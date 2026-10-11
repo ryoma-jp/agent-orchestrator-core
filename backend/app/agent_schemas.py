@@ -53,10 +53,20 @@ class TaskPlan(BaseModel):
 class SubtaskResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    status: Literal["succeeded", "failed"]
+    status: Literal["succeeded", "needs_input", "failed"]
     summary: str = Field(max_length=4_000)
     findings: list[str] = Field(max_length=30)
+    questions: list[str] = Field(max_length=10)
     error: str
+
+    @model_validator(mode="after")
+    def validate_questions(self):
+        if self.status == "needs_input":
+            if not any(question.strip() for question in self.questions):
+                raise ValueError("needs_input requires a question")
+        elif self.questions:
+            raise ValueError("questions are only valid for needs_input")
+        return self
 
 
 class IntegratedAnswer(BaseModel):

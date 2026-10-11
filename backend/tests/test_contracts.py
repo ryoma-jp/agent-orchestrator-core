@@ -7,10 +7,11 @@ from fastapi import HTTPException
 from pydantic import BaseModel, ValidationError
 from starlette.requests import Request
 
-from app.agent_schemas import PlannedSubtask, TaskPlan
+from app.agent_schemas import PlannedSubtask, SubtaskResult, TaskPlan
 from app.dependencies import get_task_user, require_task_csrf
-from app.models import ApiAccessKey, User
+from app.models import ApiAccessKey, ConversationMessage, Event, Job, Task, User
 from app.openai_client import StructuredModelClient
+from app.routers.tasks import add_message
 from app.schemas import MessageCreate, TaskCreate
 from app.security import hash_password, token_digest, verify_password
 
@@ -75,6 +76,169 @@ def test_task_plan_rejects_dependency_cycles():
                 ),
             ],
         )
+
+
+def test_subtask_result_requires_questions_for_user_input():
+    result = SubtaskResult(
+        status="needs_input",
+        summary="More information is needed.",
+        findings=[],
+        questions=["Which audience should I focus on?"],
+        error="",
+    )
+    assert result.questions == ["Which audience should I focus on?"]
+    with pytest.raises(ValidationError, match="requires a question"):
+        SubtaskResult(
+            status="needs_input",
+            summary="More information is needed.",
+            findings=[],
+            questions=[],
+            error="",
+        )
+
+
+@pytest.mark.asyncio
+async def test_user_questions_pause_task_and_are_saved_as_assistant_message(
+    monkeypatch,
+):
+    import app.orchestrator as orchestrator_module
+
+    task_id = uuid.uuid4()
+    job_id = uuid.uuid4()
+    lease_owner = "worker-test"
+    task = Task(
+        id=task_id,
+        owner_id=uuid.uuid4(),
+        instruction="Research options",
+        status="running",
+        result="stale result",
+        error={"code": "stale"},
+    )
+    job = Job(
+        id=job_id,
+        task_id=task_id,
+        status="leased",
+        lease_owner=lease_owner,
+        lease_expires_at=None,
+    )
+
+    class FakeSession:
+        def __init__(self):
+            self.scalar_values = [task, 1]
+            self.added = []
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def scalar(self, _statement):
+            return self.scalar_values.pop(0)
+
+        async def get(self, model, _identity):
+            return job if model is Job else None
+
+        def add(self, value):
+            self.added.append(value)
+
+        async def flush(self):
+            return None
+
+        async def commit(self):
+            return None
+
+    session = FakeSession()
+
+    async def assert_lease(_session, _job_id, _lease_owner):
+        return None
+
+    monkeypatch.setattr(orchestrator_module, "SessionFactory", lambda: session)
+    monkeypatch.setattr(
+        orchestrator_module, "_assert_lease_in_session", assert_lease
+    )
+
+    await orchestrator_module._pause_for_user_input(
+        task_id,
+        job_id,
+        lease_owner,
+        1,
+        [" Which audience should I focus on? ", "Which audience should I focus on?"],
+    )
+
+    message = next(
+        item for item in session.added if isinstance(item, ConversationMessage)
+    )
+    assert task.status == "needs_attention"
+    assert task.result is None
+    assert task.error is None
+    assert message.role == "assistant"
+    assert message.content == "1. Which audience should I focus on?"
+    assert job.status == "completed"
+    assert job.lease_owner is None
+    assert any(
+        isinstance(item, Event)
+        and item.type == "task.status_changed"
+        and item.payload_json["status"] == "needs_attention"
+        for item in session.added
+    )
+
+
+@pytest.mark.asyncio
+async def test_user_reply_requeues_task_waiting_for_attention():
+    task_id = uuid.uuid4()
+    user = User(
+        id=uuid.uuid4(),
+        email="person@example.com",
+        password_hash="hash",
+        role="user",
+        is_active=True,
+        must_change_password=False,
+    )
+    task = Task(
+        id=task_id,
+        owner_id=user.id,
+        instruction="Research options",
+        status="needs_attention",
+        result="stale result",
+        error={"code": "needs_input"},
+    )
+
+    class FakeSession:
+        def __init__(self):
+            self.scalar_values = [task, 2]
+            self.added = []
+
+        async def scalar(self, _statement):
+            return self.scalar_values.pop(0)
+
+        def add(self, value):
+            self.added.append(value)
+
+        async def flush(self):
+            return None
+
+        async def commit(self):
+            return None
+
+        async def refresh(self, _value):
+            return None
+
+    session = FakeSession()
+    await add_message(
+        task_id,
+        MessageCreate(content="Focus on first-time founders."),
+        user,
+        session,
+    )
+
+    assert task.status == "queued"
+    assert task.result is None
+    assert task.error is None
+    assert any(
+        isinstance(item, Job) and item.status == "pending"
+        for item in session.added
+    )
 
 
 def test_passwords_are_hashed_and_verifiable():
@@ -204,6 +368,7 @@ async def test_model_json_fallback_when_schema_mode_is_unsupported(
 
     class FakeClient:
         def __init__(self, **kwargs):
+            self.kwargs = kwargs
             self.responses = FakeResponses()
             clients.append(self)
 
@@ -211,6 +376,14 @@ async def test_model_json_fallback_when_schema_mode_is_unsupported(
             return None
 
     monkeypatch.setattr(client_module, "AsyncOpenAI", FakeClient)
+    monkeypatch.setattr(
+        client_module,
+        "get_settings",
+        lambda: SimpleNamespace(
+            openai_base_url="", max_agent_attempts=3,
+            agent_timeout_seconds=30,
+        ),
+    )
     monkeypatch.setattr(
         client_module, "read_openai_api_key", lambda: "test-key"
     )
@@ -225,6 +398,7 @@ async def test_model_json_fallback_when_schema_mode_is_unsupported(
     )
 
     assert result.answer == "validated"
+    assert clients[0].kwargs["base_url"] == "https://api.openai.com/v1"
     requests = [
         request for client in clients for request in client.responses.requests
     ]

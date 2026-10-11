@@ -98,6 +98,7 @@ async def execute_task(
 
     result_by_id: dict[str, dict] = {}
     pending = {str(row.id): row for row in subtask_rows}
+    user_questions: list[str] = []
     concurrency = min(max(config["max_concurrent_agents"], 1), 32)
     while pending:
         if await _requeue_if_new_messages(
@@ -149,10 +150,23 @@ async def execute_task(
             await _save_subtask_result(
                 task_id, job_id, lease_owner, row, serialized, None
             )
-            if outcome.status == "failed":
+            if outcome.status == "needs_input":
+                user_questions.extend(outcome.questions)
+            elif outcome.status == "failed":
                 raise RuntimeError("subtask_reported_failure")
-            result_by_id[str(row.id)] = serialized
-            pending.pop(str(row.id))
+            else:
+                result_by_id[str(row.id)] = serialized
+                pending.pop(str(row.id))
+
+        if user_questions:
+            await _pause_for_user_input(
+                task_id,
+                job_id,
+                lease_owner,
+                planned_through_sequence,
+                user_questions,
+            )
+            return
 
     if await _requeue_if_new_messages(
         task_id, job_id, lease_owner, planned_through_sequence
@@ -229,8 +243,12 @@ async def _execute_subtask(
         system_prompt=(
             "Complete one informational subtask using only the supplied "
             "context and your knowledge. Do not use tools or perform side "
-            "effects. Return concise findings. Mark failed if you cannot "
-            "complete it; do not reveal hidden reasoning."
+            "effects. Return concise findings. Use needs_input when essential "
+            "information must come from the user; put concise, specific "
+            "questions in questions, in the user's language. Use failed only "
+            "for blockers that cannot be resolved with user input. Set "
+            "questions to an empty list for succeeded or failed. Do not "
+            "reveal hidden reasoning."
         ),
         input_text=prompt,
         max_attempts=max_attempts,
@@ -264,7 +282,11 @@ async def _save_subtask_result(
     async with SessionFactory() as session:
         await _assert_lease_in_session(session, job_id, lease_owner)
         stored = await session.get(Subtask, row.id)
-        stored.status = result["status"]
+        stored.status = (
+            "blocked"
+            if result["status"] == "needs_input"
+            else result["status"]
+        )
         stored.result = result
         stored.error = error
         session.add(
@@ -363,6 +385,74 @@ async def _finish_task(
                 payload_json={
                     "message_id": str(assistant_message.id),
                     "sequence": (sequence or 0) + 1,
+                    "role": "assistant",
+                },
+            )
+        )
+        await session.commit()
+
+
+async def _pause_for_user_input(
+    task_id,
+    job_id,
+    lease_owner,
+    through_sequence: int,
+    questions: list[str],
+) -> None:
+    unique_questions = list(
+        dict.fromkeys(
+            question.strip() for question in questions if question.strip()
+        )
+    )
+    content = "\n".join(
+        f"{index}. {question}"
+        for index, question in enumerate(unique_questions, start=1)
+    )
+    async with SessionFactory() as session:
+        await _assert_lease_in_session(session, job_id, lease_owner)
+        task = await session.scalar(
+            select(Task).where(Task.id == task_id).with_for_update()
+        )
+        latest_sequence = await session.scalar(
+            select(
+                func.coalesce(func.max(ConversationMessage.sequence), 0)
+            ).where(ConversationMessage.task_id == task_id)
+        )
+        job = await session.get(Job, job_id)
+        if (latest_sequence or 0) > through_sequence:
+            _queue_for_new_instruction(session, task, job)
+            await session.commit()
+            return
+
+        task.status = "needs_attention"
+        task.result = None
+        task.error = None
+        task.updated_at = datetime.now(timezone.utc)
+        assistant_message = ConversationMessage(
+            task_id=task_id,
+            sequence=(latest_sequence or 0) + 1,
+            role="assistant",
+            content=content,
+        )
+        session.add(assistant_message)
+        await session.flush()
+        job.status = "completed"
+        job.lease_owner = None
+        job.lease_expires_at = None
+        session.add(
+            Event(
+                task_id=task_id,
+                type="task.status_changed",
+                payload_json={"status": "needs_attention"},
+            )
+        )
+        session.add(
+            Event(
+                task_id=task_id,
+                type="conversation.message_added",
+                payload_json={
+                    "message_id": str(assistant_message.id),
+                    "sequence": (latest_sequence or 0) + 1,
                     "role": "assistant",
                 },
             )

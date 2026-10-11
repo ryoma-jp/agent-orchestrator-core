@@ -250,7 +250,7 @@ async def add_message(
             },
         )
     )
-    if task.status == "succeeded":
+    if task.status in {"succeeded", "needs_attention"}:
         task.status = "queued"
         task.result = None
         task.error = None

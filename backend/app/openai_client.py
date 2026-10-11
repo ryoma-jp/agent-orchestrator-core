@@ -33,7 +33,10 @@ class StructuredModelClient:
                 api_key = await asyncio.to_thread(read_openai_api_key)
                 client = AsyncOpenAI(
                     api_key=api_key,
-                    base_url=settings.openai_base_url,
+                    base_url=(
+                        settings.openai_base_url
+                        or "https://api.openai.com/v1"
+                    ),
                     max_retries=0,
                     timeout=settings.agent_timeout_seconds,
                 )

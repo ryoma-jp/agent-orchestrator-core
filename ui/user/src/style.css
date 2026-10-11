@@ -100,6 +100,8 @@ button:disabled { cursor: wait; opacity: .6; }
 .message p, .result-block p, .error-block p { margin: 6px 0 0; white-space: pre-wrap; overflow-wrap: anywhere; color: #585a54; font-size: 12px; line-height: 1.65; }
 .progress-note { display: flex; align-items: center; gap: 8px; padding: 11px 12px; margin: 9px 0 18px; background: #f0f1e8; color: #666a5e; font-size: 11px; }
 .progress-note svg { color: #66853d; animation: rotate 2s linear infinite; }
+.clarification-note { display: flex; align-items: center; gap: 8px; padding: 11px 12px; margin: 9px 0 18px; background: #edf1e6; color: #526145; font-size: 11px; }
+.clarification-note svg { flex: 0 0 auto; color: #66853d; }
 .result-block, .error-block { padding: 13px; border-left: 2px solid #81a847; background: #f0f3e9; margin: 14px 0; }
 .error-block { border-left-color: var(--coral); background: #faf0ed; }
 .result-label { display: flex; align-items: center; gap: 6px; color: #52712f; font: 10px var(--mono); }
