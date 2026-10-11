@@ -9,7 +9,14 @@ from starlette.requests import Request
 
 from app.agent_schemas import PlannedSubtask, SubtaskResult, TaskPlan
 from app.dependencies import get_task_user, require_task_csrf
-from app.models import ApiAccessKey, ConversationMessage, Event, Job, Task, User
+from app.models import (
+    ApiAccessKey,
+    ConversationMessage,
+    Event,
+    Job,
+    Task,
+    User,
+)
 from app.openai_client import StructuredModelClient
 from app.routers.tasks import add_message
 from app.schemas import MessageCreate, TaskCreate
@@ -163,7 +170,10 @@ async def test_user_questions_pause_task_and_are_saved_as_assistant_message(
         job_id,
         lease_owner,
         1,
-        [" Which audience should I focus on? ", "Which audience should I focus on?"],
+        [
+            " Which audience should I focus on? ",
+            "Which audience should I focus on?",
+        ],
     )
 
     message = next(
