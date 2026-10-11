@@ -180,7 +180,117 @@ async def test_user_questions_pause_task_and_are_saved_as_assistant_message(
         isinstance(item, Event)
         and item.type == "task.status_changed"
         and item.payload_json["status"] == "needs_attention"
+        and item.payload_json["conversation_sequence"] == 1
         for item in session.added
+    )
+
+
+@pytest.mark.asyncio
+async def test_subtask_receives_conversation_history(monkeypatch):
+    import json
+
+    import app.orchestrator as orchestrator_module
+
+    messages = [
+        ConversationMessage(role="assistant", content="Which industry?"),
+        ConversationMessage(role="user", content="IT, embedded software."),
+    ]
+    captured = {}
+
+    async def assert_lease(*_args):
+        return None
+
+    async def generate(**kwargs):
+        captured.update(kwargs)
+        return SubtaskResult(
+            status="succeeded",
+            summary="Completed",
+            findings=[],
+            questions=[],
+            error="",
+        )
+
+    monkeypatch.setattr(orchestrator_module, "_assert_lease", assert_lease)
+    monkeypatch.setattr(orchestrator_module.model_client, "generate", generate)
+
+    await orchestrator_module._execute_subtask(
+        SimpleNamespace(
+            title="Clarify profile",
+            instruction="Proceed",
+            dependencies=[],
+            model_id="test-worker",
+        ),
+        SimpleNamespace(summary="Plan"),
+        {},
+        messages,
+        uuid.uuid4(),
+        "worker-test",
+        1,
+    )
+
+    prompt = json.loads(captured["input_text"])
+    assert prompt["conversation"] == [
+        {"role": "assistant", "content": "Which industry?"},
+        {"role": "user", "content": "IT, embedded software."},
+    ]
+    assert "do not ask again" in captured["system_prompt"]
+
+
+@pytest.mark.asyncio
+async def test_subtask_progress_events_are_tagged(monkeypatch):
+    import app.orchestrator as orchestrator_module
+
+    task_id = uuid.uuid4()
+    job_id = uuid.uuid4()
+    row = SimpleNamespace(id=uuid.uuid4(), title="Research")
+    stored = SimpleNamespace(status="running", result=None, error=None)
+
+    class FakeSession:
+        def __init__(self):
+            self.added = []
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def get(self, _model, _identity):
+            return stored
+
+        def add(self, value):
+            self.added.append(value)
+
+        async def commit(self):
+            return None
+
+    session = FakeSession()
+
+    async def assert_lease(*_args):
+        return None
+
+    monkeypatch.setattr(orchestrator_module, "SessionFactory", lambda: session)
+    monkeypatch.setattr(
+        orchestrator_module, "_assert_lease_in_session", assert_lease
+    )
+
+    await orchestrator_module._save_subtask_result(
+        task_id,
+        job_id,
+        "worker-test",
+        row,
+        {"status": "succeeded", "summary": "Research complete"},
+        None,
+        4,
+    )
+
+    progress_events = [
+        item for item in session.added if isinstance(item, Event)
+    ]
+    assert len(progress_events) == 2
+    assert all(
+        item.payload_json["conversation_sequence"] == 4
+        for item in progress_events
     )
 
 
@@ -239,6 +349,12 @@ async def test_user_reply_requeues_task_waiting_for_attention():
         isinstance(item, Job) and item.status == "pending"
         for item in session.added
     )
+    queued_event = next(
+        item
+        for item in session.added
+        if isinstance(item, Event) and item.type == "task.status_changed"
+    )
+    assert queued_event.payload_json["conversation_sequence"] == 3
 
 
 def test_passwords_are_hashed_and_verifiable():

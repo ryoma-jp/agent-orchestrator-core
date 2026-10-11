@@ -62,7 +62,7 @@ async def create_task(
         Event(
             task_id=task.id,
             type="task.status_changed",
-            payload_json={"status": "queued"},
+            payload_json={"status": "queued", "conversation_sequence": 1},
         )
     )
     db.add(
@@ -259,7 +259,10 @@ async def add_message(
             Event(
                 task_id=task_id,
                 type="task.status_changed",
-                payload_json={"status": "queued"},
+                payload_json={
+                    "status": "queued",
+                    "conversation_sequence": message.sequence,
+                },
             )
         )
         db.add(Job(task_id=task_id, status="pending"))

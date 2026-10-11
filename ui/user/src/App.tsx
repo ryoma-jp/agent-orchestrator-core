@@ -1,4 +1,4 @@
-import { useEffect, useState, type FormEvent } from 'react'
+import { Fragment, useEffect, useState, type FormEvent } from 'react'
 import {
   Activity, ArrowUpRight, Ban, Check, ChevronDown, Clock3, Command,
   Copy, KeyRound, LoaderCircle, LogOut, MessageSquareText, Plus, Send,
@@ -11,6 +11,7 @@ type Task = {
   result: string | null; error: { code?: string; message?: string } | null
 }
 type Message = { id: string; sequence: number; role: 'user' | 'assistant'; content: string; created_at: string }
+type ProgressItem = { id: string; conversationSequence: number; content: string }
 
 async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
   const headers = new Headers(init.headers)
@@ -39,6 +40,7 @@ function App() {
   const [tasks, setTasks] = useState<Task[]>([])
   const [active, setActive] = useState<Task | null>(null)
   const [messages, setMessages] = useState<Message[]>([])
+  const [progress, setProgress] = useState<ProgressItem[]>([])
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
   const [showCreate, setShowCreate] = useState(false)
@@ -61,6 +63,7 @@ function App() {
     if (!active || !user) return
     let alive = true
     const taskId = active.id
+    setProgress([])
     api<Message[]>(`/tasks/${taskId}/messages`)
       .then((value) => { if (alive) setMessages(value) })
       .catch((reason) => { if (alive) setError(reason.message) })
@@ -76,8 +79,38 @@ function App() {
         if (alive) { setActive(task); setMessages(history); setTasks(updatedTasks) }
       } catch { /* A later event or reconnect will retry the read. */ }
     }
-    for (const name of ['task.status_changed', 'conversation.message_added', 'agent.progress', 'tool.completed', 'task.completed', 'task.failed']) {
+    const recordProgress = (event: Event) => {
+      const message = event as MessageEvent<string>
+      let payload: Record<string, unknown>
+      try { payload = JSON.parse(message.data) as Record<string, unknown> } catch { return }
+      const conversationSequence = payload.conversation_sequence
+      if (typeof conversationSequence !== 'number' || !Number.isInteger(conversationSequence)) return
+      let content = ''
+      if (message.type === 'plan.created') {
+        const summary = typeof payload.summary === 'string' ? payload.summary : ''
+        const count = typeof payload.subtask_count === 'number' ? payload.subtask_count : 0
+        content = summary || `${count}件の作業に分けて計画しました。`
+      } else if (message.type === 'subtask.status_changed') {
+        const title = typeof payload.title === 'string' ? payload.title : '作業項目'
+        const status = payload.status
+        const action = status === 'running' ? 'に取り組んでいます' : status === 'succeeded' ? 'が完了しました' : status === 'blocked' ? 'は追加情報待ちです' : status === 'failed' ? 'で問題が発生しました' : ''
+        content = action ? `${title}${action}` : ''
+      } else if (message.type === 'agent.progress') {
+        content = typeof payload.summary === 'string' ? payload.summary : ''
+      } else if (message.type === 'task.status_changed') {
+        const status = payload.status
+        content = status === 'planning' ? '作業内容を整理しています。' : status === 'running' ? 'エージェントが作業を開始しました。' : status === 'needs_attention' ? '追加の情報が必要です。' : ''
+      }
+      if (!content || !alive) return
+      setProgress((current) => current.some((item) => item.id === message.lastEventId)
+        ? current
+        : [...current, { id: message.lastEventId, conversationSequence, content }])
+    }
+    for (const name of ['task.status_changed', 'conversation.message_added', 'task.completed', 'task.failed']) {
       stream.addEventListener(name, sync)
+    }
+    for (const name of ['plan.created', 'subtask.status_changed', 'agent.progress', 'task.status_changed']) {
+      stream.addEventListener(name, recordProgress)
     }
     return () => { alive = false; stream.close() }
   }, [active?.id, user])
@@ -155,6 +188,18 @@ function App() {
   const counts = tasks.reduce<Record<string, number>>((acc, task) => {
     acc[task.status] = (acc[task.status] ?? 0) + 1; return acc
   }, {})
+  const latestUserMessageSequence = messages.filter((message) => message.role === 'user').at(-1)?.sequence
+  const renderProgress = (conversationSequence: number) => {
+    const items = progress.filter((item) => item.conversationSequence === conversationSequence)
+    if (items.length === 0) return null
+    const isActiveRun = conversationSequence === latestUserMessageSequence
+      && active !== null
+      && ['queued', 'planning', 'running'].includes(active.status)
+    return <details className="progress-section" open={isActiveRun}>
+      <summary className="progress-heading"><span><Activity size={14} /> 途中経過 <small>{items.length}件</small></span><ChevronDown className="progress-chevron" size={14} /></summary>
+      <ol>{items.map((item) => <li key={item.id}>{item.content}</li>)}</ol>
+    </details>
+  }
 
   return <div className="app-shell">
     <aside className="rail">
@@ -187,10 +232,10 @@ function App() {
           {active ? <>
             <div className="detail-top"><div><div className="eyebrow">TASK THREAD</div><div className={`status-pill pill-${active.status}`}>{statusLabel[active.status] ?? active.status}</div></div><div className="detail-actions">{['queued', 'planning', 'running', 'waiting_approval', 'needs_attention'].includes(active.status) ? <button className="icon-btn" title="Cancel task" disabled={busy} onClick={cancelTask}><Ban size={16} /></button> : ['succeeded', 'failed', 'cancelled'].includes(active.status) ? <button className="icon-btn" title="Delete task" disabled={busy} onClick={deleteTask}><Trash2 size={16} /></button> : null}<button className="icon-btn" title="Close task" onClick={() => setActive(null)}><X size={17} /></button></div></div>
             <h2 className="detail-title">{active.instruction}</h2>
-            <div className="thread" aria-live="polite">{messages.map((message) => <article className={`message message-${message.role}`} key={message.id}><div className="message-avatar">{message.role === 'user' ? user.email[0].toUpperCase() : <Sparkles size={14} />}</div><div><div className="message-meta">{message.role === 'user' ? 'You' : 'Relay'} <time>{new Date(message.created_at).toLocaleTimeString('ja-JP', { hour: '2-digit', minute: '2-digit' })}</time></div><p>{message.content}</p></div></article>)}
+            <div className="thread" aria-live="polite">{messages.map((message) => <Fragment key={message.id}><article className={`message message-${message.role}`}><div className="message-avatar">{message.role === 'user' ? user.email[0].toUpperCase() : <Sparkles size={14} />}</div><div><div className="message-meta">{message.role === 'user' ? 'You' : 'Relay'} <time>{new Date(message.created_at).toLocaleTimeString('ja-JP', { hour: '2-digit', minute: '2-digit' })}</time></div><p>{message.content}</p></div></article>{message.role === 'user' && renderProgress(message.sequence)}</Fragment>)}
               {active.status === 'queued' && <div className="progress-note"><LoaderCircle size={15} /> Waiting for an available worker</div>}
               {active.status === 'needs_attention' && <div className="clarification-note" role="status"><MessageSquareText size={15} /> Reply below to continue this task.</div>}
-              {active.result && <article className="result-block"><div className="result-label"><Check size={14} /> RESULT</div><p>{active.result}</p></article>}
+              {active.result && !messages.some((message) => message.role === 'assistant' && message.content === active.result) && <article className="result-block"><div className="result-label"><Check size={14} /> RESULT</div><p>{active.result}</p></article>}
               {active.error && <article className="error-block"><strong>{active.error.code ?? 'Task error'}</strong><p>{active.error.message ?? 'The task could not be completed.'}</p></article>}
             </div>
             <form className="reply-box" onSubmit={sendMessage}><textarea name="content" placeholder={active.status === 'needs_attention' ? 'Answer the questions above to continue...' : 'Add context or a follow-up...'} rows={3} maxLength={20000} required /><div className="reply-actions"><span><MessageSquareText size={14} /> Messages stay in this task</span><button className="send-btn" title="Send message" disabled={busy}><Send size={16} /></button></div></form>

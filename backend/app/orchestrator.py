@@ -81,6 +81,7 @@ async def execute_task(
                 payload_json={
                     "summary": plan.summary,
                     "subtask_count": len(subtask_rows),
+                    "conversation_sequence": planned_through_sequence,
                 },
             )
         )
@@ -91,7 +92,10 @@ async def execute_task(
             Event(
                 task_id=task_id,
                 type="task.status_changed",
-                payload_json={"status": "running"},
+                payload_json={
+                    "status": "running",
+                    "conversation_sequence": planned_through_sequence,
+                },
             )
         )
         await session.commit()
@@ -115,13 +119,20 @@ async def execute_task(
         if not ready:
             raise RuntimeError("subtask_dependency_deadlock")
 
-        await _mark_subtasks_running(task_id, job_id, lease_owner, ready)
+        await _mark_subtasks_running(
+            task_id,
+            job_id,
+            lease_owner,
+            ready,
+            planned_through_sequence,
+        )
         outcomes = await asyncio.gather(
             *[
                 _execute_subtask(
                     row,
                     plan,
                     result_by_id,
+                    conversation,
                     job_id,
                     lease_owner,
                     config["max_agent_attempts"],
@@ -143,12 +154,24 @@ async def execute_task(
                     "error": error["message"],
                 }
                 await _save_subtask_result(
-                    task_id, job_id, lease_owner, row, result, error
+                    task_id,
+                    job_id,
+                    lease_owner,
+                    row,
+                    result,
+                    error,
+                    planned_through_sequence,
                 )
                 raise RuntimeError("subtask_execution_failed") from outcome
             serialized = outcome.model_dump(mode="json")
             await _save_subtask_result(
-                task_id, job_id, lease_owner, row, serialized, None
+                task_id,
+                job_id,
+                lease_owner,
+                row,
+                serialized,
+                None,
+                planned_through_sequence,
             )
             if outcome.status == "needs_input":
                 user_questions.extend(outcome.questions)
@@ -221,13 +244,17 @@ def _format_conversation(messages: list[ConversationMessage]) -> str:
 
 
 async def _execute_subtask(
-    row, plan, results, job_id, lease_owner, max_attempts
+    row, plan, results, conversation, job_id, lease_owner, max_attempts
 ) -> SubtaskResult:
     dependency_results = [
         results[dependency] for dependency in row.dependencies
     ]
     prompt = json.dumps(
         {
+            "conversation": [
+                {"role": message.role, "content": message.content}
+                for message in conversation
+            ],
             "task_title": row.title,
             "instruction": row.instruction,
             "plan_summary": plan.summary,
@@ -242,7 +269,10 @@ async def _execute_subtask(
         schema=SubtaskResult,
         system_prompt=(
             "Complete one informational subtask using only the supplied "
-            "context and your knowledge. Do not use tools or perform side "
+            "context and your knowledge. Treat the conversation as the "
+            "source of user-provided information, honor prior answers, and "
+            "do not ask again for information already provided. Do not use "
+            "tools or perform side "
             "effects. Return concise findings. Use needs_input when essential "
             "information must come from the user; put concise, specific "
             "questions in questions, in the user's language. Use failed only "
@@ -255,7 +285,9 @@ async def _execute_subtask(
     )
 
 
-async def _mark_subtasks_running(task_id, job_id, lease_owner, rows) -> None:
+async def _mark_subtasks_running(
+    task_id, job_id, lease_owner, rows, conversation_sequence
+) -> None:
     async with SessionFactory() as session:
         await _assert_lease_in_session(session, job_id, lease_owner)
         for row in rows:
@@ -270,6 +302,7 @@ async def _mark_subtasks_running(task_id, job_id, lease_owner, rows) -> None:
                         "subtask_id": str(row.id),
                         "status": "running",
                         "title": row.title,
+                        "conversation_sequence": conversation_sequence,
                     },
                 )
             )
@@ -277,7 +310,7 @@ async def _mark_subtasks_running(task_id, job_id, lease_owner, rows) -> None:
 
 
 async def _save_subtask_result(
-    task_id, job_id, lease_owner, row, result, error
+    task_id, job_id, lease_owner, row, result, error, conversation_sequence
 ) -> None:
     async with SessionFactory() as session:
         await _assert_lease_in_session(session, job_id, lease_owner)
@@ -297,6 +330,7 @@ async def _save_subtask_result(
                     "subtask_id": str(row.id),
                     "status": stored.status,
                     "title": row.title,
+                    "conversation_sequence": conversation_sequence,
                 },
             )
         )
@@ -307,6 +341,7 @@ async def _save_subtask_result(
                 payload_json={
                     "summary": result["summary"],
                     "subtask_id": str(row.id),
+                    "conversation_sequence": conversation_sequence,
                 },
             )
         )
@@ -333,7 +368,9 @@ async def _finish_task(
         )
         job = await session.get(Job, job_id)
         if (sequence or 0) > through_sequence:
-            _queue_for_new_instruction(session, task, job)
+            _queue_for_new_instruction(
+                session, task, job, sequence or through_sequence
+            )
             await session.commit()
             return
         task.status = "succeeded" if answer.completion_met else "failed"
@@ -368,14 +405,20 @@ async def _finish_task(
             Event(
                 task_id=task_id,
                 type=event_type,
-                payload_json={"status": task.status},
+                payload_json={
+                    "status": task.status,
+                    "conversation_sequence": through_sequence,
+                },
             )
         )
         session.add(
             Event(
                 task_id=task_id,
                 type="task.status_changed",
-                payload_json={"status": task.status},
+                payload_json={
+                    "status": task.status,
+                    "conversation_sequence": through_sequence,
+                },
             )
         )
         session.add(
@@ -420,7 +463,9 @@ async def _pause_for_user_input(
         )
         job = await session.get(Job, job_id)
         if (latest_sequence or 0) > through_sequence:
-            _queue_for_new_instruction(session, task, job)
+            _queue_for_new_instruction(
+                session, task, job, latest_sequence
+            )
             await session.commit()
             return
 
@@ -443,7 +488,10 @@ async def _pause_for_user_input(
             Event(
                 task_id=task_id,
                 type="task.status_changed",
-                payload_json={"status": "needs_attention"},
+                payload_json={
+                    "status": "needs_attention",
+                    "conversation_sequence": through_sequence,
+                },
             )
         )
         session.add(
@@ -476,12 +524,14 @@ async def _requeue_if_new_messages(
         if latest_sequence <= through_sequence:
             return False
         job = await session.get(Job, job_id)
-        _queue_for_new_instruction(session, task, job)
+        _queue_for_new_instruction(session, task, job, latest_sequence)
         await session.commit()
         return True
 
 
-def _queue_for_new_instruction(session, task: Task, job: Job) -> None:
+def _queue_for_new_instruction(
+    session, task: Task, job: Job, conversation_sequence
+) -> None:
     task.status = "queued"
     task.updated_at = datetime.now(timezone.utc)
     task.result = None
@@ -494,14 +544,20 @@ def _queue_for_new_instruction(session, task: Task, job: Job) -> None:
         Event(
             task_id=task.id,
             type="task.status_changed",
-            payload_json={"status": "queued"},
+            payload_json={
+                "status": "queued",
+                "conversation_sequence": conversation_sequence,
+            },
         )
     )
     session.add(
         Event(
             task_id=task.id,
             type="agent.progress",
-            payload_json={"summary": "New instruction received; replanning."},
+            payload_json={
+                "summary": "New instruction received; replanning.",
+                "conversation_sequence": conversation_sequence,
+            },
         )
     )
 
