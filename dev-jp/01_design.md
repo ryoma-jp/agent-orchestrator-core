@@ -17,7 +17,7 @@
 
 - タスク管理UIおよびバックエンドAPI
 - 管理エージェントによる計画、サブエージェント統括、成果物の統合
-- OpenAI APIを利用するBYOK認証
+- 管理者が設定するシステム共通OpenAI APIキー認証
 - スキルの動的ロードとRAG検索インターフェース
 - 承認フロー、サンドボックス実行、永続化、再開処理
 - リアルタイムイベント配信
@@ -26,6 +26,7 @@
 
 - 開発・テスト・本番のすべてでPostgreSQLを使用し、SQLiteには対応しない。PostgreSQLはアプリケーション状態の唯一の正規ストアとする。APIとワーカーを分離し、コンテナ数を増やしてもタスク状態とジョブ状態が一貫する構成を基本とする。
 - バックエンドはPython（非同期実行、プライベートPythonスキルのロードとの親和性）、HTTP APIはFastAPIを採用する。フロントエンドはTypeScriptベースとし、管理者ダッシュボードと一般ユーザー用タスクUIを別々のコンテナとして配信する。
+- バックエンドがPythonであるため、OpenAI API接続には公式OpenAI Python SDKを直接利用する。API呼び出しに必要な公式SDKを用いながら、計画、Tool Callingのループ、サブエージェント制御、永続化・再開を基盤側で制御し、PostgreSQLを唯一の状態正本として保つ。OpenAI Agents SDKのAgent／Runner状態管理には依存しない。
 - モデル名は設定値とする。GPT-6系の名称は要求上の例であり、利用可能な実モデルID・API機能を実行環境で確認して設定する。特定のモデル名や機能をコードに固定しない。
 - 知識検索用Vector DBはアプリケーション状態DBとは別の依存コンポーネントとし、特定製品に固定しない。初期構成では検索インターフェースを提供し、利用者の設定に基づいてローカルまたは外部の実装を接続する。
 - ネットワークから切断中に新たなモデル応答を生成することはできない。実行中状態を永続化し、接続回復後またはユーザー操作後に再開する。
@@ -69,7 +70,8 @@ flowchart TB
         EventStream -->|永続化イベントを取得| Repository
     end
 
-    OpenAI["OpenAI API (BYOK)"]
+    OpenAI["OpenAI API<br/>管理者設定の共通キー"]
+    Vault["HashiCorp Vault<br/>KV v2: システム共通OpenAIキー"]
     Skills["Private Skills"]
     Sandbox["Sandbox service/container<br/>task_idごとの一時ワークスペース"]
     Knowledge["Private Knowledge DB / vector store"]
@@ -87,6 +89,8 @@ flowchart TB
     SkillRegistry --> Skills
     Safety -->|隔離ツール実行・成果物入出力| Sandbox
     RAGAdapter --> Knowledge
+    API -->|管理者AppRole: KV v2へ書込| Vault
+    OpenAIClient -->|Worker AppRole: 呼び出しごとにキー読取| Vault
 ```
 
 ### 3.1 コンポーネント責務
@@ -99,7 +103,7 @@ flowchart TB
 | タスクサービス | 永続DBを介したタスク受付・状態変更・ジョブ登録を行う。エージェント実行はWorkerへ委譲する |
 | オーケストレーター | Worker内でDBから取得した最新状態に基づき、意図解釈、計画生成、依存関係に沿った実行、結果の検証・統合を行う |
 | エージェント実行器 | 管理エージェント／サブエージェントのプロンプトとコンテキストを構築し、モデル呼び出しを行う |
-| OpenAIクライアント | BYOKキーの適用、タイムアウト、PostgreSQL上の共有枠と連携したレート制御、429等の再試行、使用量・エラー計測 |
+| OpenAIクライアント | Vaultから取得したシステム共通キーの適用、公式OpenAI Python SDKによるAPI呼び出し、タイムアウト、PostgreSQL上の共有枠と連携したレート制御、429等の再試行、使用量・エラー計測 |
 | スキルレジストリ | 設定されたプライベートディレクトリから許可済みスキルをロードし、JSON Schemaと実装を登録 |
 | スキル実行器 | 引数検証、危険度判定、承認、専用Sandboxサービスでの実行、実行結果の記録 |
 | RAGアダプター | ナレッジ検索の共通インターフェースを提供。文書・ベクトルデータはコアDBに複製しない |
@@ -205,7 +209,9 @@ PostgreSQLを開発・テスト・本番で共通の正規永続ストアとし�
 
 管理者ダッシュボードと一般ユーザー用タスクUIは、異なる配信単位・アクセス面として独立したコンテナに分離する。両UIは共通のAPIコンテナを利用するが、管理者向け資産を一般ユーザー用UIの配信物に含めず、nginxから別々の経路にルーティングする。これにより、管理者画面の公開範囲・更新・障害影響を一般ユーザー画面から分離できる。
 
-リバースプロキシにはnginxを推奨する。初期デプロイは単一ホスト上のコンテナ構成であり、Kubernetes固有のIngressリソースを必要としないためである。nginxはTLS終端とUI/APIへの経路振り分けを担い、SSE向けにプロキシバッファリングを無効化し、長時間接続を許容するタイムアウトを設定する。実行環境の標準基盤などに別のリバースプロキシ要件がある場合は差し替え可能とする。
+リバースプロキシにはnginxを推奨する。初期デプロイは単一ホスト上のコンテナ構成であり、nginxはTLS終端とUI/APIへの経路振り分けを担う。SSE向けにプロキシバッファリングを無効化し、長時間接続を許容するタイムアウトを設定する。実行環境の標準基盤などに別のリバースプロキシ要件がある場合は差し替え可能とする。
+
+コマンド実行にはタスクごとの非特権・リソース制限付き一時コンテナを使用する。コンテナの作成・破棄を担当するSandboxサービスだけが制限付きDocker APIへ接続し、WorkerにはDocker制御権限を与えない。Sandboxサービスは`task_id`ごとの作業領域を管理し、`needs_attention`中は作業領域を保持する。タスクが再開して正常終了するか、ユーザーが終了を選択したときに一時コンテナと作業領域を破棄する。成果物は作業領域から検証後に独立した永続ボリュームへ移し、タスクの存在中は保持する。
 
 ```mermaid
 flowchart TB
@@ -221,24 +227,38 @@ flowchart TB
             TaskRepository["タスク用Repository<br/>DB読込・状態更新"]
             Manager["管理エージェント<br/>タスクごとの論理実行コンテキスト"]
             Subagents["サブエージェント群<br/>サブタスクごとの一時実行"]
+            OpenAIClient["OpenAI Python SDKクライアント"]
+            ArtifactWriter["成果物検証・登録"]
             WorkerLoop --> TaskRepository
             TaskRepository -->|最新の会話・計画・状態| Manager
             Manager -->|応答・計画・状態の更新| TaskRepository
             Manager -->|タスクに応じて生成・統括| Subagents
             Subagents -->|構造化結果| Manager
             Subagents -->|サブタスク結果| TaskRepository
+            Manager --> OpenAIClient
+            Subagents --> OpenAIClient
+            WorkerLoop --> ArtifactWriter
         end
         PostgreSQL[("PostgreSQL container/service<br/>tasks・会話・events・approvals・jobs・leases")]
+        Vault["HashiCorp Vault<br/>KV v2"]
+        ArtifactStorage[("成果物用永続ボリューム")]
         PrivateSkills[("Private skills mount<br/>ワーカーへ読み取り専用")]
+        API -->|成果物を読み取り専用で配信| ArtifactStorage
+        ArtifactWriter -->|検証済み成果物を書込| ArtifactStorage
+        API -->|管理API用AppRoleでキー更新| Vault
     end
 
     subgraph SandboxNetwork["分離されたSandbox実行ネットワーク"]
-        Sandbox["Sandbox service/container<br/>task_idごとの隔離ワークスペース"]
-        Egress["Egress制御<br/>既定拒否・管理者許可リスト"]
-        Sandbox --> Egress
+        SandboxService["Sandbox service/container<br/>ワークスペース管理"]
+        LimitedDockerAPI["制限付きDocker API"]
+        TaskSandbox["task_idごとの非特権・制限付き一時コンテナ"]
+        Egress["Egress制御<br/>DB設定の許可リストを強制"]
+        SandboxService --> LimitedDockerAPI
+        SandboxService --> TaskSandbox
+        TaskSandbox --> Egress
     end
 
-    OpenAI["OpenAI API (BYOK)"]
+    OpenAI["OpenAI API<br/>管理者設定の共通キー"]
     Knowledge["Private Knowledge DB / Vector DB"]
 
     Browser --> Nginx
@@ -249,10 +269,10 @@ flowchart TB
     UserUI -->|ユーザーセッション| API
     API -->|タスク・メッセージ・イベント・ジョブを永続化| PostgreSQL
     TaskRepository -->|ジョブ取得・リース、会話・計画・状態の読込／更新| PostgreSQL
-    Manager -->|モデル呼び出し| OpenAI
-    Subagents -->|モデル呼び出し| OpenAI
+    OpenAIClient -->|呼び出しごとにWorker用AppRoleでキー取得| Vault
+    OpenAIClient -->|公式SDKでモデル呼び出し| OpenAI
     Subagents -->|許可されたスキルをロード| PrivateSkills
-    Subagents -->|制限付きツール要求・成果物入出力| Sandbox
+    Subagents -->|ツール要求・成果物入出力| SandboxService
     Manager -->|検索アダプター経由| Knowledge
 ```
 
@@ -266,11 +286,13 @@ flowchart TB
 | API | REST、SSE、認証、入力検証、会話・承認操作、DBへの受付記録 | ステートレスにし、必要に応じて複数レプリカ化 |
 | Worker | DBジョブの取得・期限切れリースの回収、タスクごとの管理エージェント処理、サブエージェント実行、統合 | 初期1レプリカ。複数レプリカ時はDB上の期限付きスロット／リースで共有の同時実行・APIレート制御に従う |
 | PostgreSQL | タスク、会話履歴、イベント、承認、実行状態、耐久ジョブキューの保存 | 永続ボリューム、バックアップ、マイグレーションを適用。アプリ用資格情報は必要権限に限定 |
-| Sandbox service/container | シェル／ファイル操作等をWorkerから隔離して実行 | タスク単位の作業領域をツール呼び出し間で維持し、タスク終了時に破棄。API・Workerと権限を分離 |
+| Sandbox service/container | 制限付きDocker APIを介してタスクごとの非特権・リソース制限付き一時コンテナを管理 | WorkerにDocker制御権限を与えない。通常のタスク終了時は破棄し、`needs_attention`中は解決まで保持 |
+| 成果物ストレージ | 検証済み成果物をPostgreSQLと分離した永続ボリュームに保存 | Workerは書込、APIは読み取り専用マウントで配信。タスク削除時に関連成果物を削除 |
+| HashiCorp Vault | KV v2でシステム共通OpenAI APIキーを保存 | 管理APIは書込専用の限定AppRole、Workerは読取専用AppRoleを使用 |
 
-スキルは信頼済みのプライベート配布元からワーカーへ読み取り専用で提供し、コンテナイメージへ独自ノウハウを焼き込まない。ナレッジDBはプライベートストレージに残し、アダプター経由でアクセスする。PostgreSQLのデータディレクトリだけを永続ボリュームに置き、コンテナのファイルシステムを状態保存先として使わない。APIとワーカーには必要な環境変数のみを注入し、OpenAI APIキーはモデル呼び出しを行うWorkerのみに渡す。キーをイメージ、Composeファイル、ログ、DBへ格納しない。
+スキルは信頼済みのプライベート配布元からワーカーへ読み取り専用で提供し、コンテナイメージへ独自ノウハウを焼き込まない。ナレッジDBはプライベートストレージに残し、アダプター経由でアクセスする。PostgreSQLのデータディレクトリだけを永続ボリュームに置き、コンテナのファイルシステムを状態保存先として使わない。APIとWorkerには必要な環境変数のみを注入する。管理APIにはVault KV v2への限定書込権限、Workerには読取専用権限を付与し、APIキーそのものはWorkerがモデル呼び出しごとにVaultから取得する。AppRoleの`role_id`／`secret_id`はDocker Secrets等の読み取り専用ファイルから渡す。キーをイメージ、Composeファイル、ログ、DBへ格納しない。
 
-ワーカーからDockerデーモンのソケットを直接マウントする構成は、ホスト権限の実質的な付与となるため採用しない。専用Sandboxサービス／コンテナで`task_id`ごとの隔離ワークスペースを作成し、同一タスク内のツール呼び出し間ではワークスペースを維持する。Sandboxサービスは`task_id`をキーにワークスペースを識別するため、ツール呼び出しを別Workerが引き継いでも同じ作業領域を利用できる。ユーザーが指定したホストパスやホスト資格情報はマウントしない。成果物はSandboxから検証済みの明示的な出力経路を通じて取得し、タスク終了時にワークスペースを破棄する。Sandboxからの外向きネットワーク通信は既定で禁止し、管理者設定の宛先許可リストに一致する通信のみ許可する。ユーザー指示やモデル出力だけでは許可リストを変更できない。Sandboxサービスが構成されていない環境では、危険な操作をホスト上で代替実行せず、該当ツールを利用不可として報告する。
+WorkerへDockerソケットやDocker API資格情報を渡さない。Sandboxサービスだけが専用の制限付きDocker APIに接続し、タスクごとに非特権・CPU／メモリ／実行時間制限付きコンテナを生成・破棄する。`task_id`をキーに作業領域を維持し、Worker交代後も同じタスクのSandboxを利用する。`needs_attention`中はユーザー判断に備えてSandboxを保持し、再開後の正常終了またはユーザーの終了選択で破棄する。ホストパスやホスト資格情報はマウントしない。成果物はWorkerがSandboxから検証済みの経路で取得し、別永続ボリュームへ保存する。APIは成果物ボリュームを読み取り専用でマウントして所有者認可後に配信し、書込みは行わない。外向き通信は既定拒否とし、PostgreSQL上の管理者許可リストをSandboxネットワーク側でも強制する。ユーザー指示やモデル出力だけでは許可リストを変更できない。Sandboxサービスまたは制限付きDocker APIが利用できない場合、危険な操作をホスト上で代替実行せず、該当ツールを利用不可として報告する。
 
 APIはDBへの書き込み後にのみタスク受付成功を返す。Workerはジョブを短いリース付きで取得し、定期的にリースを更新する。正常終了時は同一トランザクションでジョブ完了・タスク状態・イベントを確定する。Workerの強制終了時はリース失効後に再取得するが、モデル呼び出しや外部副作用が実行済みか判定できない処理は自動再実行せず、`needs_attention`へ遷移させる。
 
@@ -306,13 +328,14 @@ stateDiagram-v2
     waiting_approval --> queued: 承認（再開ジョブを登録）
     waiting_approval --> queued: 却下（操作せず再計画ジョブを登録）
     waiting_approval --> needs_attention: 承認期限切れ
+    needs_attention --> queued: 不明操作・期限切れ承認を解決して再開
+    needs_attention --> cancelled: ユーザーが終了を選択
     running --> failed
     running --> cancelled
     running --> needs_attention
     succeeded --> queued: 新しいユーザー指示で同じタスクを継続
     failed --> [*]
     cancelled --> [*]
-    needs_attention --> [*]
 ```
 
 - `queued`: 受付済み、実行待ち
@@ -320,13 +343,15 @@ stateDiagram-v2
 - `running`: サブタスクまたは統合処理を実行中
 - `waiting_approval`: 副作用のある操作に対するユーザー承認待ち
 - `succeeded`: 完了条件を満たして正常終了
-- `failed`: 回復可能な手段が尽きて異常終了
+- `failed`: 回復可能な手段が尽きて異常終了。終端状態とし、同一タスクでは再開しない
 - `cancelled`: ユーザーがキャンセル
-- `needs_attention`: 再起動時に安全な自動再開ができない等、ユーザー判断が必要
+- `needs_attention`: 再起動時に安全な自動再開ができない、または承認期限が切れた等、ユーザー判断が必要。タスクを終了状態にせず、解決APIで再開または終了を選択する
 
 各状態遷移はDBトランザクションで更新し、同じトランザクション内でイベントを記録する。無効な遷移は拒否する。サブタスクは`pending`、`ready`、`running`、`waiting_approval`、`succeeded`、`failed`、`blocked`、`cancelled`の状態を持つ。依存先がすべて成功した場合のみ`ready`にする。
 
 タスクは実行状態が`succeeded`になった後も会話スレッドとして保持する。完了済みタスクに新しいユーザーメッセージが届くと、同じ`task_id`と履歴を引き継いで`queued`へ戻し、新しい実行サイクルを開始する。実行中または承認待ちに届いたメッセージは履歴に保存して受信確認する。実行中の場合は現在のモデル呼び出しやサブエージェント処理を完了・保存してから、次の判断チェックポイントでWorkerがPostgreSQLから新指示を含む最新情報を取得し、管理エージェントが再計画する。承認待ちの場合はメッセージを保存するだけで承認要求・承認状態を変更せず、承認または却下後の再開Workerが新指示も含めて再計画する。1タスク内でユーザー指示を処理する管理エージェントのターンは直列化し、複数のサブエージェントのみを計画に従って並行実行する。
+
+`needs_attention`では、ユーザーに結果不明の副作用操作を一件ずつ提示し、「実施済み」または「未実施」の確認を必須とする。実施済みは成功扱いでスキップし、未実施のみ再実行候補とする。承認期限切れの操作は内容を再表示し、ユーザーが改めて承認または却下するまで実行しない。解決APIは未解決項目が残ったままの再開を拒否する。ユーザーが再開を選択すると、解決済み情報をDBへ保存して`queued`にし、新しいジョブを登録する。終了を選択した場合は`cancelled`にし、Sandbox作業領域を破棄する。`failed`は終端であり、再試行する場合は新しいタスクを作成する。
 
 ### 6.2 実行シーケンス
 
@@ -338,7 +363,7 @@ stateDiagram-v2
 6. サブタスク結果をスキーマ検証し、管理エージェントが統合・品質確認する。
 7. 完了条件を満たした結果、会話応答、タスク状態、イベント、ジョブ完了をDBトランザクションで永続化して`succeeded`にする。未達で回復不能な場合はエラーと実行履歴を残して`failed`または`needs_attention`にする。
 
-キャンセル要求では新規サブタスクの起動を止め、実行中処理へキャンセルを伝播する。既に開始した外部副作用を取り消せない場合はその旨を記録し、状態を明示する。
+キャンセル要求では新規サブタスクの起動を止め、実行中処理へキャンセルを伝播する。既に開始した外部副作用を取り消せない場合はその旨を記録し、実施状況が不明なら`needs_attention`としてユーザーに確認する。実行が安全に停止した場合に`cancelled`へ遷移する。
 
 既存タスクへの追加指示は専用APIでメッセージとして永続化する。実行中は処理中のモデル呼び出しやサブエージェント処理を完了・保存した後、Workerがチェックポイントで最新会話を再読込して計画へ反映する。承認待ち中は追加指示を保存するのみとし、承認要求を変更しない。承認または却下後の再開処理で追加指示を含めて再計画する。ユーザーの追加指示だけで副作用操作を承認済みにしてはならない。
 
@@ -408,21 +433,48 @@ UIの認証はサーバー側セッションで行い、管理者UIと一般ユ�
 |---|---|---|
 | `POST` | `/api/auth/login` | メールアドレス／パスワードでログインし、サーバー側セッションを発行 |
 | `POST` | `/api/auth/logout` | セッションを破棄 |
-| `POST` | `/api/admin/users` | 管理者が一般ユーザーを登録 |
+| `POST` | `/api/admin/users` | 管理者が一般ユーザーを登録し、初期パスワードを設定 |
+| `POST` | `/api/admin/users/{user_id}/password-reset` | 管理者が初期パスワードを再設定し、次回ログイン時の変更を必須化 |
+| `GET` | `/api/admin/operations/tasks` | タスクID、所有ユーザー、状態、時刻、エラー要約、使用量・コストなど運用情報を取得。指示文・会話・成果物は返さない |
+| `GET` | `/api/admin/settings` | アプリ運用設定とVaultキー設定状態を取得。キーそのものは返さない |
+| `PUT` | `/api/admin/settings` | アプリ運用設定をPostgreSQLへ保存し、新規タスクの設定として適用 |
+| `PUT` | `/api/admin/secrets/openai-api-key` | 管理者がリクエスト本文の`api_key`をVault KV v2へ登録・更新し、成功後に非秘密の設定済み状態を記録。値は応答へ含めない |
 | `POST` | `/api/account/password` | ログイン中ユーザーが本人確認後にパスワードを変更 |
 | `POST` | `/api/account/access-key` | ログイン中ユーザーのアクセスキーを発行または再発行 |
 | `POST` | `/api/tasks` | タスクを作成し、実行をキューに登録 |
 | `GET` | `/api/tasks` | タスク一覧を取得（状態・ページングのフィルター対応） |
 | `GET` | `/api/tasks/{task_id}` | タスク、サブタスク、最終結果を取得 |
+| `DELETE` | `/api/tasks/{task_id}` | 解決済みの終端タスクと会話・イベント・成果物等の関連データを削除 |
 | `GET` | `/api/tasks/{task_id}/messages` | タスク固有の会話履歴を時系列で取得 |
+| `GET` | `/api/tasks/{task_id}/artifacts/{artifact_id}` | 所有者認可後に成果物をストリーミングダウンロード |
 | `POST` | `/api/tasks/{task_id}/messages` | タスク固有の会話へユーザー指示を追加し、必要に応じて実行を継続 |
 | `POST` | `/api/tasks/{task_id}/cancel` | タスクをキャンセル |
-| `POST` | `/api/tasks/{task_id}/resume` | 再開可能なタスクを再開 |
+| `POST` | `/api/tasks/{task_id}/resolve` | `needs_attention`中の各不明操作の実施状況・期限切れ承認を解決し、再開または終了を確定 |
 | `GET` | `/api/tasks/{task_id}/events` | `Last-Event-ID`対応のSSEイベントストリーム |
 | `POST` | `/api/approvals/{approval_id}/decision` | 承認または却下を記録 |
 | `GET` | `/api/health` | 生存・依存コンポーネントのヘルス情報 |
 
 タスク作成要求は`instruction`、任意の`context`、任意の実行制約を受け取り、初期指示を会話履歴へ保存する。タスクには認証済みユーザーの`owner_id`を付与する。タスク、初期メッセージ、イベント、耐久ジョブは同一DBトランザクションで作成し、コミット後にWorkerが処理する。追加メッセージ要求は`content`を受け取り、対象タスクの所有権・操作権限を検証したうえで連番付きで追記する。追加指示は実行中・承認待ち・完了済みのタスクで受け付ける。完了済みタスクはメッセージ保存と同一トランザクションで新しい実行サイクルのジョブを登録して`queued`に戻す。実行中はメッセージのみを永続化し、現在のモデル呼び出し等を完了・保存してからWorkerがチェックポイントで最新会話を再読込する。承認待ち中もメッセージを保存するだけで承認要求は変更せず、承認または却下後の再開Workerが追加指示を含めて再計画する。承認APIは決定を永続化し、承認時は実行再開ジョブを、却下時は対象操作を実行せず再計画するジョブを登録する。承認期限切れは自動実行ジョブを登録せず、要確認状態にする。クライアントからモデルIDや任意ツールを無条件に指定できる設計にはせず、許可済みサーバー設定の範囲内でのみ選択可能とする。APIは入力検証エラー、認証失敗、状態競合、内部依存障害を適切なHTTPエラーとして返す。
+
+失敗したタスクは終端状態とし、再試行は新しいタスクとして作成する。`needs_attention`の解決APIでは、結果が不明な副作用操作ごとにユーザーが「実施済み」または「未実施」を指定する。実施済みは再実行せず、未実施のみ実行対象として再開ジョブへ含める。継続を選択した場合は追加指示も読み込んで`queued`へ遷移する。終了を選択した場合は`cancelled`へ遷移し、Sandbox作業領域を破棄する。承認期限切れの操作は内容を再表示し、ユーザーが改めて承認または却下できる。承認待ち・実行中・未解決の`needs_attention`状態のタスクは削除できず、`succeeded`、`failed`または`cancelled`の終端タスクのみ削除できる。タスク削除は会話、イベント、サブタスク、承認、操作履歴、成果物をまとめて削除する。
+
+解決APIの要求本文は次の形式とする。`action`は`resume`または`cancel`、`operation_outcomes[].outcome`は`performed`または`not_performed`、`approval_decisions[].decision`は`approved`または`rejected`に限定する。
+
+```json
+{
+  "action": "resume",
+  "operation_outcomes": [
+    {"execution_id": "execution-id", "outcome": "performed"}
+  ],
+  "approval_decisions": [
+    {"approval_id": "approval-id", "decision": "approved"}
+  ]
+}
+```
+
+`operation_outcomes`と`approval_decisions`は対象タスク内の各未解決項目を網羅し、該当項目がない場合は空配列とする。対象IDは当該タスクに属することを検証し、未解決の操作または承認が残る`resume`要求は状態競合として拒否する。実施済み操作は再実行せず、未実施かつ承認済みの操作だけを実行可能とする。承認後に操作内容が変化した場合は承認を無効化して再確認する。通常の承認待ちでは既存の承認APIを使い、期限切れで`needs_attention`となった承認は再表示後に解決APIで明示的な判断を受け付ける。
+
+成果物のダウンロードAPIはタスク所有者を認可し、成果物メタデータからサーバー管理の保存キーを解決して、成果物用永続ボリュームからストリーミングする。クライアント指定のファイルパスを直接開かない。APIはボリュームを読み取り専用でマウントし、書込みはWorkerのみが行う。
 
 アクセスキーは外部RESTクライアント専用のBearer認証資格情報とし、ログインUIのセッション認証とは分ける。各ユーザーにつき有効なキーは最大1本とする。発行・再発行時に十分なエントロピーを持つキーを生成し、平文は発行応答で一度だけ返し、DBにはハッシュのみを保存する。再発行は旧キーを同一トランザクションで失効させ、自動期限は設けない。一般ユーザーは自身のキーのみを発行・再発行できる。
 
@@ -437,8 +489,11 @@ UIの認証はサーバー側セッションで行い、管理者UIと一般ユ�
 - `agent.progress`
 - `tool.started` / `tool.completed` / `tool.failed`
 - `approval.requested` / `approval.resolved`
+- `approval.expired`
+- `tool.needs_confirmation`
 - `artifact.created`
 - `context.summarized`
+- `task.needs_attention` / `task.resolved`
 - `task.completed` / `task.failed`
 
 SSEは状態更新ごとに永続化済みイベントを送る。再接続時はLast-Event-ID以降を再送する。重複配信を許容し、クライアントはイベントIDで重複排除する。内部の隠れた思考過程（Chain-of-Thought）は配信・保存しない。ユーザー向けの進捗要約、計画概要、ツール呼び出し・結果、エラー、成果物のみを表示する。
@@ -449,21 +504,29 @@ SSEは状態更新ごとに永続化済みイベントを送る。再接続時�
 
 | テーブル | 主な項目 | 用途 |
 |---|---|---|
-| `users` | `id`, `email`, `password_hash`, `role`, `is_active`, `created_at`, `updated_at` | 管理者・一般ユーザーのアカウントと権限。パスワード平文は保存しない |
+| `users` | `id`, `email`, `password_hash`, `role`, `is_active`, `must_change_password`, `created_at`, `updated_at` | 管理者・一般ユーザーのアカウントと権限。初期パスワード再設定後の変更強制フラグを持ち、平文は保存しない |
 | `api_access_keys` | `id`, `user_id`, `key_hash`, `created_at`, `revoked_at` | ユーザーにつき有効キーを最大1本保持。ハッシュのみ保存し、自動期限は設けない |
-| `web_sessions` | `id`, `user_id`, `session_token_hash`, `csrf_token_hash`, `created_at`, `expires_at`, `revoked_at` | Web UIのサーバー側セッション。ブラウザーCookieには不透明なセッショントークンのみを保持 |
+| `web_sessions` | `id`, `user_id`, `session_token_hash`, `csrf_token_hash`, `created_at`, `last_seen_at`, `absolute_expires_at`, `revoked_at` | Web UIのサーバー側セッション。アイドル30分、絶対有効期間12時間。Cookieには不透明なセッショントークンのみを保持 |
 | `tasks` | `id`, `owner_id`, `instruction`, `status`, `created_at`, `updated_at`, `result`, `error`, `config_snapshot` | タスク本体と所有者、再開に必要な実行設定。`instruction`は初期指示の表示用で、会話の正本はメッセージ履歴 |
+| `system_settings` | `id`, `settings_json`, `openai_key_configured`, `version`, `updated_by`, `updated_at` | 管理画面から変更するアプリ運用設定とOpenAIキー設定済み状態の正本。キー自体・接続先等のデプロイ設定は格納しない |
 | `task_leases` | `task_id`, `owner_id`, `lease_expires_at`, `fencing_token`, `updated_at` | タスクごとの管理エージェント処理を単一Workerに限定する実行リース |
 | `execution_slots` | `scope`, `slot_id`, `owner_id`, `lease_expires_at`, `fencing_token`, `updated_at` | Workerレプリカ間で共有する同時実行枠・外部API呼び出し枠の期限付きリース |
 | `rate_limit_buckets` | `provider`, `window_start`, `requests_used`, `tokens_reserved`, `updated_at` | Workerレプリカ間で共有するRPM／TPM等のレート制限カウンター |
 | `conversation_messages` | `id`, `task_id`, `sequence`, `role`, `content`, `created_at` | タスク固有のユーザー指示と管理エージェント応答を時系列で保存 |
 | `subtasks` | `id`, `task_id`, `title`, `status`, `dependencies`, `model_id`, `skill_names`, `attempt`, `result`, `error` | 計画された作業単位と依存関係 |
 | `events` | `id`, `task_id`, `subtask_id`, `type`, `payload_json`, `created_at` | 監査履歴、SSE再送、画面進捗 |
-| `approvals` | `id`, `task_id`, `subtask_id`, `action_json`, `status`, `requested_at`, `resolved_at`, `expires_at` | 副作用操作の承認状態 |
+| `approvals` | `id`, `task_id`, `subtask_id`, `action_json`, `status`, `requested_at`, `resolved_at`, `expires_at` | `pending`／`approved`／`rejected`／`expired`で副作用操作の承認状態を管理 |
+| `tool_executions` | `id`, `task_id`, `subtask_id`, `approval_id`, `action_fingerprint`, `status`, `confirmed_outcome`, `confirmed_by`, `confirmed_at`, `started_at`, `completed_at`, `result_summary` | 副作用操作の実施状態と`needs_attention`時のユーザー確認結果を追跡 |
+| `artifacts` | `id`, `task_id`, `storage_key`, `filename`, `media_type`, `size_bytes`, `checksum`, `created_at` | 成果物用永続ボリューム内のファイルメタデータ。DBにはパスではなくサーバー管理キーを保存 |
+| `usage_records` | `id`, `task_id`, `user_id`, `model_id`, `input_tokens`, `output_tokens`, `cost`, `created_at` | 管理者向け運用集計および利用量・コストの確認 |
 | `jobs` | `id`, `task_id`, `status`, `available_at`, `lease_owner`, `lease_expires_at`, `attempt`, `created_at`, `updated_at` | ワーカーが取得する耐久ジョブキューとリース状態 |
 | `summaries` | `id`, `task_id`, `through_event_id`, `content`, `created_at` | コンテキスト圧縮結果と対象履歴位置 |
 
-`users.email`は正規化した一意値とし、`users.role`は`admin`または`user`に限定する。`api_access_keys.user_id`は一意とし、ユーザーに複数の現行キーが存在しないよう制約する。タスクおよびユーザー所有リソースへのアクセスでは所有者を認可条件に含める。`jobs`の取得はPostgreSQLの行ロック（例: `FOR UPDATE SKIP LOCKED`）と期限付きリースで競合制御し、`jobs(status, available_at, lease_expires_at)`にインデックスを設ける。タスク単位の管理エージェント実行は`task_leases`で排他し、共有同時実行枠は`execution_slots`で管理する。RPM／TPM等の時間窓制限は`rate_limit_buckets`の共有カウンターまたはトークンバケットを用い、Worker内カウンターだけで制御しない。リースの新規取得・引き継ぎ時に単調増加する`fencing_token`を発行し、書き込みトランザクションで現在のトークンと照合して、期限切れリースを持つ旧Workerからの遅延書き込みを拒否する。タスク／メッセージ／イベントとジョブ登録は同一トランザクションで確定し、DBコミット後にWorkerが処理する。`conversation_messages`は`task_id`と`sequence`の組を一意にし、`role`は`user`または`assistant`に限定する。メッセージの追加と連番発行をトランザクション内で行い、ユーザー指示の保存とタスク再キュー化が必要な場合はそれらも同一トランザクションで確定する。ユーザー／管理エージェント間の会話本文はこのテーブルを正本とし、`events`は状態・進捗・配信再開に用いる。`conversation.message_added`イベントにはメッセージID、ロール、連番を含め、会話本文を重複保存しない。UIはイベント受信後、必要に応じて会話履歴APIからメッセージを取得する。サブエージェントの内部コンテキストや隠れた思考過程を会話履歴として記録・共有しない。
+`users.email`は正規化した一意値とし、`users.role`は`admin`または`user`に限定する。`api_access_keys.user_id`は一意とし、ユーザーに複数の現行キーが存在しないよう制約する。タスクおよびユーザー所有リソースへのアクセスでは所有者を認可条件に含める。`system_settings`にはモデルID・パラメーター、エージェント同時実行数、リトライ条件、承認期限、Sandbox egress許可リスト等すべてのアプリ運用設定を保存するが、接続先・認証情報などデプロイ設定は含めない。設定更新は新規タスクから適用し、既存タスクは作成時の`config_snapshot`を維持する。Sandbox egress許可リストはタスク設定スナップショットとしてSandboxサービスへ渡し、ネットワーク層でも強制する。
+
+`tool_executions.status`は`pending`、`running`、`succeeded`、`failed`、`unknown`、`resolved_performed`、`resolved_not_performed`のいずれかとする。実行結果が判定不能な操作だけを`unknown`として提示し、ユーザーの確認を`confirmed_outcome`、`confirmed_by`、`confirmed_at`へ記録する。`approvals.status`が`pending`のまま期限切れとなった場合は`expired`へ更新し、タスクを`needs_attention`へ遷移させる。期限切れ承認のユーザー判断は新しい解決記録として監査可能にする。
+
+`jobs`の取得はPostgreSQLの行ロック（例: `FOR UPDATE SKIP LOCKED`）と期限付きリースで競合制御し、`jobs(status, available_at, lease_expires_at)`にインデックスを設ける。タスク単位の管理エージェント実行は`task_leases`で排他し、共有同時実行枠は`execution_slots`で管理する。RPM／TPM等の時間窓制限は`rate_limit_buckets`の共有カウンターまたはトークンバケットを用い、Worker内カウンターだけで制御しない。リースの新規取得・引き継ぎ時に単調増加する`fencing_token`を発行し、書き込みトランザクションで現在のトークンと照合して、期限切れリースを持つ旧Workerからの遅延書き込みを拒否する。タスク／メッセージ／イベントとジョブ登録は同一トランザクションで確定し、DBコミット後にWorkerが処理する。`conversation_messages`は`task_id`と`sequence`の組を一意にし、`role`は`user`または`assistant`に限定する。メッセージの追加と連番発行をトランザクション内で行い、ユーザー指示の保存とタスク再キュー化が必要な場合はそれらも同一トランザクションで確定する。ユーザー／管理エージェント間の会話本文はこのテーブルを正本とし、`events`は状態・進捗・配信再開に用いる。`conversation.message_added`イベントにはメッセージID、ロール、連番を含め、会話本文を重複保存しない。UIはイベント受信後、必要に応じて会話履歴APIからメッセージを取得する。サブエージェントの内部コンテキストや隠れた思考過程を会話履歴として記録・共有しない。
 
 スキーマにはインデックスとして`tasks(status, updated_at)`、`conversation_messages(task_id, sequence)`、`subtasks(task_id, status)`、`events(task_id, id)`を設ける。イベントは追記型とし、秘密情報や不要なプロンプト全文を記録しない。`config_snapshot`にはモデル選択など再現に必要な非秘密設定のみ保存し、APIキーを含めない。PostgreSQLのバックアップ、資格情報、ネットワークアクセスは運用設定で保護する。
 
@@ -476,23 +539,25 @@ SSEは状態更新ごとに永続化済みイベントを送る。再接続時�
 ### 10.1 アカウント認証とアクセスキー
 
 - 初期管理者は初回起動時に`INITIAL_ADMIN_EMAIL`と`INITIAL_ADMIN_PASSWORD`環境変数から初期化する。初期化処理は既存アカウントを重複作成せず、初期化後は環境変数を削除またはSecret Storeから外す運用とする。管理者は管理者ダッシュボードから一般ユーザーを登録する。
-- 一般ユーザーはメールアドレスとパスワードでログインする。パスワードは適切な一方向パスワードハッシュとして保存し、変更時には現在のパスワードを再確認する。
-- Web UIはサーバー側セッションを利用し、Cookieに`HttpOnly`、`Secure`（TLS環境）、`SameSite`属性を設定する。状態変更要求にはCSRF対策を適用し、ログアウト、期限切れ、資格情報変更時にセッションを失効させる。
+- 管理者が一般ユーザーを登録するときに初期パスワードを設定し、`must_change_password`を有効にする。初回ログイン後はパスワード変更が完了するまで、パスワード変更以外のAPI操作を許可しない。パスワード忘れ時は管理者が初期パスワードを再設定し、同じく次回ログイン時の変更を必須とする。
+- 一般ユーザーはメールアドレスとパスワードでログインする。パスワードは適切な一方向パスワードハッシュとして保存し、本人による変更時には現在のパスワードを再確認する。変更成功時は他の有効セッションを失効させる。
+- Web UIはサーバー側セッションを利用し、最後の操作から30分のアイドル期限とログインから12時間の絶対期限を適用する。Cookieに`HttpOnly`、`Secure`（TLS環境）、`SameSite`属性を設定する。状態変更要求にはCSRF対策を適用し、ログアウト、期限切れ、資格情報変更時にセッションを失効させる。
 - 外部RESTクライアント用アクセスキーはユーザー単位で一つだけ有効とする。キーの平文は発行・再発行レスポンスで一度だけ表示し、DBには検証用ハッシュのみ保存する。再発行時は旧キーを即時失効させ、自動期限は設けない。キーが漏えいした場合は再発行で失効できるようにする。
-- タスクと関連リソースは`owner_id`により認可し、一般ユーザーは自身のデータのみ操作できる。管理者専用のユーザー管理操作は管理者ロールで保護する。アクセスキー、セッショントークン、パスワードをログやイベントへ記録しない。
+- タスクと関連リソースは`owner_id`により認可し、一般ユーザーは自身のデータのみ操作できる。管理者専用のユーザー管理操作は管理者ロールで保護する。管理者の運用画面はタスクID、所有者、状態、時刻、エラーコード／要約、利用量・コスト等に限定し、通常の運用ではユーザーの指示文・会話・成果物を閲覧できない。アクセスキー、セッショントークン、パスワードをログやイベントへ記録しない。
 
-### 10.2 BYOKキー管理
+### 10.2 OpenAI APIキー管理
 
-- 優先順位は、OS／デプロイ環境のSecret Store等から注入される秘密情報、次いで環境変数`OPENAI_API_KEY`とする。UI上にキー入力機能を実装する場合も、キーはメモリ上またはOS保護ストレージに保存し、平文DB・ログ・イベント・ブラウザー永続ストレージには保存しない。
-- APIキーはバックエンドからOpenAI APIへ送信する目的に限定し、UI、サブエージェントのプロンプト、ツール引数へ渡さない。
-- キー未設定・無効時はタスク実行を明示的なエラーで止める。ダミー値や成功扱いの代替動作をしない。
-- TLSを使用し、エラー本文・HTTPヘッダー・例外にキーが含まれないようログをマスキングする。
+- OpenAI APIキーは管理者が管理者ダッシュボードから登録するシステム共通キーとし、HashiCorp VaultのKV v2に保存する。設定画面は登録済み／未登録の状態だけを表示し、保存済みキーを再表示しない。PostgreSQL、ログ、イベント、ブラウザー永続ストレージにはキーを保存しない。
+- キー設定状態は、Vaultへの書込みが成功した後に`system_settings.openai_key_configured`へ記録する非秘密の状態フラグから表示する。管理APIはVaultキーを読み取らず、Vault KVの書込み権限のみを持つ。
+- 管理APIとWorkerにはVault AppRoleを別々に割り当てる。管理API用AppRoleは指定KVパスへの書込みに限定し、Worker用AppRoleは読取り専用とする。`role_id`と`secret_id`はDocker Secrets等のアクセス制限された読み取り専用ファイルから取得し、DBやイメージへ格納しない。Vaultのmount/pathはデプロイ設定とする。
+- Workerは各OpenAI API呼び出しの直前にVaultから最新キーを取得して公式SDKへ適用する。キー更新は以降の新しい呼び出しに反映される。Vault障害またはキー未設定・無効時はモデル呼び出しを明示的に失敗させ、古いキャッシュ値やダミー値へフォールバックしない。
+- APIキーはバックエンドからOpenAI APIへ送信する目的に限定し、UI、サブエージェントのプロンプト、ツール引数へ渡さない。TLSを使用し、エラー本文・HTTPヘッダー・例外にキーが含まれないようログをマスキングする。
 
 ### 10.3 承認とサンドボックス
 
 - ファイル書き換え、シェルコマンド、外部APIの更新系呼び出しなど副作用を伴うツールは、実行前に承認を要求する。読み取り専用処理も許可されたパス・ネットワーク範囲を超えない。
 - 承認対象は操作内容、対象リソース、引数の要約、要求時点の識別子を固定して表示する。承認後に引数が変わった場合は承認を無効化して再確認する。
-- コマンド・ファイル操作はWorkerとは分離したSandboxサービス／コンテナで実行する。`task_id`ごとの隔離ワークスペースは複数のツール呼び出し間で維持し、タスク終了時に破棄する。成果物のみを明示的な検証済み経路で取り出し、ユーザー指定のホストパスや資格情報はマウントしない。
+- コマンド・ファイル操作はWorkerとは分離したSandboxサービス／コンテナで実行する。`task_id`ごとの隔離ワークスペースは複数のツール呼び出し間で維持し、正常終了時に破棄する。`needs_attention`中は解決まで保持し、再開後の正常終了またはユーザーの終了選択時に破棄する。成果物のみを明示的な検証済み経路で取り出し、ユーザー指定のホストパスや資格情報はマウントしない。
 - Sandboxからの外向き通信は既定で禁止し、管理者が設定した宛先許可リストに一致する通信のみ許可する。ネットワーク、プロセス権限、CPU・メモリ・実行時間を制限し、ユーザー指示・モデル出力から許可リストを変更できない。
 - サンドボックスを利用できない場合、危険な操作をホスト上で代替実行してはならない。該当ツールを失敗または承認不能として報告する。
 - スキルコードは任意コード実行能力を持つ信頼境界として扱う。許可されたプライベートソースのみをロードし、ロード元とバージョンを記録する。
@@ -518,38 +583,45 @@ APIには認証境界を設け、セッション認証ではCSRF対策、厳格�
 ### 12.2 管理者向けUI
 
 - 管理者専用セッションと管理者ロールを必須とし、一般ユーザーからアクセスできない独立した管理画面として提供する。
-- 管理者が一般ユーザーを登録し、運用設定・診断情報を確認できる。
-- モデル設定、同時実行上限、スキル／RAGロード状態などの運用情報を表示する。秘密情報は伏字で扱い、キー等を再表示しない。
+- 管理者が一般ユーザーの登録・初期パスワード設定・アカウント有効／無効化・パスワード再設定を行う。
+- 運用画面にはタスクID、所有ユーザー、状態、時刻、エラーコード／要約、使用量・コスト等を表示する。ユーザーの指示文、会話履歴、成果物は通常の運用画面に表示しない。
+- モデルID・パラメーター、同時実行上限、リトライ条件、承認期限、Sandbox外向き通信許可リスト等のアプリ運用設定を管理する。設定はPostgreSQLへ保存し、新規タスクから適用する。既存タスクは作成時の設定スナップショットを維持する。
+- システム共通OpenAIキーをVaultへ登録・更新する。画面には登録済み／未登録の状態だけを表示し、保存済みキーを再表示しない。
 
 ### 12.3 一般ユーザー向けUI
 
 - **ログイン**: メールアドレス／パスワードで認証し、サーバー側セッションを開始する。
+- **初回ログイン**: 管理者が設定した初期パスワードでログインした場合、本人がパスワードを変更するまで他の画面・APIを利用できない。
 - **タスクダッシュボード／詳細**: ログインユーザー自身のタスク一覧・詳細・会話・承認・成果物を表示し、新規タスクを並行投入可能とする。ユーザー所有権はAPI側で検証する。
 - **タスクへの追加指示**: 実行中の追加指示は会話に保存し、処理中呼び出しの完了・保存後のチェックポイントで反映する。
-- **承認ダイアログ**: 操作内容・対象・影響を提示し、承認・却下を明示的に選択させる。承認待ちを見落とさない表示を行う。
+- **承認・要確認ダイアログ**: 操作内容・対象・影響を提示し、承認・却下を明示的に選択させる。`needs_attention`では結果不明の副作用ごとに実施済み／未実施を確認し、期限切れ承認は改めて判断させる。再開または終了を選べるようにする。
+- **成果物・タスク削除**: タスク所有者が個別成果物をダウンロードできる。`succeeded`、`failed`、`cancelled`のタスクは削除でき、実行中・承認待ち・未解決タスクの削除は許可しない。
 - **アカウント設定**: 本人確認付きパスワード変更と、外部RESTクライアント用アクセスキーの発行・再発行を提供する。アクセスキーは発行時のみ平文表示し、再表示しない。
 - **進捗表示**: エージェントの内部思考をそのまま表示せず、状態、進捗要約、実行中ツール、承認待ち、生成された成果物を表示する。通信断時は再接続状態を明示し、SSE再開後にサーバー上の確定状態と同期する。画面上の表示だけをタスク状態の正として扱わない。
 
 ## 13. 設定・デプロイ
 
-設定は環境変数またはアクセス制限された設定ファイルで提供する。最低限、以下を設定可能とする。
+アプリ運用設定とデプロイ設定を分離する。モデル・エージェント実行・承認・Sandbox通信許可など運用中に管理者が変更する値は管理者ダッシュボードから更新し、PostgreSQLを正本とする。環境変数は初期値または接続先等のデプロイ設定に限定し、アプリ運用設定の継続的な上書き元にはしない。設定変更は新規タスクにのみ適用し、既存タスクは作成時に保存した設定スナップショットで継続する。
 
-| 設定項目 | 内容 |
+| デプロイ設定 | 内容 |
 |---|---|
-| `OPENAI_API_KEY` | OpenAI APIキー（Secret Store経由を推奨） |
-| `OPENAI_BASE_URL` | APIエンドポイント（必要な環境のみ） |
-| `MANAGER_MODEL` | 管理エージェントのモデルID |
-| `WORKER_MODEL` | サブエージェントの既定モデルID |
-| `MAX_CONCURRENT_AGENTS` | サブエージェント同時実行上限 |
-| `MAX_AGENT_ATTEMPTS` | 自己修復の最大試行数（仕様上限3） |
-| `DATABASE_URL` | 開発・テスト・本番共通のPostgreSQL接続先 |
+| `DATABASE_URL` | PostgreSQL接続先。開発・テスト・本番すべてPostgreSQLを使用 |
+| `MANAGER_MODEL` | 管理者画面での初期設定に用いる管理エージェントのモデルID。必須。未設定時は起動時に明示エラー |
+| `WORKER_MODEL` | 管理者画面での初期設定に用いるサブエージェントの既定モデルID。必須。未設定時は起動時に明示エラー |
 | `INITIAL_ADMIN_EMAIL` | 初回起動時に作成する初期管理者のメールアドレス |
-| `INITIAL_ADMIN_PASSWORD` | 初期管理者の初期パスワード（Secret Store経由を推奨） |
-| `WORKER_REPLICAS` | Workerコンテナ数（初期値1。デプロイ環境側のスケール設定） |
-| `PRIVATE_SKILLS_PATH` | プライベートスキルディレクトリ |
-| `KNOWLEDGE_ADAPTER` | RAGアダプターの実装選択 |
-| `SANDBOX_BACKEND` | サンドボックス実装の選択 |
-| `SANDBOX_EGRESS_ALLOWLIST` | Sandboxからの外向き通信を許可する宛先リスト（未設定時は全拒否） |
+| `INITIAL_ADMIN_PASSWORD` | 初期管理者作成用の初期パスワード。Secret Store等から一時注入し、初期化後は除去 |
+| `VAULT_ADDR` | HashiCorp Vaultの接続先 |
+| `VAULT_KV_MOUNT` | Vault KV v2のmount名 |
+| `VAULT_OPENAI_KEY_PATH` | システム共通OpenAIキーを保存するKV v2内のパス |
+| `VAULT_API_ROLE_ID_FILE` / `VAULT_API_SECRET_ID_FILE` | 管理API用AppRole資格情報を読み込む制限付きファイル |
+| `VAULT_WORKER_ROLE_ID_FILE` / `VAULT_WORKER_SECRET_ID_FILE` | Worker用読取専用AppRole資格情報を読み込む制限付きファイル |
+| `OPENAI_BASE_URL` | OpenAI API接続先のデプロイ設定。標準接続先以外を利用する場合のみ設定 |
+| `PRIVATE_SKILLS_PATH` | 読み取り専用でマウントするプライベートスキルディレクトリ |
+| `SANDBOX_BACKEND` | Sandboxサービスの実装・接続先を選ぶデプロイ設定 |
+| `KNOWLEDGE_ADAPTER` | デプロイ時に接続するRAGアダプター実装 |
+| `WORKER_REPLICAS` | Workerコンテナ数。デプロイ環境側で管理し、初期値は1 |
+
+モデル設定の初期レコードは`MANAGER_MODEL`と`WORKER_MODEL`から作成する。初期化後のモデルID・パラメーター、`MAX_CONCURRENT_AGENTS`、`MAX_AGENT_ATTEMPTS`、承認期限、Sandbox egress許可リスト等は管理者画面からPostgreSQLへ保存する。`MAX_AGENT_ATTEMPTS`は最大3回を超える値に設定できない。Sandbox egress許可リストが未設定の場合は全拒否とする。OpenAI APIキーを保持する`OPENAI_API_KEY`環境変数は使用しない。
 
 初期デプロイは単一ホスト上の複数コンテナ（nginx（推奨）、Admin UI、User UI、API、Worker 1台、PostgreSQL、Sandboxサービス）を想定する。本番公開時はTLS、ユーザー認証、レート制限、Secrets管理、DBバックアップ、監査ログ保護を必須にする。nginxは管理者UI、一般ユーザーUI、APIへのルーティングを行い、SSEではプロキシバッファリングを無効化して長時間接続を許容する。Workerを複数台または別ホストへ拡張する場合も、PostgreSQL上の共有ジョブリースと同時実行制御を利用する。SSEはAPIが永続化済みイベントをDBから取得するため、APIレプリカ間のインメモリ状態共有を前提としない。Compose等でSecrets機能が不足する環境では、権限を制限した環境注入や外部Secrets管理を用い、秘密情報をイメージやバージョン管理対象の設定へ記載しない。
 
@@ -558,16 +630,17 @@ APIには認証境界を設け、セッション認証ではCSRF対策、厳格�
 | 観点 | 受け入れ条件 |
 |---|---|
 | マルチタスク | 複数の独立タスクを投入でき、UIで個別の状態・イベントを追跡できる |
-| 認証・権限 | 初期管理者を環境変数から安全に初期化でき、一般ユーザー登録、ユーザー所有範囲の分離、管理者権限の分離が機能する |
-| セッション | メールアドレス／パスワードでUIログインし、サーバー側セッション、ログアウト、CSRF防御、パスワード変更が機能する |
+| 認証・権限 | 初期管理者を環境変数から安全に初期化でき、一般ユーザー登録・初回パスワード変更強制・管理者による再設定、所有範囲の分離、管理者権限の分離が機能する |
+| セッション | メールアドレス／パスワードでUIログインし、アイドル30分・絶対12時間のサーバー側セッション、ログアウト、CSRF防御、本人確認付きパスワード変更が機能する |
 | アクセスキー | 1ユーザー1本を維持し、平文は発行時のみ返し、ハッシュのみ保存し、再発行で旧キーが直ちに無効化される |
 | 計画と並行実行 | 依存タスクは順序を守り、独立タスクは設定上限内で並行実行される |
-| BYOK | キー未設定・無効時に明示的に失敗し、キーがDB・UI・ログへ漏れない |
+| OpenAI APIキー | 管理者がキーをVault KV v2へ登録でき、画面には設定済み状態のみ表示される。AppRole権限がAPI書込／Worker読取に分離され、各モデル呼び出しで最新キーを取得し、更新が後続呼び出しへ反映される。Vault障害・キー未設定時は明示的に失敗し、キーがDB・UI・ログへ漏れない |
 | レート制御 | 429応答でバックオフし、上限後は失敗理由が記録・表示される |
 | 構造化出力 | 不正な計画・結果・ツール引数を拒否し、成功として扱わない |
 | 自己修復 | 形式崩れ・ツールエラーに対する試行が最大3回で停止する |
-| 承認 | 副作用操作は承認前に実行されず、却下・期限切れ後にも実行されない |
-| サンドボックス | Workerから分離したSandboxでタスク単位のワークスペースを呼び出し間で維持し、終了後に破棄する。成果物のみを許可経路で出力し、ホスト外への意図しないファイルアクセスや権限昇格を制限する |
+| 承認・要確認 | 副作用操作は承認前に実行されず、却下後は実行されない。期限切れ操作は`needs_attention`で再表示され、再承認／却下される。実行結果不明時は操作ごとの実施済み／未実施確認後に限り再開し、終了選択は`cancelled`となる。`failed`は同一タスクで再開されない |
+| 成果物 | 所有者のみが個別ダウンロードでき、APIは読み取り専用で配信する。タスク削除で成果物と関連データが削除され、実行中・承認待ち・未解決タスクは削除できない |
+| サンドボックス | Workerから分離したSandboxでタスク単位のワークスペースを呼び出し間で維持し、通常の終了時に破棄する。`needs_attention`中は保持し、再開後の正常終了またはユーザーの終了選択で破棄する。成果物のみを許可経路で出力し、ホスト外への意図しないファイルアクセスや権限昇格を制限する |
 | Sandboxネットワーク | 外向き通信は既定拒否であり、管理者許可リストの宛先だけが到達可能となる |
 | 資産分離 | 公開コアにプライベートスキル・ナレッジ・キーが含まれず、アダプター経由で接続できる |
 | SSE再接続 | 切断後、Last-Event-ID以降のイベントを再取得して状態を同期できる |
@@ -575,6 +648,8 @@ APIには認証境界を設け、セッション認証ではCSRF対策、厳格�
 | コンテキスト管理 | 長期実行の要約がイベント記録され、重要な制約・完了条件を保持する |
 | コンテナ分離 | APIとWorkerが別コンテナで稼働し、Workerを追加してもPostgreSQL上のジョブリースと同時実行上限が共有される |
 | UIコンテナ分離 | Admin UIとUser UIが別コンテナで配信され、nginx（または採用したリバースプロキシ）で個別にルーティングされる。User UIの配信資産に管理者専用画面を含めない |
+| 管理者の閲覧範囲 | 管理画面の運用情報に会話本文、ユーザー指示、成果物が含まれず、運用メタデータ・エラー要約・使用量に限定される |
+| 運用設定 | 管理者が更新したアプリ運用設定はPostgreSQLに保存され、新規タスクのみ適用される。既存タスクは作成時スナップショットを維持する。環境変数はデプロイ設定・初期値に限定される |
 | Worker状態管理 | 各実行チェックポイントでDBの最新会話・計画状態を読み、処理結果をDBへ保存する。Worker内キャッシュは正本として使わない |
 | 追加指示 | 実行中の呼び出しを完了・保存してから最新指示を再読込し、承認待ち中は承認状態を変更せず、承認／却下後に指示を含めて再計画する |
 | キュー復旧 | Worker停止後に未完了ジョブを再取得でき、実行結果が不明な副作用処理は自動再実行せず要確認状態になる |
