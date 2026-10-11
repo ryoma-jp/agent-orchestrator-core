@@ -1,0 +1,113 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: orchestrator
+      POSTGRES_USER: orchestrator
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U orchestrator -d orchestrator"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  api:
+    build: .
+    environment:
+      DATABASE_URL: ${DATABASE_URL:?Set DATABASE_URL in .env}
+      MANAGER_MODEL: ${MANAGER_MODEL:?Set MANAGER_MODEL in .env}
+      WORKER_MODEL: ${WORKER_MODEL:?Set WORKER_MODEL in .env}
+      SESSION_COOKIE_SECURE: ${SESSION_COOKIE_SECURE:-true}
+      VAULT_ADDR: ${VAULT_ADDR:-}
+      VAULT_KV_MOUNT: ${VAULT_KV_MOUNT:-secret}
+      VAULT_OPENAI_KEY_PATH: ${VAULT_OPENAI_KEY_PATH:-agent-orchestrator/openai}
+      VAULT_API_ROLE_ID_FILE: /run/secrets/vault-api-role-id
+      VAULT_API_SECRET_ID_FILE: /run/secrets/vault-api-secret-id
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    expose:
+      - "8000"
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - ${VAULT_API_ROLE_ID_SOURCE:-./secrets/vault-api-role-id}:/run/secrets/vault-api-role-id:ro
+      - ${VAULT_API_SECRET_ID_SOURCE:-./secrets/vault-api-secret-id}:/run/secrets/vault-api-secret-id:ro
+
+  worker:
+    build: .
+    profiles: ["agent"]
+    init: true
+    restart: unless-stopped
+    command: ["python", "-m", "app.worker"]
+    environment:
+      DATABASE_URL: ${DATABASE_URL:?Set DATABASE_URL in .env}
+      MANAGER_MODEL: ${MANAGER_MODEL:?Set MANAGER_MODEL in .env}
+      WORKER_MODEL: ${WORKER_MODEL:?Set WORKER_MODEL in .env}
+      MAX_CONCURRENT_AGENTS: ${MAX_CONCURRENT_AGENTS:-4}
+      MAX_AGENT_ATTEMPTS: ${MAX_AGENT_ATTEMPTS:-3}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
+      VAULT_ADDR: ${VAULT_ADDR:-}
+      VAULT_KV_MOUNT: ${VAULT_KV_MOUNT:-secret}
+      VAULT_OPENAI_KEY_PATH: ${VAULT_OPENAI_KEY_PATH:-agent-orchestrator/openai}
+      VAULT_WORKER_ROLE_ID_FILE: /run/secrets/vault-worker-role-id
+      VAULT_WORKER_SECRET_ID_FILE: /run/secrets/vault-worker-secret-id
+    volumes:
+      - ${VAULT_WORKER_ROLE_ID_SOURCE:-./secrets/vault-worker-role-id}:/run/secrets/vault-worker-role-id:ro
+      - ${VAULT_WORKER_SECRET_ID_SOURCE:-./secrets/vault-worker-secret-id}:/run/secrets/vault-worker-secret-id:ro
+    depends_on:
+      db:
+        condition: service_healthy
+
+  migrate:
+    build: .
+    profiles: ["setup"]
+    environment:
+      DATABASE_URL: ${DATABASE_URL:?Set DATABASE_URL in .env}
+    command: ["alembic", "upgrade", "head"]
+    depends_on:
+      db:
+        condition: service_healthy
+
+  bootstrap:
+    build: .
+    profiles: ["setup"]
+    environment:
+      DATABASE_URL: ${DATABASE_URL:?Set DATABASE_URL in .env}
+      MANAGER_MODEL: ${MANAGER_MODEL:?Set MANAGER_MODEL in .env}
+      WORKER_MODEL: ${WORKER_MODEL:?Set WORKER_MODEL in .env}
+      INITIAL_ADMIN_EMAIL: ${INITIAL_ADMIN_EMAIL:?Set INITIAL_ADMIN_EMAIL in .env}
+      INITIAL_ADMIN_PASSWORD: ${INITIAL_ADMIN_PASSWORD:?Set INITIAL_ADMIN_PASSWORD in .env}
+    command: ["python", "-m", "app.cli", "create-initial-admin"]
+    depends_on:
+      db:
+        condition: service_healthy
+
+  user-ui:
+    build:
+      context: .
+      dockerfile: ui/Dockerfile
+      args:
+        APP_DIR: user
+
+  admin-ui:
+    build:
+      context: .
+      dockerfile: ui/Dockerfile
+      args:
+        APP_DIR: admin
+
+  edge:
+    image: nginx:1.27-alpine
+    ports:
+      - "8080:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - api
+      - user-ui
+      - admin-ui
+
+volumes:
+  postgres_data:

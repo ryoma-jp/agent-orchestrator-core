@@ -1,0 +1,12 @@
+.git
+.venv
+.testdeps
+__pycache__
+.pytest_cache
+.env
+secrets
+private_skills
+knowledge_db
+artifacts
+ui/*/node_modules
+ui/*/dist
