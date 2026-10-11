@@ -13,6 +13,27 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
 
+  vault:
+    image: hashicorp/vault:1.20
+    profiles: ["local-vault"]
+    command:
+      - server
+      - -dev
+      - -dev-root-token-id=${VAULT_DEV_ROOT_TOKEN_ID:-local-vault-root-token}
+      - -dev-listen-address=0.0.0.0:8200
+    environment:
+      VAULT_ADDR: http://127.0.0.1:8200
+      VAULT_TOKEN: ${VAULT_DEV_ROOT_TOKEN_ID:-local-vault-root-token}
+    cap_add:
+      - IPC_LOCK
+    ports:
+      - "127.0.0.1:8201:8200"
+    healthcheck:
+      test: ["CMD-SHELL", "vault status -address=http://127.0.0.1:8200 >/dev/null 2>&1"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
   api:
     build: .
     environment:
@@ -20,11 +41,13 @@ services:
       MANAGER_MODEL: ${MANAGER_MODEL:?Set MANAGER_MODEL in .env}
       WORKER_MODEL: ${WORKER_MODEL:?Set WORKER_MODEL in .env}
       SESSION_COOKIE_SECURE: ${SESSION_COOKIE_SECURE:-true}
-      VAULT_ADDR: ${VAULT_ADDR:-}
+      VAULT_ADDR: ${VAULT_ADDR:-http://vault:8200}
       VAULT_KV_MOUNT: ${VAULT_KV_MOUNT:-secret}
       VAULT_OPENAI_KEY_PATH: ${VAULT_OPENAI_KEY_PATH:-agent-orchestrator/openai}
       VAULT_API_ROLE_ID_FILE: /run/secrets/vault-api-role-id
       VAULT_API_SECRET_ID_FILE: /run/secrets/vault-api-secret-id
+    group_add:
+      - ${VAULT_CREDENTIAL_GID:-1000}
     command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
     expose:
       - "8000"
@@ -48,11 +71,13 @@ services:
       MAX_CONCURRENT_AGENTS: ${MAX_CONCURRENT_AGENTS:-4}
       MAX_AGENT_ATTEMPTS: ${MAX_AGENT_ATTEMPTS:-3}
       OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
-      VAULT_ADDR: ${VAULT_ADDR:-}
+      VAULT_ADDR: ${VAULT_ADDR:-http://vault:8200}
       VAULT_KV_MOUNT: ${VAULT_KV_MOUNT:-secret}
       VAULT_OPENAI_KEY_PATH: ${VAULT_OPENAI_KEY_PATH:-agent-orchestrator/openai}
       VAULT_WORKER_ROLE_ID_FILE: /run/secrets/vault-worker-role-id
       VAULT_WORKER_SECRET_ID_FILE: /run/secrets/vault-worker-secret-id
+    group_add:
+      - ${VAULT_CREDENTIAL_GID:-1000}
     volumes:
       - ${VAULT_WORKER_ROLE_ID_SOURCE:-./secrets/vault-worker-role-id}:/run/secrets/vault-worker-role-id:ro
       - ${VAULT_WORKER_SECRET_ID_SOURCE:-./secrets/vault-worker-secret-id}:/run/secrets/vault-worker-secret-id:ro

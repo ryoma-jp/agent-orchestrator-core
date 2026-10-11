@@ -1,5 +1,6 @@
 .env
 secrets/
+.local-vault/
 .venv*/
 .testdeps/
 *.egg-info/
