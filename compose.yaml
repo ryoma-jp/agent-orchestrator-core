@@ -70,10 +70,12 @@ services:
       WORKER_MODEL: ${WORKER_MODEL:?Set WORKER_MODEL in .env}
       MAX_CONCURRENT_AGENTS: ${MAX_CONCURRENT_AGENTS:-4}
       MAX_AGENT_ATTEMPTS: ${MAX_AGENT_ATTEMPTS:-3}
+      TAVILY_TIMEOUT_SECONDS: ${TAVILY_TIMEOUT_SECONDS:-20}
       OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
       VAULT_ADDR: ${VAULT_ADDR:-http://vault:8200}
       VAULT_KV_MOUNT: ${VAULT_KV_MOUNT:-secret}
       VAULT_OPENAI_KEY_PATH: ${VAULT_OPENAI_KEY_PATH:-agent-orchestrator/openai}
+      VAULT_TAVILY_KEY_PATH: ${VAULT_TAVILY_KEY_PATH:-agent-orchestrator/tavily}
       VAULT_WORKER_ROLE_ID_FILE: /run/secrets/vault-worker-role-id
       VAULT_WORKER_SECRET_ID_FILE: /run/secrets/vault-worker-secret-id
     group_add:

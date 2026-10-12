@@ -11,8 +11,8 @@
 | 区分 | 現行実装（v0.1.0） | 将来設計・未実装 |
 |---|---|---|
 | 実行基盤 | PostgreSQL、FastAPI、独立API／Worker、PostgreSQLジョブ行のロックと期限付きリース | Worker間のタスク実行リース、fencing token、共有同時実行枠・RPM／TPM制御、複数Worker運用保証 |
-| エージェント | 構造化計画、依存関係に沿った読み取り専用サブタスクの並行実行、結果統合、最大3回の設定可能な試行 | Tool Calling、ファイル・シェル・外部更新操作、承認、Sandbox |
-| 拡張 | なし | 動的プライベートスキル、RAGアダプター、成果物ストレージ、コンテキスト要約 |
+| エージェント | 構造化計画、依存関係に沿った読み取り専用サブタスクの並行実行、Tavily検索Function Calling、結果統合、最大3回の設定可能な試行 | Tavily以外のツール拡張、ファイル・シェル・外部更新操作、承認、Sandbox |
+| 拡張 | Worker内の読み取り専用Tavily Web検索 | 動的プライベートスキル、RAGアダプター、成果物ストレージ、コンテキスト要約 |
 | 認証・管理 | WebセッションとCSRF、ユーザー別Bearerアクセスキー、管理者によるアカウント・モデル設定・Vaultキー管理 | より細かな権限・監査、利用量／コスト集計 |
 | UI・イベント | User UI、Admin UI、DBイベントのSSE配信とLast-Event-ID以降の再送 | 承認／副作用解決UI、成果物UI |
 
@@ -32,7 +32,7 @@
 - タスク管理UIおよびバックエンドAPI
 - 管理エージェントによる計画、サブエージェント統括、成果物の統合
 - 管理者が設定するシステム共通OpenAI APIキー認証
-- スキルの動的ロードとRAG検索インターフェース
+- 共通ツール連携、Tavilyによる一般Web検索、スキルの動的ロードとRAG検索インターフェース
 - 承認フロー、サンドボックス実行、永続化、再開処理
 - リアルタイムイベント配信
 
@@ -42,11 +42,11 @@
 - バックエンドはPython（非同期実行、プライベートPythonスキルのロードとの親和性）、HTTP APIはFastAPIを採用する。フロントエンドはTypeScriptベースとし、管理者ダッシュボードと一般ユーザー用タスクUIを別々のコンテナとして配信する。
 - バックエンドがPythonであるため、OpenAI API接続には公式OpenAI Python SDKを直接利用する。API呼び出しに必要な公式SDKを用いながら、計画、Tool Callingのループ、サブエージェント制御、永続化・再開を基盤側で制御し、PostgreSQLを唯一の状態正本として保つ。OpenAI Agents SDKのAgent／Runner状態管理には依存しない。
 - モデル名は設定値とする。GPT-6系の名称は要求上の例であり、利用可能な実モデルID・API機能を実行環境で確認して設定する。特定のモデル名や機能をコードに固定しない。
-- 知識検索用Vector DBと検索インターフェースは将来拡張であり、現行実装には含まれない。
+- 非公開ナレッジ向けVector DB／RAG検索は将来拡張であり、現行実装には含まれない。一般Web検索はWorkerからTavilyアダプターを通じて実行する読み取り専用ツールとして実装し、RAGとは別の経路で扱う。
 - ネットワークから切断中に新たなモデル応答を生成することはできない。現行実装はジョブリース失効後の再取得を行うが、途中計画からの復元ではなく、会話を再読込してタスク処理を再試行する。
 
 ## 3. システム構成
-以下の図は将来の目標構成である。現行コードにあるのはAPI、Worker、PostgreSQL、Vault、User/Admin UI、nginxであり、Skill Registry、Sandbox、RAG、成果物ストレージ、共有レート制御は未実装である。
+以下の図は将来の目標構成である。現行コードにはAPI、Worker、PostgreSQL、Vault、User/Admin UI、nginxと、Worker内のTavily読み取り専用検索がある。追加のツール登録、Skill Registry、Sandbox、RAG、成果物ストレージ、Worker間共有レート制御は未実装である。
 
 ```mermaid
 flowchart TB
@@ -68,12 +68,16 @@ flowchart TB
             AgentRunner["エージェント実行器"]
             OpenAIClient["OpenAIクライアント"]
             Throttling["同時実行・再試行制御"]
+            ToolRegistry["ツールレジストリ・実行器"]
+            TavilyAdapter["Tavily Web検索アダプター"]
             SkillRegistry["スキルレジストリ・実行器"]
             RAGAdapter["RAG検索アダプター"]
             Safety["承認・サンドボックス境界"]
             Orchestrator --> AgentRunner
             AgentRunner --> Throttling
             Throttling --> OpenAIClient
+            AgentRunner --> ToolRegistry
+            ToolRegistry --> TavilyAdapter
             Orchestrator --> SkillRegistry
             SkillRegistry --> Safety
             Orchestrator --> RAGAdapter
@@ -86,7 +90,8 @@ flowchart TB
     end
 
     OpenAI["OpenAI API<br/>管理者設定の共通キー"]
-    Vault["HashiCorp Vault<br/>KV v2: システム共通OpenAIキー"]
+    Vault["HashiCorp Vault<br/>KV v2: OpenAI/Tavilyキー"]
+    Tavily["Tavily Search API"]
     Skills["Private Skills"]
     Sandbox["Sandbox service/container<br/>task_idごとの一時ワークスペース"]
     Knowledge["Private Knowledge DB / vector store"]
@@ -101,11 +106,13 @@ flowchart TB
     EventStream -->|SSE| AdminUI
     EventStream -->|SSE| UserUI
     OpenAIClient --> OpenAI
+    TavilyAdapter --> Tavily
     SkillRegistry --> Skills
     Safety -->|隔離ツール実行・成果物入出力| Sandbox
     RAGAdapter --> Knowledge
     API -->|管理者AppRole: KV v2へ書込| Vault
     OpenAIClient -->|Worker AppRole: 呼び出しごとにキー読取| Vault
+    TavilyAdapter -->|Worker AppRole: 検索前にキー読取| Vault
 ```
 
 ### 3.1 コンポーネント責務
@@ -120,7 +127,7 @@ flowchart TB
 | エージェント実行器 | 管理エージェント／サブエージェントのプロンプトとコンテキストを構築し、モデル呼び出しを行う |
 | OpenAIクライアント | Vaultから取得したシステム共通キーで公式OpenAI Python SDKを呼び出し、タイムアウト、Structured OutputsからJSONへのフォールバック、限定的な再試行を行う。共有RPM／TPM制御・利用量計測は未実装 |
 | Worker | PostgreSQLのジョブを `FOR UPDATE SKIP LOCKED` で取得し、期限付きジョブリースを更新しながらタスクを実行する |
-| スキル／Sandbox／RAG | 現行実装なし。将来の拡張設計 |
+| ツール／スキル／Sandbox／RAG | Tavilyの読み取り専用検索をWorkerに実装。Tavily以外の追加ツール、動的スキル、Sandbox、RAGは将来の拡張設計 |
 | 永続化 | PostgreSQLにユーザー、セッション、設定、タスク、会話、サブタスク、イベント、ジョブを保存する。承認・成果物・要約・タスク実行リースは未実装 |
 | SSE配信 | PostgreSQLに保存済みのイベントを取得して順序付きでクライアントに配信し、Last-Event-IDによる再接続を支援 |
 
@@ -185,19 +192,21 @@ flowchart TB
 
 ### 4.3 サブエージェント
 
-現行実装ではサブタスクごとに設定済みWorkerモデルを用い、同一タスク内の独立した依存関係レベルを最大32件まで並行実行する。出力は `SubtaskResult`（`succeeded`／`needs_input`／`failed`、summary、findings、questions、error）で検証する。サブタスク個別の再開、スキル実行、Worker間の共有レート制限はない。
+現行実装ではサブタスクごとに設定済みWorkerモデルを用い、同一タスク内の独立した依存関係レベルを最大32件まで並行実行する。必要に応じてTavilyの読み取り専用Web検索を呼び出せる。出力は `SubtaskResult`（`succeeded`／`needs_input`／`failed`、summary、findings、sources、tool_runs、questions、error）で検証する。サブタスク個別の再開、動的スキル実行、Worker間の共有レート制限はない。
 
 ### 4.4 Tool Callingと構造化データ
 
-現行実装はOpenAI APIの`tools`を使用しない。計画、サブタスク結果、統合応答をそれぞれPydanticモデルで定義し、Responses APIのStructured Outputsで要求する。Structured Outputsが未対応の場合は通常JSONへ切り替え、同じスキーマで検証する。
+現行Workerはサブタスク実行に限りResponses APIのFunction CallingでTavily検索を呼び出す。ツール名と引数を登録内容・JSON Schemaで検証し、呼び出しは1サブタスクにつき最大3回とする。計画、サブタスク結果、統合応答は引き続きPydanticモデルのStructured Outputsで要求し、未対応の場合は通常JSONへ切り替えて同じスキーマで検証する。Tavily以外のツール実装と副作用ツールは未実装である。
 
 現行実装のサブタスク結果:
 
 ```json
 {
     "status": "succeeded",
-  "summary": "サブタスクの要約",
+        "summary": "サブタスクの要約",
     "findings": [],
+        "sources": [],
+        "tool_runs": [],
     "questions": [],
     "error": ""
 }
@@ -387,8 +396,8 @@ stateDiagram-v2
 
 要約・履歴プルーニング・要約イベントは未実装である。現行Workerは計画と最終統合の入力に会話全件を使用するため、会話の長さに応じてモデルのコンテキスト上限へ達する可能性がある。
 
-## 7. スキルとRAGの拡張設計
-この節は将来拡張の設計であり、現行コードにはスキル登録・動的ロード・Tool Calling・RAGアダプターがない。現行の計画スキーマでも`skill_names`は受け付けるが、Workerは非空のスキル指定をエラーとして拒否する。
+## 7. ツール・スキル・RAG
+この節には現行実装と将来拡張の設計を記載する。現行Workerには共通のツール登録・Function Calling実行境界とTavily検索ツールがある。動的スキルロードとRAGアダプターは未実装であり、現行の計画スキーマでも`skill_names`は受け付けるが、Workerは非空のスキル指定をエラーとして拒否する。
 
 ### 7.1 スキルインターフェース
 
@@ -431,6 +440,24 @@ flowchart TB
 ### 7.3 検索インターフェース
 
 検索アダプターは、クエリ、件数上限、任意のメタデータフィルターを受け取り、文書ID、関連箇所、スコア、出典メタデータを返す。Vector DBの認証情報・接続先はサーバー側設定に置く。コアは文書のインデックス作成・削除や具体的な埋め込み方式を固定せず、外部実装の責務とする。検索結果は出典情報付きでタスク履歴に記録する。
+
+### 7.4 共通ツール連携
+
+ツールはモデルやエージェント固有の実装から分離し、Public側の共通契約と登録済みアダプターを通じて実行する。現行実装はWorkerに共通Tool Registry／Function Calling境界を持ち、Tavily検索だけを登録する。ツール定義は一意な名前・バージョン、説明、引数JSON Schema、リスク分類、実行タイムアウト、構造化された結果・エラー形式を持つ。実装は非同期実行を基本とする。Tavilyなど外部サービス固有のAPI形式は各アダプター内に閉じ込め、オーケストレーターとエージェントには共通形式だけを見せる。複数ツールの管理UIは将来拡張である。
+
+Tool Callingの制御ループと実行判断はWorker側が担う。モデルが返したツール名と引数は登録済みツールの許可リストおよびJSON Schemaで検証してから実行し、未登録ツールや不正な引数は実行しない。承認機構が未実装の現行Registryは`read_only`以外のツールをモデルへ公開せず、実行要求も拒否する。ツールの利用可否はタスク実行時の設定で制限し、モデル出力だけで権限やネットワーク許可範囲を拡張できないようにする。ツールの実行要求・結果・エラーはタスクに紐付けて記録し、再試行はリスク分類と冪等性を考慮する。副作用を伴うツールは承認境界を通し、ファイル・シェル操作はWorker上で直接実行せずSandboxへ委譲する。
+
+ツールが外部サービスへ送信する情報は、実行に必要な最小限の入力に限定する。会話全体、システムプロンプト、認証情報、その他の秘密情報を無条件に転送しない。外部送信がタスク内容の機微性に照らして許可できない場合は呼び出しを行わず、理由をタスク結果に示す。ツール応答や取得文書は信頼できないデータとして扱い、その中の指示をシステム指示やユーザー指示として実行しない。
+
+### 7.5 Tavilyによる一般Web検索
+
+一般情報のWeb検索には、AIエージェント向け検索サービスであるTavilyを採用する。Public側にTavilyアダプターを実装し、現行Workerではサブタスクから共通ツール契約を介して呼び出す。Tavily固有のリクエスト・レスポンス形式はアダプターで変換し、他の検索プロバイダーへ移行する場合も共通ツール契約とエージェント側の利用方法を維持できるようにする。現行ツールが受け付ける引数は検索queryと結果件数（1〜5件）に限定する。
+
+このWeb検索は公開Web上の一般情報を対象とし、非公開ナレッジを検索するRAG／Vector DBとは別のツールとして扱う。検索結果はタイトル、URL、抜粋、検索スコア、公開日を正規化する。実際に返った出典はプロバイダー名・取得時刻とともに`subtasks.result`へ保存し、統合回答ではそのURLをMarkdownリンクで引用する。検索結果の内容自体は未検証の外部情報として扱う。
+
+Tavily APIキーはVaultの`VAULT_TAVILY_KEY_PATH`からWorker用AppRoleで読み取り、DB、イベント、ログ、ブラウザーには保存・返却しない。検索要求はTavilyの固定API接続先`https://api.tavily.com/search`に限定し、任意URLへのアクセスや取得ページを起点とした追加リクエストを行わない。安全検索を有効にし、結果は最大5件、応答本文は256 KB、各抜粋は1,500文字に制限する。タイムアウトと再試行回数を設定で制限し、レート制御はWorkerプロセス内で30回／分とする。Worker間で共有するレート制御は未実装である。検索クエリは必要最小限にし、APIキー・Bearer token・メールアドレス等の代表的なパターンを引数検証で拒否する。この検査は一般的な個人情報や秘密情報を完全に検出するものではない。ドメイン許可・拒否リストや検索オプションの管理UIは未実装である。
+
+現行実装は読み取り専用のTavily検索に限定する。汎用ツールの管理機能、他プロバイダー、ドメイン制限設定、外部更新操作は将来拡張であり、導入時には承認・Sandbox等の境界を別途設ける。
 
 ## 8. APIとリアルタイムイベント
 
@@ -504,7 +531,7 @@ SSEエンドポイントはタスク所有者を検証し、DBのイベントID�
 
 現行DBには上記9テーブル（`users`、`system_settings`、`api_access_keys`、`web_sessions`、`tasks`、`conversation_messages`、`subtasks`、`events`、`jobs`）がある。`users.email`は一意、roleは`admin`または`user`、有効なアクセスキーはユーザーにつき最大1本となる部分一意インデックスで制約する。所有タスクAPIは`owner_id`で認可する。管理設定として保存するのはmanager／workerモデル、最大同時サブタスク数、最大試行回数であり、新規タスク作成時に`config_snapshot`へコピーする。承認期限やSandbox許可リストは設定・DBモデルに存在しない。
 
-承認、ツール実行、成果物、利用量、要約、タスク単位リース、共有レート制御のテーブルは未実装である。将来追加する場合は、実装するAPI・状態遷移・データ保持要件に合わせてマイグレーションを設計する。
+独立したツール実行テーブルは未実装である。Tavilyの実行要求要約・成否・エラーコードと検索出典は、サブタスクの`result` JSONBに保存する。承認、成果物、利用量、要約、タスク単位リース、共有レート制御のテーブルも未実装であり、将来追加する場合はAPI・状態遷移・データ保持要件に合わせてマイグレーションを設計する。
 
 `jobs`取得ではPostgreSQL行ロック（`FOR UPDATE SKIP LOCKED`）を用い、status／available_at／lease_expires_atのインデックスで期限切れジョブを再取得する。タスク実行リースやfencing tokenはない。`conversation_messages(task_id, sequence)`は一意で、roleは`user`または`assistant`に限定する。イベントはグローバル採番IDを持ち、`task_id`で絞り込んでID順に配信する。タスク／メッセージ／イベント／ジョブの更新は各API・Worker処理のDBセッションでコミットされる。
 
@@ -532,6 +559,7 @@ SSEエンドポイントはタスク所有者を検証し、DBのイベントID�
 - 管理APIとWorkerにはVault AppRoleを別々に割り当てる。管理API用AppRoleは指定KVパスへの書込みに限定し、Worker用AppRoleは読取り専用とする。`role_id`と`secret_id`はDocker Secrets等のアクセス制限された読み取り専用ファイルから取得し、DBやイメージへ格納しない。Vaultのmount/pathはデプロイ設定とする。
 - Workerは各OpenAI API呼び出しの直前にVaultから最新キーを取得して公式SDKへ適用する。キー更新は以降の新しい呼び出しに反映される。Vault障害またはキー未設定・無効時はモデル呼び出しを明示的に失敗させ、古いキャッシュ値やダミー値へフォールバックしない。
 - APIキーはモデル要求にのみ用い、ユーザーUIへ返さない。Vault障害・キー未設定時はモデル要求を失敗させ、環境変数等のキーへフォールバックしない。キーを含むエラーのログマスキングは別途確認・運用すべき事項である。
+- Tavily APIキーは別のKV v2パス（`VAULT_TAVILY_KEY_PATH`）に保存し、Worker用AppRoleだけに読取権限を与える。管理APIはTavilyキーを読み書きせず、運用者がSecret Storeへ登録する。キーを環境変数、DB、イベント、ログ、UIへ複製しない。
 
 ### 10.3 承認とサンドボックス
 この節は将来設計であり、現行Workerはツール、承認、Sandbox、副作用実行、成果物作成を提供しない。実装前に以下の安全境界を設ける。
@@ -592,6 +620,8 @@ SSEエンドポイントはタスク所有者を検証し、DBのイベントID�
 | `VAULT_ADDR` | HashiCorp Vaultの接続先 |
 | `VAULT_KV_MOUNT` | Vault KV v2のmount名 |
 | `VAULT_OPENAI_KEY_PATH` | システム共通OpenAIキーを保存するKV v2内のパス |
+| `VAULT_TAVILY_KEY_PATH` | Tavily APIキーを保存するKV v2内のパス。Worker AppRoleのみ読取可能 |
+| `TAVILY_TIMEOUT_SECONDS` | Tavily検索要求のタイムアウト。Worker側で1〜60秒に制限 |
 | `VAULT_API_ROLE_ID_FILE` / `VAULT_API_SECRET_ID_FILE` | 管理API用AppRole資格情報を読み込む制限付きファイル |
 | `VAULT_WORKER_ROLE_ID_FILE` / `VAULT_WORKER_SECRET_ID_FILE` | Worker用読取専用AppRole資格情報を読み込む制限付きファイル |
 | `OPENAI_BASE_URL` | OpenAI API接続先のデプロイ設定。標準接続先以外を利用する場合のみ設定 |
@@ -613,8 +643,9 @@ SSEエンドポイントはタスク所有者を検証し、DBのイベントID�
 | エージェント実行 | 構造化計画、依存関係付き読み取り専用サブタスク、質問待ち、結果統合を実装 |
 | 構造化出力 | Structured Outputsと通常JSONフォールバック、Pydantic検証、限定再試行を実装 |
 | 永続キュー・SSE | PostgreSQLジョブリース、期限切れ再取得、イベント保存、Last-Event-ID再送を実装。途中計画の復元は未実装 |
+| ツール・Web検索 | Worker内のTavily読み取り専用Function Callingと出典保存を実装。追加プロバイダー・副作用ツールは未実装 |
 | 全体レート制御 | 1タスク内の並行数とモデル要求再試行のみ。Worker間共有RPM／TPM・同時実行枠は未実装 |
-| 副作用実行 | Tool Calling、承認、Sandbox、外向き通信制御、成果物は未実装 |
+| 副作用実行 | 副作用Tool Calling、承認、Sandbox、外向き通信制御、成果物は未実装 |
 | 拡張・集計 | プライベートスキル、RAG、コンテキスト要約、利用量／コスト集計は未実装 |
 | 運用・UI | 分離したUser/Admin UIを実装。管理画面はアカウント、基本設定、Vaultキー、タスクメタデータを扱う |
 
@@ -628,6 +659,7 @@ SSEエンドポイントはタスク所有者を検証し、DBのイベントID�
 | OpenAI APIキー | 管理者がキーをVault KV v2へ登録でき、画面には設定済み状態のみ表示される。AppRole権限がAPI書込／Worker読取に分離され、各モデル呼び出しで最新キーを取得し、更新が後続呼び出しへ反映される。Vault障害・キー未設定時は明示的に失敗し、キーがDB・UI・ログへ漏れない |
 | レート制御 | 429応答でバックオフし、上限後は失敗理由が記録・表示される |
 | 構造化出力 | 不正な計画・結果・ツール引数を拒否し、成功として扱わない |
+| ツール・Tavily検索 | 登録済みツールとスキーマで引数を検証し、未許可ツールを実行しない。Tavily検索は最小限のクエリをサーバー側キーで実行し、出典URLをタスク履歴と回答に保持する。外部応答内の指示を実行せず、タイムアウト・応答サイズ・再試行を制限する |
 | 自己修復 | 形式崩れ・ツールエラーに対する試行が最大3回で停止する |
 | 承認・要確認 | 副作用操作は承認前に実行されず、却下後は実行されない。期限切れ操作は`needs_attention`で再表示され、再承認／却下される。実行結果不明時は操作ごとの実施済み／未実施確認後に限り再開し、終了選択は`cancelled`となる。`failed`は同一タスクで再開されない |
 | 成果物 | 所有者のみが個別ダウンロードでき、APIは読み取り専用で配信する。タスク削除で成果物と関連データが削除され、実行中・承認待ち・未解決タスクは削除できない |

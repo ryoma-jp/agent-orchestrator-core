@@ -21,6 +21,12 @@ from app.openai_client import StructuredModelClient
 from app.routers.tasks import add_message
 from app.schemas import MessageCreate, TaskCreate
 from app.security import hash_password, token_digest, verify_password
+from app.tools import (
+    TavilySearchArguments,
+    TavilySearchTool,
+    ToolRegistration,
+    ToolRegistry,
+)
 
 
 def test_task_instruction_is_bounded_and_nonempty():
@@ -90,6 +96,8 @@ def test_subtask_result_requires_questions_for_user_input():
         status="needs_input",
         summary="More information is needed.",
         findings=[],
+        sources=[],
+        tool_runs=[],
         questions=["Which audience should I focus on?"],
         error="",
     )
@@ -99,6 +107,8 @@ def test_subtask_result_requires_questions_for_user_input():
             status="needs_input",
             summary="More information is needed.",
             findings=[],
+            sources=[],
+            tool_runs=[],
             questions=[],
             error="",
         )
@@ -212,10 +222,28 @@ async def test_subtask_receives_conversation_history(monkeypatch):
 
     async def generate(**kwargs):
         captured.update(kwargs)
+        kwargs["on_tool_result"](
+            "tavily_web_search",
+            '{"query":"public query","max_results":1}',
+            {
+                "retrieved_at": "2026-10-12T00:00:00+00:00",
+                "results": [
+                    {
+                        "title": "Verified source",
+                        "url": "https://example.org/source",
+                        "content": "Supporting excerpt",
+                        "score": 0.8,
+                        "published_date": "2026-10-01",
+                    }
+                ],
+            },
+        )
         return SubtaskResult(
             status="succeeded",
             summary="Completed",
             findings=[],
+            sources=[],
+            tool_runs=[],
             questions=[],
             error="",
         )
@@ -223,7 +251,7 @@ async def test_subtask_receives_conversation_history(monkeypatch):
     monkeypatch.setattr(orchestrator_module, "_assert_lease", assert_lease)
     monkeypatch.setattr(orchestrator_module.model_client, "generate", generate)
 
-    await orchestrator_module._execute_subtask(
+    result = await orchestrator_module._execute_subtask(
         SimpleNamespace(
             title="Clarify profile",
             instruction="Proceed",
@@ -243,7 +271,14 @@ async def test_subtask_receives_conversation_history(monkeypatch):
         {"role": "assistant", "content": "Which industry?"},
         {"role": "user", "content": "IT, embedded software."},
     ]
+    assert result.sources[0].provider == "tavily"
+    assert result.sources[0].url == "https://example.org/source"
+    assert result.sources[0].score == 0.8
+    assert result.tool_runs[0].request_summary == "public query"
+    assert result.tool_runs[0].source_count == 1
     assert "do not ask again" in captured["system_prompt"]
+    assert "tavily_web_search" in captured["system_prompt"]
+    assert "Do not use tools" not in captured["system_prompt"]
 
 
 @pytest.mark.asyncio
@@ -531,3 +566,261 @@ async def test_model_json_fallback_when_schema_mode_is_unsupported(
     assert len(requests) == 2
     assert "text" in requests[0]
     assert "text" not in requests[1]
+
+
+@pytest.mark.asyncio
+async def test_tool_call_is_validated_executed_and_returned_to_model(
+    monkeypatch,
+):
+    import app.openai_client as client_module
+
+    calls = []
+
+    class ToolArguments(BaseModel):
+        query: str
+
+    async def search(arguments):
+        calls.append(arguments.query)
+        return {
+            "results": [
+                {"title": "Example", "url": "https://example.org"}
+            ]
+        }
+
+    registry = ToolRegistry(
+        [
+            ToolRegistration(
+                name="test_search",
+                version="1",
+                description="Search test data",
+                risk_class="read_only",
+                timeout_seconds=5,
+                arguments_model=ToolArguments,
+                handler=search,
+            )
+        ]
+    )
+    first_response = SimpleNamespace(
+        id="response-1",
+        output=[
+            SimpleNamespace(
+                type="function_call",
+                name="test_search",
+                arguments='{"query":"latest release"}',
+                call_id="call-1",
+            )
+        ],
+        output_text="",
+    )
+    final_response = SimpleNamespace(
+        id="response-2",
+        output=[],
+        output_text='{"answer":"Release notes found."}',
+    )
+
+    class FakeResponses:
+        def __init__(self):
+            self.requests = []
+
+        async def create(self, **request):
+            self.requests.append(request)
+            if len(self.requests) == 1:
+                return first_response
+            return final_response
+
+    class FakeClient:
+        def __init__(self, **_kwargs):
+            self.responses = FakeResponses()
+            self.closed = False
+
+        async def close(self):
+            self.closed = True
+
+    clients = []
+
+    def create_client(**kwargs):
+        client = FakeClient(**kwargs)
+        clients.append(client)
+        return client
+
+    monkeypatch.setattr(client_module, "AsyncOpenAI", create_client)
+    monkeypatch.setattr(
+        client_module,
+        "get_settings",
+        lambda: SimpleNamespace(
+            openai_base_url="", max_agent_attempts=1,
+            agent_timeout_seconds=30,
+        ),
+    )
+    monkeypatch.setattr(client_module, "read_openai_api_key", lambda: "key")
+    lease_checks = []
+    captured_results = []
+
+    async def check_lease():
+        lease_checks.append(True)
+
+    result = await StructuredModelClient().generate(
+        model="test-model",
+        schema_name="small_output",
+        schema=SmallOutput,
+        system_prompt="Use tools if needed.",
+        input_text="Find recent release information.",
+        tool_registry=registry,
+        before_tool_call=check_lease,
+        on_tool_result=lambda name, arguments, value: captured_results.append(
+            (name, arguments, value)
+        ),
+    )
+
+    assert result.answer == "Release notes found."
+    assert calls == ["latest release"]
+    assert len(lease_checks) == 1
+    assert captured_results[0][0] == "test_search"
+    requests = clients[0].responses.requests
+    assert requests[0]["tools"][0]["name"] == "test_search"
+    assert requests[1]["previous_response_id"] == "response-1"
+    assert requests[1]["input"][0]["call_id"] == "call-1"
+
+
+@pytest.mark.asyncio
+async def test_tool_registry_rejects_unknown_and_invalid_arguments():
+    invoked = []
+
+    async def handler(_arguments):
+        invoked.append(True)
+        return {"ok": True}
+
+    registry = ToolRegistry([TavilySearchTool().registration()])
+
+    invalid = await registry.execute(
+        "tavily_web_search", '{"query":"", "max_results":99}'
+    )
+    sensitive = await registry.execute(
+        "tavily_web_search",
+        '{"query":"contact admin@example.org", "max_results":2}',
+    )
+    unknown = await registry.execute("unknown", "{}")
+
+    assert invalid == {"error": "invalid_tool_arguments"}
+    assert sensitive == {"error": "invalid_tool_arguments"}
+    assert unknown == {"error": "tool_not_allowed"}
+    assert invoked == []
+
+
+@pytest.mark.asyncio
+async def test_tool_registry_blocks_non_read_only_tools():
+    invoked = []
+
+    class ToolArguments(BaseModel):
+        value: str
+
+    async def handler(_arguments):
+        invoked.append(True)
+        return {"ok": True}
+
+    registry = ToolRegistry(
+        [
+            ToolRegistration(
+                name="write_tool",
+                version="1",
+                description="A future write tool",
+                risk_class="writes_data",
+                timeout_seconds=5,
+                arguments_model=ToolArguments,
+                handler=handler,
+            )
+        ]
+    )
+
+    result = await registry.execute("write_tool", '{"value":"change"}')
+
+    assert registry.openai_definitions() == []
+    assert result == {"error": "tool_requires_approval"}
+    assert invoked == []
+
+
+@pytest.mark.asyncio
+async def test_tavily_search_uses_worker_key_and_filters_results(monkeypatch):
+    import json
+
+    import app.tools as tools_module
+
+    payload = {
+        "results": [
+            {
+                "title": "Useful result",
+                "url": "https://example.org/article",
+                "content": "A verified-length excerpt.",
+                "score": 0.9,
+                "published_date": "2026-10-12",
+            },
+            {
+                "title": "Invalid local result",
+                "url": "file:///etc/passwd",
+                "content": "Must be excluded.",
+                "score": 0.2,
+            },
+        ]
+    }
+    request_values = {}
+
+    class FakeResponse:
+        status_code = 200
+        headers = {}
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def aiter_bytes(self):
+            yield json.dumps(payload).encode()
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            request_values["timeout"] = kwargs["timeout"]
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        def stream(self, method, url, **kwargs):
+            request_values.update(
+                {"method": method, "url": url, **kwargs}
+            )
+            return FakeResponse()
+
+    class NoopLimiter:
+        async def acquire(self):
+            return None
+
+    monkeypatch.setattr(tools_module.httpx, "AsyncClient", FakeClient)
+    monkeypatch.setattr(
+        tools_module, "read_tavily_api_key", lambda: "worker-secret"
+    )
+    monkeypatch.setattr(
+        tools_module,
+        "get_settings",
+        lambda: SimpleNamespace(
+            tavily_timeout_seconds=20,
+            max_agent_attempts=1,
+        ),
+    )
+    tool = TavilySearchTool()
+    tool._limiter = NoopLimiter()
+
+    result = await tool._search(
+        TavilySearchArguments(query="  current news  ", max_results=2)
+    )
+
+    assert request_values["url"] == "https://api.tavily.com/search"
+    assert request_values["headers"]["Authorization"] == (
+        "Bearer worker-secret"
+    )
+    assert request_values["json"]["query"] == "current news"
+    assert request_values["json"]["include_answer"] is False
+    assert len(result["results"]) == 1
+    assert result["results"][0]["url"] == "https://example.org/article"

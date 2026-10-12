@@ -1,15 +1,17 @@
 import asyncio
 import json
 import random
-from typing import TypeVar
+from typing import Awaitable, Callable, TypeVar
 
 from openai import APIConnectionError, APIStatusError, AsyncOpenAI
 from pydantic import BaseModel, ValidationError
 
 from app.config import get_settings
+from app.tools import ToolRegistry
 from app.vault import read_openai_api_key
 
 T = TypeVar("T", bound=BaseModel)
+MAX_TOOL_CALLS = 20
 
 
 class StructuredModelClient:
@@ -22,6 +24,11 @@ class StructuredModelClient:
         system_prompt: str,
         input_text: str,
         max_attempts: int | None = None,
+        tool_registry: ToolRegistry | None = None,
+        before_tool_call: Callable[[], Awaitable[None]] | None = None,
+        on_tool_result: Callable[
+            [str, dict[str, object]], None
+        ] | None = None,
     ) -> T:
         settings = get_settings()
         attempts = min(max(max_attempts or settings.max_agent_attempts, 1), 3)
@@ -70,7 +77,64 @@ class StructuredModelClient:
                                 "strict": True,
                             }
                         }
+                    tool_definitions = (
+                        tool_registry.openai_definitions()
+                        if tool_registry is not None
+                        else []
+                    )
+                    if tool_definitions:
+                        request.update(
+                            {
+                                "tools": tool_definitions,
+                                "tool_choice": "auto",
+                                "parallel_tool_calls": False,
+                            }
+                        )
                     response = await client.responses.create(**request)
+                    tool_calls_used = 0
+                    while tool_definitions:
+                        calls = [
+                            item
+                            for item in getattr(response, "output", [])
+                            if getattr(item, "type", None) == "function_call"
+                        ]
+                        if not calls:
+                            break
+                        if tool_calls_used + len(calls) > MAX_TOOL_CALLS:
+                            raise RuntimeError("tool_call_limit_exceeded")
+                        tool_outputs = []
+                        for call in calls:
+                            if before_tool_call is not None:
+                                await before_tool_call()
+                            name = call.name
+                            tool_result = await tool_registry.execute(
+                                name, call.arguments
+                            )
+                            tool_calls_used += 1
+                            if on_tool_result is not None:
+                                on_tool_result(
+                                    name, call.arguments, tool_result
+                                )
+                            tool_outputs.append(
+                                {
+                                    "type": "function_call_output",
+                                    "call_id": call.call_id,
+                                    "output": json.dumps(
+                                        tool_result, ensure_ascii=False
+                                    ),
+                                }
+                            )
+                        follow_up = {
+                            "model": model,
+                            "previous_response_id": response.id,
+                            "input": tool_outputs,
+                            "tools": tool_definitions,
+                            "tool_choice": "auto",
+                            "parallel_tool_calls": False,
+                        }
+                        if structured_output_supported:
+                            follow_up["text"] = request["text"]
+                        response = await client.responses.create(**follow_up)
                 finally:
                     await client.close()
                 return schema.model_validate_json(response.output_text)

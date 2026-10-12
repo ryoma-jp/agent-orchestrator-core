@@ -21,10 +21,12 @@ class Settings(BaseSettings):
     max_agent_attempts: int = 3
     job_lease_seconds: int = 60
     agent_timeout_seconds: int = 180
+    tavily_timeout_seconds: int = 20
     openai_base_url: str | None = None
     vault_addr: str | None = None
     vault_kv_mount: str = "secret"
     vault_openai_key_path: str = "agent-orchestrator/openai"
+    vault_tavily_key_path: str = "agent-orchestrator/tavily"
     vault_api_role_id_file: str | None = None
     vault_api_secret_id_file: str | None = None
     vault_worker_role_id_file: str | None = None

@@ -29,7 +29,16 @@ unset db_password admin_password
 
 The optional `local-vault` profile runs HashiCorp Vault in dev mode, reachable by the application at `http://vault:8200` and from the host at `http://localhost:8201`. Its root token is for local development only; dev-mode data is in memory and is lost when the Vault container is recreated. Rerun the provisioning script after recreating it. For an external Vault, set `VAULT_ADDR` and the four `VAULT_*_SOURCE` paths in `.env` to the external server and its AppRole credentials instead. Existing `.env` files should set `VAULT_ADDR=http://vault:8200` and use the four `.local-vault/*` source paths shown in the updated `.env.example` when using the local profile.
 
-The provisioning script configures a KV v2 secret path and two AppRoles restricted to that path: an API role that can write but not read, and a Worker role that can read but not write. It writes their credentials to four ignored files under `.local-vault/` with group-only read permissions. The administrator UI can then store an OpenAI key in Vault. Start the independent Worker with `docker compose --profile local-vault --profile agent up --build -d worker`. The Worker does not receive the OpenAI key in its environment and reads the current key from Vault before each model request. Set `SESSION_COOKIE_SECURE=true` when serving through TLS.
+The provisioning script configures KV v2 paths and two AppRoles: the API role can write the OpenAI path but cannot read secrets, and the Worker role can read the OpenAI and Tavily paths but cannot write. It writes their credentials to four ignored files under `.local-vault/` with group-only read permissions. The administrator UI can store an OpenAI key in Vault. To enable Web search, store the Tavily key at `agent-orchestrator/tavily` (or the path configured by `VAULT_TAVILY_KEY_PATH`) without putting it in shell history:
+
+```sh
+read -r -s -p "Tavily API key: " tavily_api_key
+printf '\n'
+printf '%s' "$tavily_api_key" | docker compose --profile local-vault exec -T vault vault kv put -mount=secret agent-orchestrator/tavily api_key=-
+unset tavily_api_key
+```
+
+Start the independent Worker with `docker compose --profile local-vault --profile agent up --build -d worker`. The Worker does not receive either provider key in its environment; it reads each key from Vault only when making the corresponding request. For an external Vault, grant the Worker AppRole read access to both configured secret paths. Set `SESSION_COOKIE_SECURE=true` when serving through TLS.
 
 ## Cleanup
 
@@ -67,11 +76,11 @@ rm -rf .local-vault
 
 This also deletes the database volume and dev Vault data. Images shared with other running containers are not removed. It does not prune Docker resources belonging to other projects.
 
-The user UI supports login, task creation, conversation continuation, cancellation, terminal-task deletion, durable SSE replay, password changes, and one-time API-key rotation. The administrator UI supports account provisioning, runtime model/concurrency settings, Vault key updates, and privacy-limited task operations. Agent execution supports structured planning, dependency-aware parallel read-only subtasks, replanning on new user messages, and structured response integration. No shell, file mutation, or external write tools are exposed by this initial runtime.
+The user UI supports login, task creation, conversation continuation, cancellation, terminal-task deletion, durable SSE replay, password changes, and one-time API-key rotation. The administrator UI supports account provisioning, runtime model/concurrency settings, OpenAI Vault key updates, and privacy-limited task operations. Agent execution supports structured planning, dependency-aware parallel read-only subtasks, Tavily Web search with source retention/citations, replanning on new user messages, and structured response integration. No shell, file mutation, or external write tools are exposed by this runtime.
 
 ## Remaining scope
 
-Human approval and `needs_attention` resolution flows, the isolated Sandbox service, dynamic private-skill loading, the RAG adapter, artifact storage/download, context summarization, usage/cost records, and database-shared RPM/TPM/concurrency slots are not implemented yet. Until those execution boundaries exist, the Worker only performs model-based informational tasks and exposes no side-effecting tools. Run a single Worker replica for this initial implementation.
+Additional tool providers and side-effecting tools, human approval and `needs_attention` resolution flows, the isolated Sandbox service, dynamic private-skill loading, the RAG adapter, artifact storage/download, context summarization, usage/cost records, and database-shared RPM/TPM/concurrency slots are not implemented yet. The current Tavily tool is read-only and uses a per-Worker rate limit; the Worker exposes no shell, file mutation, or external write tools. Run a single Worker replica for this initial implementation.
 
 ## Development checks
 
