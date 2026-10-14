@@ -42,6 +42,12 @@ async def create_task(
         "worker_model": settings.worker_model,
         "max_concurrent_agents": settings.max_concurrent_agents,
         "max_agent_attempts": min(max(settings.max_agent_attempts, 1), 3),
+        "max_quality_revisions_per_subtask": min(
+            max(settings.max_quality_revisions_per_subtask, 0), 5
+        ),
+        "max_quality_revisions_per_task": min(
+            max(settings.max_quality_revisions_per_task, 0), 25
+        ),
     }
     if stored_settings:
         execution_settings.update(stored_settings.settings_json)
@@ -144,7 +150,12 @@ async def cancel_task(
     )
     if task is None:
         raise HTTPException(status_code=404, detail="Task not found")
-    if task.status in {"succeeded", "failed", "cancelled"}:
+    if task.status in {
+        "succeeded",
+        "partially_completed",
+        "failed",
+        "cancelled",
+    }:
         raise HTTPException(status_code=409, detail="Task is already terminal")
 
     now = datetime.now(timezone.utc)
@@ -195,7 +206,12 @@ async def delete_task(
     )
     if task is None:
         raise HTTPException(status_code=404, detail="Task not found")
-    if task.status not in {"succeeded", "failed", "cancelled"}:
+    if task.status not in {
+        "succeeded",
+        "partially_completed",
+        "failed",
+        "cancelled",
+    }:
         raise HTTPException(
             status_code=409, detail="Only terminal tasks can be deleted"
         )
@@ -250,10 +266,15 @@ async def add_message(
             },
         )
     )
-    if task.status in {"succeeded", "needs_attention"}:
+    if task.status in {
+        "succeeded",
+        "partially_completed",
+        "needs_attention",
+    }:
         task.status = "queued"
         task.result = None
         task.error = None
+        task.completion_report = None
         task.updated_at = datetime.now(timezone.utc)
         db.add(
             Event(

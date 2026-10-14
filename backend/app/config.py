@@ -19,6 +19,8 @@ class Settings(BaseSettings):
     session_poll_seconds: float = 1.0
     max_concurrent_agents: int = 4
     max_agent_attempts: int = 3
+    max_quality_revisions_per_subtask: int = 2
+    max_quality_revisions_per_task: int = 10
     job_lease_seconds: int = 60
     agent_timeout_seconds: int = 180
     tavily_timeout_seconds: int = 20

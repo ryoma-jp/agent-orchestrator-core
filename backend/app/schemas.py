@@ -57,14 +57,21 @@ class AdminSettingsUpdate(BaseModel):
     worker_model: str = Field(min_length=1, max_length=200)
     max_concurrent_agents: int = Field(ge=1, le=32)
     max_agent_attempts: int = Field(ge=1, le=3)
+    max_quality_revisions_per_subtask: int = Field(ge=0, le=5)
+    max_quality_revisions_per_task: int = Field(ge=0, le=25)
 
 
 class AdminSettingsView(AdminSettingsUpdate):
     openai_key_configured: bool
+    tavily_key_configured: bool
     version: int
 
 
 class OpenAIKeyRequest(BaseModel):
+    api_key: SecretStr = Field(min_length=1, max_length=1024)
+
+
+class TavilyKeyRequest(BaseModel):
     api_key: SecretStr = Field(min_length=1, max_length=1024)
 
 
@@ -94,5 +101,6 @@ class TaskView(BaseModel):
     updated_at: datetime
     result: str | None
     error: dict | None
+    completion_report: dict | None = None
 
     model_config = ConfigDict(from_attributes=True)

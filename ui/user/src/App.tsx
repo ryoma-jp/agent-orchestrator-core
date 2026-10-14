@@ -8,7 +8,8 @@ import {
 type User = { id: string; email: string; role: string; must_change_password: boolean }
 type Task = {
   id: string; instruction: string; status: string; created_at: string; updated_at: string;
-  result: string | null; error: { code?: string; message?: string } | null
+  result: string | null; error: { code?: string; message?: string } | null;
+  completion_report: { plan_version: number; unmet_items: { target_type: string; subtask_title: string | null; item_id: string; description: string; evidence: string; deficiency: string }[] } | null
 }
 type Message = { id: string; sequence: number; role: 'user' | 'assistant'; content: string; created_at: string }
 type ProgressItem = { id: string; conversationSequence: number; content: string }
@@ -31,7 +32,7 @@ async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
 
 const statusLabel: Record<string, string> = {
   queued: '待機中', planning: '計画中', running: '実行中', waiting_approval: '承認待ち',
-  needs_attention: '要確認', succeeded: '完了', failed: '失敗', cancelled: '停止',
+  needs_attention: '要確認', succeeded: '完了', partially_completed: '準完了', failed: '失敗', cancelled: '停止',
 }
 
 function App() {
@@ -93,10 +94,16 @@ function App() {
       } else if (message.type === 'subtask.status_changed') {
         const title = typeof payload.title === 'string' ? payload.title : '作業項目'
         const status = payload.status
-        const action = status === 'running' ? 'に取り組んでいます' : status === 'succeeded' ? 'が完了しました' : status === 'blocked' ? 'は追加情報待ちです' : status === 'failed' ? 'で問題が発生しました' : ''
+        const action = status === 'running' ? 'に取り組んでいます' : status === 'reviewing' ? 'の成果物を検証しています' : status === 'revising' ? 'の不足部分を修正しています' : status === 'accepted' ? 'の成果物を受け入れました' : status === 'partially_accepted' ? 'は一部未達です' : status === 'succeeded' ? 'が完了しました' : status === 'blocked' ? 'は追加情報待ちです' : status === 'failed' ? 'で問題が発生しました' : ''
         content = action ? `${title}${action}` : ''
       } else if (message.type === 'agent.progress') {
         content = typeof payload.summary === 'string' ? payload.summary : ''
+      } else if (message.type === 'quality.checklists_created') {
+        const count = typeof payload.subtask_item_count === 'number' ? payload.subtask_item_count : 0
+        content = `成果物チェックリストを作成しました（${count}項目）。`
+      } else if (message.type === 'quality.review_completed') {
+        const verdict = payload.verdict
+        content = verdict === 'accepted' ? '成果物の受け入れチェックに合格しました。' : verdict === 'revision_requested' ? '未達項目に絞って修正を依頼しました。' : verdict === 'partially_accepted' ? '修正上限に達した未達項目を記録しました。' : ''
       } else if (message.type === 'task.status_changed') {
         const status = payload.status
         content = status === 'planning' ? '作業内容を整理しています。' : status === 'running' ? 'エージェントが作業を開始しました。' : status === 'needs_attention' ? '追加の情報が必要です。' : ''
@@ -106,10 +113,10 @@ function App() {
         ? current
         : [...current, { id: message.lastEventId, conversationSequence, content }])
     }
-    for (const name of ['task.status_changed', 'conversation.message_added', 'task.completed', 'task.failed']) {
+    for (const name of ['task.status_changed', 'conversation.message_added', 'task.completed', 'task.partially_completed', 'task.failed']) {
       stream.addEventListener(name, sync)
     }
-    for (const name of ['plan.created', 'subtask.status_changed', 'agent.progress', 'task.status_changed']) {
+    for (const name of ['plan.created', 'subtask.status_changed', 'agent.progress', 'quality.checklists_created', 'quality.review_completed', 'task.status_changed']) {
       stream.addEventListener(name, recordProgress)
     }
     return () => { alive = false; stream.close() }
@@ -230,11 +237,12 @@ function App() {
 
         <aside className="detail-pane">
           {active ? <>
-            <div className="detail-top"><div><div className="eyebrow">TASK THREAD</div><div className={`status-pill pill-${active.status}`}>{statusLabel[active.status] ?? active.status}</div></div><div className="detail-actions">{['queued', 'planning', 'running', 'waiting_approval', 'needs_attention'].includes(active.status) ? <button className="icon-btn" title="Cancel task" disabled={busy} onClick={cancelTask}><Ban size={16} /></button> : ['succeeded', 'failed', 'cancelled'].includes(active.status) ? <button className="icon-btn" title="Delete task" disabled={busy} onClick={deleteTask}><Trash2 size={16} /></button> : null}<button className="icon-btn" title="Close task" onClick={() => setActive(null)}><X size={17} /></button></div></div>
+            <div className="detail-top"><div><div className="eyebrow">TASK THREAD</div><div className={`status-pill pill-${active.status}`}>{statusLabel[active.status] ?? active.status}</div></div><div className="detail-actions">{['queued', 'planning', 'running', 'waiting_approval', 'needs_attention'].includes(active.status) ? <button className="icon-btn" title="Cancel task" disabled={busy} onClick={cancelTask}><Ban size={16} /></button> : ['succeeded', 'partially_completed', 'failed', 'cancelled'].includes(active.status) ? <button className="icon-btn" title="Delete task" disabled={busy} onClick={deleteTask}><Trash2 size={16} /></button> : null}<button className="icon-btn" title="Close task" onClick={() => setActive(null)}><X size={17} /></button></div></div>
             <h2 className="detail-title">{active.instruction}</h2>
             <div className="thread" aria-live="polite">{messages.map((message) => <Fragment key={message.id}><article className={`message message-${message.role}`}><div className="message-avatar">{message.role === 'user' ? user.email[0].toUpperCase() : <Sparkles size={14} />}</div><div><div className="message-meta">{message.role === 'user' ? 'You' : 'Relay'} <time>{new Date(message.created_at).toLocaleTimeString('ja-JP', { hour: '2-digit', minute: '2-digit' })}</time></div><p>{message.content}</p></div></article>{message.role === 'user' && renderProgress(message.sequence)}</Fragment>)}
               {active.status === 'queued' && <div className="progress-note"><LoaderCircle size={15} /> Waiting for an available worker</div>}
               {active.status === 'needs_attention' && <div className="clarification-note" role="status"><MessageSquareText size={15} /> Reply below to continue this task.</div>}
+              {active.status === 'partially_completed' && active.completion_report && <article className="partial-block"><strong>未達項目 · 計画 v{active.completion_report.plan_version}</strong><ul>{active.completion_report.unmet_items.map((item) => <li key={`${item.target_type}-${item.subtask_title}-${item.item_id}`}><b>{item.subtask_title ?? '最終回答'}: {item.description}</b>{item.deficiency && <span>{item.deficiency}</span>}{item.evidence && <small>確認内容: {item.evidence}</small>}</li>)}</ul></article>}
               {active.result && !messages.some((message) => message.role === 'assistant' && message.content === active.result) && <article className="result-block"><div className="result-label"><Check size={14} /> RESULT</div><p>{active.result}</p></article>}
               {active.error && <article className="error-block"><strong>{active.error.code ?? 'Task error'}</strong><p>{active.error.message ?? 'The task could not be completed.'}</p></article>}
             </div>

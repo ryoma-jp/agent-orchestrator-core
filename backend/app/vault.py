@@ -86,3 +86,23 @@ def write_openai_api_key(api_key: str) -> None:
         raise
     except Exception as exc:
         raise RuntimeError("vault_key_write_failed") from exc
+
+
+def write_tavily_api_key(api_key: str) -> None:
+    settings = get_settings()
+    if not api_key:
+        raise RuntimeError("tavily_api_key_empty")
+    try:
+        client = _authenticated_client(
+            settings.vault_api_role_id_file,
+            settings.vault_api_secret_id_file,
+        )
+        client.secrets.kv.v2.create_or_update_secret(
+            mount_point=settings.vault_kv_mount,
+            path=settings.vault_tavily_key_path,
+            secret={"api_key": api_key},
+        )
+    except RuntimeError:
+        raise
+    except Exception as exc:
+        raise RuntimeError("vault_tavily_key_write_failed") from exc

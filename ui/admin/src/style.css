@@ -63,6 +63,7 @@ tbody tr:hover { background: #f3f4ed; }
 .admin-status i { width: 6px; height: 6px; border-radius: 50%; background: #9b9d94; }
 .admin-status.status-running i, .admin-status.status-planning i { background: #d8993e; }
 .admin-status.status-succeeded i { background: #79a542; }
+.admin-status.status-partially_completed i { background: #b98932; }
 .admin-status.status-failed i, .admin-status.status-needs_attention i { background: var(--coral); }
 .table-empty { padding: 40px; color: var(--muted); text-align: center; font-size: 12px; }
 .privacy-note { display: flex; align-items: center; gap: 8px; margin-top: 12px; color: #7b804f; font-size: 10px; }
@@ -116,6 +117,7 @@ tbody tr:hover { background: #f3f4ed; }
 .settings-number-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
 .settings-form .admin-button { margin-top: 2px; }
 .secret-panel { min-width: 0; }
+.secret-stack { display: grid; gap: 18px; }
 .secret-panel form { display: grid; gap: 14px; margin-top: 19px; }
 .secret-panel .admin-button { width: 100%; }
 .secret-state { display: flex; align-items: center; gap: 8px; width: fit-content; padding: 6px 8px; background: #f0f0e9; color: #77786f; font-size: 10px; }

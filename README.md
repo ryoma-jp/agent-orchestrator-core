@@ -29,14 +29,7 @@ unset db_password admin_password
 
 The optional `local-vault` profile runs HashiCorp Vault in dev mode, reachable by the application at `http://vault:8200` and from the host at `http://localhost:8201`. Its root token is for local development only; dev-mode data is in memory and is lost when the Vault container is recreated. Rerun the provisioning script after recreating it. For an external Vault, set `VAULT_ADDR` and the four `VAULT_*_SOURCE` paths in `.env` to the external server and its AppRole credentials instead. Existing `.env` files should set `VAULT_ADDR=http://vault:8200` and use the four `.local-vault/*` source paths shown in the updated `.env.example` when using the local profile.
 
-The provisioning script configures KV v2 paths and two AppRoles: the API role can write the OpenAI path but cannot read secrets, and the Worker role can read the OpenAI and Tavily paths but cannot write. It writes their credentials to four ignored files under `.local-vault/` with group-only read permissions. The administrator UI can store an OpenAI key in Vault. To enable Web search, store the Tavily key at `agent-orchestrator/tavily` (or the path configured by `VAULT_TAVILY_KEY_PATH`) without putting it in shell history:
-
-```sh
-read -r -s -p "Tavily API key: " tavily_api_key
-printf '\n'
-printf '%s' "$tavily_api_key" | docker compose --profile local-vault exec -T vault vault kv put -mount=secret agent-orchestrator/tavily api_key=-
-unset tavily_api_key
-```
+The provisioning script configures KV v2 paths and two AppRoles: the API role can write the OpenAI and Tavily paths but cannot read secrets, and the Worker role can read both paths but cannot write. It writes their credentials to four ignored files under `.local-vault/` with group-only read permissions. Configure or replace both provider keys from **Runtime settings** in the administrator UI. The values are stored in Vault and are never returned to the UI. For an external Vault, grant the API AppRole write access to both configured secret paths and the Worker AppRole read access to them.
 
 Start the independent Worker with `docker compose --profile local-vault --profile agent up --build -d worker`. The Worker does not receive either provider key in its environment; it reads each key from Vault only when making the corresponding request. For an external Vault, grant the Worker AppRole read access to both configured secret paths. Set `SESSION_COOKIE_SECURE=true` when serving through TLS.
 

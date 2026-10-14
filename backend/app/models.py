@@ -11,6 +11,7 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
+    UniqueConstraint,
     func,
     text,
 )
@@ -47,6 +48,7 @@ class SystemSettings(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
     settings_json: Mapped[dict] = mapped_column(JSONB, default=dict)
     openai_key_configured: Mapped[bool] = mapped_column(Boolean, default=False)
+    tavily_key_configured: Mapped[bool] = mapped_column(Boolean, default=False)
     version: Mapped[int] = mapped_column(Integer, default=1)
     updated_by: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("users.id", ondelete="SET NULL")
@@ -113,7 +115,8 @@ class Task(Base):
         Index("ix_tasks_owner_updated", "owner_id", "updated_at"),
         CheckConstraint(
             "status IN ('queued', 'planning', 'running', 'waiting_approval', "
-            "'succeeded', 'failed', 'cancelled', 'needs_attention')",
+            "'succeeded', 'partially_completed', 'failed', 'cancelled', "
+            "'needs_attention')",
             name="ck_tasks_status",
         ),
     )
@@ -136,6 +139,7 @@ class Task(Base):
     )
     result: Mapped[str | None] = mapped_column(Text)
     error: Mapped[dict | None] = mapped_column(JSONB)
+    completion_report: Mapped[dict | None] = mapped_column(JSONB)
     config_snapshot: Mapped[dict] = mapped_column(JSONB, default=dict)
     messages: Mapped[list["ConversationMessage"]] = relationship(
         cascade="all, delete-orphan"
@@ -170,6 +174,7 @@ class Subtask(Base):
     __table_args__ = (
         CheckConstraint(
             "status IN ('pending', 'ready', 'running', 'waiting_approval', "
+            "'reviewing', 'revising', 'accepted', 'partially_accepted', "
             "'succeeded', 'failed', 'blocked', 'cancelled')",
             name="ck_subtasks_status",
         ),
@@ -187,9 +192,69 @@ class Subtask(Base):
     dependencies: Mapped[list] = mapped_column(JSONB, default=list)
     model_id: Mapped[str] = mapped_column(String(200))
     skill_names: Mapped[list] = mapped_column(JSONB, default=list)
+    plan_position: Mapped[int] = mapped_column(Integer, default=0)
+    artifact_goal: Mapped[str] = mapped_column(Text, default="")
+    acceptance_checklist: Mapped[list] = mapped_column(JSONB, default=list)
+    plan_version: Mapped[int | None] = mapped_column(Integer)
     attempt: Mapped[int] = mapped_column(Integer, default=0)
+    quality_revision_count: Mapped[int] = mapped_column(Integer, default=0)
     result: Mapped[dict | None] = mapped_column(JSONB)
     error: Mapped[dict | None] = mapped_column(JSONB)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class TaskPlanRecord(Base):
+    __tablename__ = "task_plans"
+    __table_args__ = (
+        UniqueConstraint("task_id", "version", name="uq_task_plans_version"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    task_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("tasks.id", ondelete="CASCADE"), index=True
+    )
+    version: Mapped[int] = mapped_column(Integer)
+    conversation_sequence: Mapped[int] = mapped_column(Integer)
+    summary: Mapped[str] = mapped_column(Text)
+    final_checklist: Mapped[list] = mapped_column(JSONB)
+    change_reason: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class QualityReview(Base):
+    __tablename__ = "quality_reviews"
+    __table_args__ = (
+        CheckConstraint(
+            "target_type IN ('subtask', 'final')",
+            name="ck_quality_reviews_target_type",
+        ),
+        CheckConstraint(
+            "verdict IN ('accepted', 'revision_requested', "
+            "'partially_accepted')",
+            name="ck_quality_reviews_verdict",
+        ),
+        Index("ix_quality_reviews_task_plan", "task_id", "plan_version"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    task_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("tasks.id", ondelete="CASCADE"), index=True
+    )
+    plan_version: Mapped[int] = mapped_column(Integer)
+    target_type: Mapped[str] = mapped_column(String(16))
+    target_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    revision_round: Mapped[int] = mapped_column(Integer, default=0)
+    checklist_results: Mapped[list] = mapped_column(JSONB)
+    verdict: Mapped[str] = mapped_column(String(32))
+    reviewer_model_id: Mapped[str] = mapped_column(String(200))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )

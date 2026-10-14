@@ -3,7 +3,7 @@ import { Activity, ArrowUpRight, Check, CircleAlert, Command, KeyRound, LogOut, 
 
 type User = { id: string; email: string; role: string; must_change_password: boolean }
 type TaskSummary = { id: string; owner_email: string; status: string; created_at: string; updated_at: string; error: { code?: string; message?: string } | null }
-type AdminSettings = { manager_model: string; worker_model: string; max_concurrent_agents: number; max_agent_attempts: number; openai_key_configured: boolean; version: number }
+type AdminSettings = { manager_model: string; worker_model: string; max_concurrent_agents: number; max_agent_attempts: number; max_quality_revisions_per_subtask: number; max_quality_revisions_per_task: number; openai_key_configured: boolean; tavily_key_configured: boolean; version: number }
 
 async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
   const headers = new Headers(init.headers)
@@ -57,7 +57,7 @@ function App() {
   if (!user) return <main className="admin-login"><div className="admin-login-brand"><span className="admin-mark"><Command size={17} /></span><span>relay<span>.</span><small>CONTROL ROOM</small></span></div><form className="admin-login-form" onSubmit={login}><div className="eyebrow">RESTRICTED ACCESS</div><h1>Administration</h1><p>Sign in with an administrator account.</p><label>Email<input type="email" name="email" autoComplete="username" required /></label><label>Password<input type="password" name="password" autoComplete="current-password" required /></label>{error && <div className="admin-error">{error}</div>}<button className="admin-button">Enter control room <ArrowUpRight size={16} /></button></form><div className="admin-login-stamp">AUTHENTICATED ACCESS ONLY <span>RLY / 01</span></div></main>
 
   const activeCount = tasks.filter((task) => ['queued', 'planning', 'running', 'waiting_approval'].includes(task.status)).length
-  const failedCount = tasks.filter((task) => ['failed', 'needs_attention'].includes(task.status)).length
+  const failedCount = tasks.filter((task) => ['failed', 'needs_attention', 'partially_completed'].includes(task.status)).length
 
   return <div className="admin-shell">
     <aside className="admin-rail"><div className="admin-brand"><span className="admin-mark"><Command size={17} /></span><span>relay<span>.</span><small>CONTROL ROOM</small></span></div><div className="admin-caption">OPERATIONS</div><button className={`admin-nav ${section === 'operations' ? 'chosen' : ''}`} onClick={() => setSection('operations')}><Activity size={17} /> System overview</button><button className={`admin-nav ${section === 'accounts' ? 'chosen' : ''}`} onClick={() => setSection('accounts')}><Users size={17} /> User accounts</button><button className={`admin-nav ${section === 'settings' ? 'chosen' : ''}`} onClick={() => setSection('settings')}><SlidersHorizontal size={17} /> Runtime settings</button><div className="admin-rail-bottom"><div className="admin-identity"><div className="admin-avatar">A</div><div><strong>Administrator</strong><span>{user.email}</span></div></div><button className="admin-nav" onClick={logout}><LogOut size={16} /> Sign out</button></div></aside>
@@ -100,6 +100,8 @@ function SettingsPanel() {
           worker_model: data.get('worker_model'),
           max_concurrent_agents: Number(data.get('max_concurrent_agents')),
           max_agent_attempts: Number(data.get('max_agent_attempts')),
+          max_quality_revisions_per_subtask: Number(data.get('max_quality_revisions_per_subtask')),
+          max_quality_revisions_per_task: Number(data.get('max_quality_revisions_per_task')),
         }),
       })
       setSettings(saved); setNotice(`Settings saved · version ${saved.version}`)
@@ -107,18 +109,21 @@ function SettingsPanel() {
     finally { setBusy(false) }
   }
 
-  const saveApiKey = async (event: FormEvent<HTMLFormElement>) => {
+  const saveProviderKey = async (event: FormEvent<HTMLFormElement>, provider: 'openai' | 'tavily') => {
     event.preventDefault()
     const form = event.currentTarget
     const data = new FormData(form)
     setBusy(true); setError(''); setNotice('')
     try {
-      await api('/admin/secrets/openai-api-key', {
+      await api(`/admin/secrets/${provider}-api-key`, {
         method: 'PUT', body: JSON.stringify({ api_key: data.get('api_key') }),
       })
       form.reset()
-      setSettings((current) => current ? { ...current, openai_key_configured: true } : current)
-      setNotice('OpenAI API key stored in Vault.')
+      setSettings((current) => current ? provider === 'openai'
+        ? { ...current, openai_key_configured: true }
+        : { ...current, tavily_key_configured: true }
+        : current)
+      setNotice(`${provider === 'openai' ? 'OpenAI' : 'Tavily'} API key stored in Vault.`)
     } catch (reason) { setError((reason as Error).message) }
     finally { setBusy(false) }
   }
@@ -134,9 +139,13 @@ function SettingsPanel() {
         <label>Manager model ID<input name="manager_model" defaultValue={settings.manager_model} maxLength={200} required /></label>
         <label>Worker model ID<input name="worker_model" defaultValue={settings.worker_model} maxLength={200} required /></label>
         <div className="settings-number-grid"><label>Concurrent agents<input name="max_concurrent_agents" type="number" min={1} max={32} defaultValue={settings.max_concurrent_agents} required /></label><label>Maximum attempts<input name="max_agent_attempts" type="number" min={1} max={3} defaultValue={settings.max_agent_attempts} required /></label></div>
+        <div className="settings-number-grid"><label>Revisions per subtask<input name="max_quality_revisions_per_subtask" type="number" min={0} max={5} defaultValue={settings.max_quality_revisions_per_subtask} required /></label><label>Total quality revisions<input name="max_quality_revisions_per_task" type="number" min={0} max={25} defaultValue={settings.max_quality_revisions_per_task} required /></label></div>
         <button className="admin-button" disabled={busy}><Check size={15} /> Save runtime settings</button>
       </form>
-      <section className="secret-panel"><div className="settings-section-title"><KeyRound size={17} /><div><h2>OpenAI API key</h2><span>System-wide secret · Vault KV v2</span></div></div><div className={`secret-state ${settings.openai_key_configured ? 'is-configured' : ''}`}><i />{settings.openai_key_configured ? 'Configured' : 'Not configured'}</div><form onSubmit={saveApiKey}><label>Replace API key<input name="api_key" type="password" autoComplete="new-password" placeholder="Paste a new API key" required /></label><button className="admin-button" disabled={busy}><KeyRound size={15} /> Store key</button></form><div className="secret-foot">The saved value is never returned to this screen.</div></section>
+      <div className="secret-stack">
+        <section className="secret-panel"><div className="settings-section-title"><KeyRound size={17} /><div><h2>OpenAI API key</h2><span>System-wide secret · Vault KV v2</span></div></div><div className={`secret-state ${settings.openai_key_configured ? 'is-configured' : ''}`}><i />{settings.openai_key_configured ? 'Configured' : 'Not configured'}</div><form onSubmit={(event) => saveProviderKey(event, 'openai')}><label>Replace API key<input name="api_key" type="password" autoComplete="new-password" placeholder="Paste a new API key" required /></label><button className="admin-button" disabled={busy}><KeyRound size={15} /> Store key</button></form><div className="secret-foot">The saved value is never returned to this screen.</div></section>
+        <section className="secret-panel"><div className="settings-section-title"><KeyRound size={17} /><div><h2>Tavily API key</h2><span>Web search · Vault KV v2</span></div></div><div className={`secret-state ${settings.tavily_key_configured ? 'is-configured' : ''}`}><i />{settings.tavily_key_configured ? 'Configured' : 'Not configured'}</div><form onSubmit={(event) => saveProviderKey(event, 'tavily')}><label>Replace API key<input name="api_key" type="password" autoComplete="new-password" placeholder="Paste a new API key" required /></label><button className="admin-button" disabled={busy}><KeyRound size={15} /> Store key</button></form><div className="secret-foot">The saved value is never returned to this screen.</div></section>
+      </div>
     </div>
   </section>
 }

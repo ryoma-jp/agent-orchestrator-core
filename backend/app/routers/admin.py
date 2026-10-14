@@ -17,10 +17,11 @@ from app.schemas import (
     CreateUserRequest,
     OpenAIKeyRequest,
     PasswordResetRequest,
+    TavilyKeyRequest,
     UserView,
 )
 from app.security import hash_password
-from app.vault import write_openai_api_key
+from app.vault import write_openai_api_key, write_tavily_api_key
 
 router = APIRouter(prefix="/api/admin", tags=["administration"])
 
@@ -32,6 +33,12 @@ def _default_settings() -> dict:
         "worker_model": settings.worker_model,
         "max_concurrent_agents": settings.max_concurrent_agents,
         "max_agent_attempts": min(max(settings.max_agent_attempts, 1), 3),
+        "max_quality_revisions_per_subtask": min(
+            max(settings.max_quality_revisions_per_subtask, 0), 5
+        ),
+        "max_quality_revisions_per_task": min(
+            max(settings.max_quality_revisions_per_task, 0), 25
+        ),
     }
 
 
@@ -60,6 +67,7 @@ async def get_admin_settings(
     return AdminSettingsView(
         **values,
         openai_key_configured=bool(row and row.openai_key_configured),
+        tavily_key_configured=bool(row and row.tavily_key_configured),
         version=row.version if row else 1,
     )
 
@@ -82,6 +90,7 @@ async def update_admin_settings(
     return AdminSettingsView(
         **payload.model_dump(),
         openai_key_configured=row.openai_key_configured,
+        tavily_key_configured=row.tavily_key_configured,
         version=row.version,
     )
 
@@ -106,6 +115,31 @@ async def set_openai_api_key(
         ) from exc
     row = await _settings_row(db)
     row.openai_key_configured = True
+    row.updated_by = admin.id
+    row.version += 1
+    await db.commit()
+
+
+@router.put(
+    "/secrets/tavily-api-key",
+    status_code=status.HTTP_204_NO_CONTENT,
+    dependencies=[Depends(require_csrf)],
+)
+async def set_tavily_api_key(
+    payload: TavilyKeyRequest,
+    admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_session),
+):
+    try:
+        await asyncio.to_thread(
+            write_tavily_api_key, payload.api_key.get_secret_value()
+        )
+    except RuntimeError as exc:
+        raise HTTPException(
+            status_code=503, detail="Secret storage is unavailable"
+        ) from exc
+    row = await _settings_row(db)
+    row.tavily_key_configured = True
     row.updated_by = admin.id
     row.version += 1
     await db.commit()

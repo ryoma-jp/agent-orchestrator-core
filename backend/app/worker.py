@@ -39,7 +39,12 @@ async def claim_job():
         task = await session.scalar(
             select(Task).where(Task.id == job.task_id).with_for_update()
         )
-        if task is None or task.status in {"succeeded", "failed", "cancelled"}:
+        if task is None or task.status in {
+            "succeeded",
+            "partially_completed",
+            "failed",
+            "cancelled",
+        }:
             job.status = "completed"
             await session.commit()
             return None
@@ -126,7 +131,7 @@ async def mark_failure(
             task.status = "queued"
             task.error = {
                 "code": "agent_attempt_failed",
-                "message": str(error)[:500],
+                "message": "Task execution failed; retry scheduled.",
             }
             task.updated_at = datetime.now(timezone.utc)
             session.add(
@@ -145,8 +150,8 @@ async def mark_failure(
             job.lease_expires_at = None
             task.status = "failed"
             task.error = {
-                "code": "agent_attempts_exhausted",
-                "message": str(error)[:500],
+                "code": "task_execution_failed",
+                "message": "Task execution failed after the retry limit.",
             }
             task.updated_at = datetime.now(timezone.utc)
             session.add(

@@ -8,19 +8,31 @@ class PlannedSubtask(BaseModel):
 
     title: str = Field(min_length=1, max_length=300)
     instruction: str = Field(min_length=1, max_length=12_000)
+    artifact_goal: str = Field(min_length=1, max_length=2_000)
+    acceptance_checklist: list["ChecklistItem"] = Field(
+        min_length=1, max_length=20
+    )
     dependencies: list[int] = Field(max_length=30)
     skill_names: list[str] = Field(max_length=2)
+
+    @model_validator(mode="after")
+    def validate_checklist_ids(self):
+        _validate_checklist_ids(self.acceptance_checklist)
+        return self
 
 
 class TaskPlan(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     summary: str = Field(min_length=1, max_length=2_000)
-    completion_criteria: list[str] = Field(min_length=1, max_length=10)
+    final_checklist: list["ChecklistItem"] = Field(
+        min_length=1, max_length=20
+    )
     subtasks: list[PlannedSubtask] = Field(min_length=1, max_length=30)
 
     @model_validator(mode="after")
     def validate_dependencies(self):
+        _validate_checklist_ids(self.final_checklist)
         count = len(self.subtasks)
         for index, subtask in enumerate(self.subtasks):
             if len(set(subtask.dependencies)) != len(subtask.dependencies):
@@ -48,6 +60,38 @@ class TaskPlan(BaseModel):
         for index in range(count):
             visit(index)
         return self
+
+
+class ChecklistItem(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(min_length=1, max_length=100)
+    description: str = Field(min_length=1, max_length=500)
+    required: bool = True
+    verification_mode: Literal[
+        "model", "non_empty", "source_present", "markdown_citation"
+    ] = "model"
+
+
+def _validate_checklist_ids(items: list[ChecklistItem]) -> None:
+    identifiers = [item.id for item in items]
+    if len(set(identifiers)) != len(identifiers):
+        raise ValueError("checklist item ids must be unique")
+
+
+class ChecklistItemResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    item_id: str = Field(min_length=1, max_length=100)
+    passed: bool
+    evidence: str = Field(max_length=2_000)
+    deficiency: str = Field(max_length=1_000)
+
+
+class ChecklistReviewResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    results: list[ChecklistItemResult] = Field(max_length=20)
 
 
 class SubtaskResult(BaseModel):
@@ -97,5 +141,4 @@ class IntegratedAnswer(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     answer: str = Field(min_length=1, max_length=20_000)
-    completion_met: bool
     caveats: list[str] = Field(max_length=20)

@@ -17,6 +17,9 @@ compose exec -T vault vault policy write agent-orchestrator-api - <<'POLICY'
 path "secret/data/agent-orchestrator/openai" {
   capabilities = ["create", "update"]
 }
+path "secret/data/agent-orchestrator/tavily" {
+    capabilities = ["create", "update"]
+}
 path "auth/token/lookup-self" {
     capabilities = ["read"]
 }
