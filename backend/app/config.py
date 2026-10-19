@@ -1,6 +1,6 @@
 from functools import lru_cache
 
-from pydantic import SecretStr
+from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -19,6 +19,8 @@ class Settings(BaseSettings):
     session_poll_seconds: float = 1.0
     max_concurrent_agents: int = 4
     max_agent_attempts: int = 3
+    max_agent_turns: int = Field(default=24, ge=1, le=64)
+    max_tool_calls_per_subtask: int = Field(default=20, ge=0, le=100)
     max_quality_revisions_per_subtask: int = 2
     max_quality_revisions_per_task: int = 10
     job_lease_seconds: int = 60

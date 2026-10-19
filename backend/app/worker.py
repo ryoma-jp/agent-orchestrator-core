@@ -10,7 +10,8 @@ from sqlalchemy import and_, or_, select
 from app.config import get_settings
 from app.db import SessionFactory
 from app.models import Event, Job, Task
-from app.orchestrator import execute_task
+from app.orchestrator import InstructionChanged, execute_task
+from app.openai_client import AgentExecutionError
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger("orchestrator.worker")
@@ -150,7 +151,11 @@ async def mark_failure(
             job.lease_expires_at = None
             task.status = "failed"
             task.error = {
-                "code": "task_execution_failed",
+                "code": (
+                    str(error)
+                    if isinstance(error, AgentExecutionError)
+                    else "task_execution_failed"
+                ),
                 "message": "Task execution failed after the retry limit.",
             }
             task.updated_at = datetime.now(timezone.utc)
@@ -185,6 +190,8 @@ async def run_job(job_id: uuid.UUID, task_id: uuid.UUID, attempt: int) -> None:
             await asyncio.gather(execution, return_exceptions=True)
             return
         await execution
+    except InstructionChanged:
+        return
     except Exception as exc:
         logger.warning(
             "Task execution failed for task %s (%s)",

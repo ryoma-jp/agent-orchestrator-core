@@ -51,6 +51,17 @@ async def create_task(
     }
     if stored_settings:
         execution_settings.update(stored_settings.settings_json)
+    execution_settings.update(
+        {
+            "max_agent_turns": settings.max_agent_turns,
+            "max_tool_calls_per_subtask": settings.max_tool_calls_per_subtask,
+            "agent_runtime": {
+                "sdk": "openai-agents",
+                "version": "0.17.8",
+                "definition_version": "1",
+            },
+        }
+    )
     task = Task(
         owner_id=user.id,
         instruction=payload.instruction,

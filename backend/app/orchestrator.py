@@ -25,7 +25,13 @@ from app.models import (
     Task,
     TaskPlanRecord,
 )
-from app.openai_client import StructuredModelClient
+from app.openai_client import (
+    AgentExecutionContext,
+    AgentExecutionError,
+    DEFAULT_MAX_AGENT_TURNS,
+    DEFAULT_MAX_TOOL_CALLS,
+    StructuredModelClient,
+)
 from app.quality import (
     failed_required_checklist_items,
     normalize_checklist_results,
@@ -35,6 +41,93 @@ from app.tools import ToolRegistry, TavilySearchTool
 
 model_client = StructuredModelClient()
 tool_registry = ToolRegistry([TavilySearchTool().registration()])
+
+
+class InstructionChanged(RuntimeError):
+    pass
+
+
+def _agent_options(
+    task_id,
+    job_id,
+    lease_owner,
+    config,
+    *,
+    plan_version=None,
+    subtask_id=None,
+    conversation_sequence=None,
+):
+    async def check_lease():
+        await _assert_lease(job_id, lease_owner)
+        if task_id and conversation_sequence is not None:
+            if await _requeue_if_new_messages(
+                task_id, job_id, lease_owner, conversation_sequence
+            ):
+                raise InstructionChanged("task_requeued")
+
+    return {
+        "before_model_call": check_lease,
+        "max_turns": config.get("max_agent_turns", DEFAULT_MAX_AGENT_TURNS),
+        "execution_context": AgentExecutionContext(
+            task_id=str(task_id) if task_id else None,
+            plan_version=plan_version,
+            subtask_id=str(subtask_id) if subtask_id else None,
+            conversation_sequence=conversation_sequence,
+        ),
+    }
+
+
+async def _reserve_subtask_tool_call(task_id, subtask_id, job_id, lease_owner):
+    async with SessionFactory() as session:
+        task = await session.scalar(
+            select(Task).where(Task.id == task_id).with_for_update()
+        )
+        if task is None or task.status not in {"planning", "running"}:
+            raise RuntimeError("job_lease_lost")
+        job = await session.scalar(
+            select(Job)
+            .where(
+                Job.id == job_id,
+                Job.task_id == task_id,
+                Job.lease_owner == lease_owner,
+                Job.status == "leased",
+                Job.lease_expires_at > datetime.now(timezone.utc),
+            )
+            .with_for_update()
+        )
+        if job is None:
+            raise RuntimeError("job_lease_lost")
+        subtask = await session.scalar(
+            select(Subtask)
+            .where(
+                Subtask.id == subtask_id,
+                Subtask.task_id == task_id,
+            )
+            .with_for_update()
+        )
+        if subtask is None:
+            raise RuntimeError("subtask_not_found")
+        limit = task.config_snapshot.get(
+            "max_tool_calls_per_subtask", DEFAULT_MAX_TOOL_CALLS
+        )
+        if not isinstance(limit, int) or not 0 <= limit <= 100:
+            raise AgentExecutionError("invalid_agent_limits")
+        if subtask.tool_calls_used >= limit:
+            raise AgentExecutionError("tool_call_limit_exceeded")
+        subtask.tool_calls_used += 1
+        session.add(
+            Event(
+                task_id=task_id,
+                type="agent.progress",
+                payload_json={
+                    "summary": "Read-only tool invocation started.",
+                    "subtask_id": str(subtask_id),
+                    "plan_version": subtask.plan_version,
+                    "tool_calls_used": subtask.tool_calls_used,
+                },
+            )
+        )
+        await session.commit()
 
 
 async def _load_or_create_plan(
@@ -112,6 +205,13 @@ async def _load_or_create_plan(
         ),
         input_text=_format_conversation(conversation),
         max_attempts=config["max_agent_attempts"],
+        **_agent_options(
+            task_id,
+            job_id,
+            lease_owner,
+            config,
+            conversation_sequence=conversation_sequence,
+        ),
     )
     if any(subtask.skill_names for subtask in plan.subtasks):
         raise RuntimeError("unavailable_skill_requested")
@@ -122,14 +222,17 @@ async def _load_or_create_plan(
 
     async with SessionFactory() as session:
         await _assert_lease_in_session(session, job_id, lease_owner)
-        version = int(
-            await session.scalar(
-                select(
-                    func.coalesce(func.max(TaskPlanRecord.version), 0)
-                ).where(TaskPlanRecord.task_id == task_id)
+        version = (
+            int(
+                await session.scalar(
+                    select(
+                        func.coalesce(func.max(TaskPlanRecord.version), 0)
+                    ).where(TaskPlanRecord.task_id == task_id)
+                )
+                or 0
             )
-            or 0
-        ) + 1
+            + 1
+        )
         stored_plan = TaskPlanRecord(
             task_id=task_id,
             version=version,
@@ -308,17 +411,30 @@ async def execute_task(
                 lease_owner,
                 config["max_agent_attempts"],
                 revision_feedback=revision_feedback,
+                config=config,
             )
 
         outcomes = await asyncio.gather(
             *(execute_or_resume(row) for row in ready),
             return_exceptions=True,
         )
+        if any(
+            isinstance(outcome, InstructionChanged) for outcome in outcomes
+        ):
+            return
         for row, outcome in zip(ready, outcomes):
             if isinstance(outcome, BaseException):
                 error = {
-                    "code": "subtask_execution_failed",
-                    "message": str(outcome)[:500],
+                    "code": (
+                        str(outcome)
+                        if isinstance(outcome, AgentExecutionError)
+                        else "subtask_execution_failed"
+                    ),
+                    "message": (
+                        str(outcome)
+                        if isinstance(outcome, AgentExecutionError)
+                        else "Subtask execution failed."
+                    ),
                 }
                 result = {
                     "status": "failed",
@@ -335,6 +451,8 @@ async def execute_task(
                     error,
                     planned_through_sequence,
                 )
+                if isinstance(outcome, AgentExecutionError):
+                    raise outcome
                 raise RuntimeError("subtask_execution_failed") from outcome
             if outcome.status == "needs_input":
                 serialized = outcome.model_dump(mode="json")
@@ -468,6 +586,14 @@ async def execute_task(
             ),
             input_text=json.dumps(synthesis_payload, ensure_ascii=False),
             max_attempts=config["max_agent_attempts"],
+            **_agent_options(
+                task_id,
+                job_id,
+                lease_owner,
+                config,
+                plan_version=plan_version,
+                conversation_sequence=planned_through_sequence,
+            ),
         )
         final_review_results = await _review_checklist(
             model=config["manager_model"],
@@ -479,6 +605,14 @@ async def execute_task(
             plan_summary=plan.summary,
             instruction=_format_conversation(latest_conversation),
             max_attempts=config["max_agent_attempts"],
+            execution_options=_agent_options(
+                task_id,
+                job_id,
+                lease_owner,
+                config,
+                plan_version=plan_version,
+                conversation_sequence=planned_through_sequence,
+            ),
         )
         total_revisions = await _quality_revision_count(task_id)
         task_revision_limit = int(
@@ -491,9 +625,7 @@ async def execute_task(
         final_verdict = (
             "accepted"
             if checks_passed
-            else "revision_requested"
-            if can_revise
-            else "partially_accepted"
+            else "revision_requested" if can_revise else "partially_accepted"
         )
         await _save_quality_review(
             task_id=task_id,
@@ -577,6 +709,7 @@ async def _review_checklist(
     plan_summary: str,
     instruction: str,
     max_attempts: int,
+    execution_options: dict | None = None,
 ) -> list[dict[str, object]]:
     model_items = [
         item for item in checklist if item.verification_mode == "model"
@@ -607,6 +740,7 @@ async def _review_checklist(
                 ensure_ascii=False,
             ),
             max_attempts=max_attempts,
+            **(execution_options or {}),
         )
     return normalize_checklist_results(checklist, review, artifact)
 
@@ -732,7 +866,9 @@ async def _execute_subtask(
     lease_owner,
     max_attempts,
     revision_feedback: str = "",
+    config: dict | None = None,
 ) -> SubtaskResult:
+    config = config or {}
     sources_by_url: dict[str, SourceReference] = {}
     tool_runs: list[ToolExecutionRecord] = []
 
@@ -803,7 +939,10 @@ async def _execute_subtask(
         )
 
     async def assert_tool_lease() -> None:
-        await _assert_lease(job_id, lease_owner)
+        await execution_options["before_model_call"]()
+        await _reserve_subtask_tool_call(
+            row.task_id, row.id, job_id, lease_owner
+        )
 
     dependency_results = [
         results[dependency] for dependency in row.dependencies
@@ -825,6 +964,17 @@ async def _execute_subtask(
         ensure_ascii=False,
     )
     await _assert_lease(job_id, lease_owner)
+    execution_options = _agent_options(
+        getattr(row, "task_id", None),
+        job_id,
+        lease_owner,
+        config,
+        plan_version=getattr(row, "plan_version", None),
+        subtask_id=getattr(row, "id", None),
+        conversation_sequence=(
+            conversation[-1].sequence if conversation else None
+        ),
+    )
     result = await model_client.generate(
         model=row.model_id,
         schema_name="subtask_result",
@@ -861,6 +1011,10 @@ async def _execute_subtask(
         tool_registry=tool_registry,
         before_tool_call=assert_tool_lease,
         on_tool_result=capture_tool_result,
+        max_tool_calls=config.get(
+            "max_tool_calls_per_subtask", DEFAULT_MAX_TOOL_CALLS
+        ),
+        **execution_options,
     )
     result.sources = list(sources_by_url.values())[:15]
     result.tool_runs = tool_runs[:10]
@@ -977,6 +1131,11 @@ async def _review_subtask_result(
             plan_summary=plan.summary,
             instruction=row.artifact_goal,
             max_attempts=config["max_agent_attempts"],
+            execution_options=_agent_options(
+                task_id, job_id, lease_owner, config,
+                plan_version=plan_version, subtask_id=row.id,
+                conversation_sequence=conversation_sequence,
+            ),
         )
         failures = failed_required_checklist_items(review_results)
         task_revision_limit = int(
@@ -1036,6 +1195,7 @@ async def _review_subtask_result(
             lease_owner,
             config["max_agent_attempts"],
             revision_feedback=_revision_feedback(review_results),
+            config=config,
         )
         if current_result.status != "succeeded":
             failed_result = current_result.model_dump(mode="json")
@@ -1220,6 +1380,7 @@ async def _requeue_if_new_messages(
         task = await session.scalar(
             select(Task).where(Task.id == task_id).with_for_update()
         )
+        await _assert_lease_in_session(session, job_id, lease_owner)
         latest_sequence = await session.scalar(
             select(
                 func.coalesce(func.max(ConversationMessage.sequence), 0)

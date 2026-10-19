@@ -178,6 +178,9 @@ class Subtask(Base):
             "'succeeded', 'failed', 'blocked', 'cancelled')",
             name="ck_subtasks_status",
         ),
+        CheckConstraint(
+            "tool_calls_used >= 0", name="ck_subtasks_tool_calls_used"
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -198,6 +201,9 @@ class Subtask(Base):
     plan_version: Mapped[int | None] = mapped_column(Integer)
     attempt: Mapped[int] = mapped_column(Integer, default=0)
     quality_revision_count: Mapped[int] = mapped_column(Integer, default=0)
+    tool_calls_used: Mapped[int] = mapped_column(
+        Integer, default=0, server_default="0"
+    )
     result: Mapped[dict | None] = mapped_column(JSONB)
     error: Mapped[dict | None] = mapped_column(JSONB)
     created_at: Mapped[datetime] = mapped_column(

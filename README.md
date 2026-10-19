@@ -33,6 +33,16 @@ The provisioning script configures KV v2 paths and two AppRoles: the API role ca
 
 Start the independent Worker with `docker compose --profile local-vault --profile agent up --build -d worker`. The Worker does not receive either provider key in its environment; it reads each key from Vault only when making the corresponding request. For an external Vault, grant the Worker AppRole read access to both configured secret paths. Set `SESSION_COOKIE_SECURE=true` when serving through TLS.
 
+## Agents SDK runtime
+
+Manager planning, checklist reviews, synthesis, and subtask generation/revision run through OpenAI Agents SDK `Agent`/`Runner` behind the shared model adapter. The application still owns PostgreSQL tasks, plans, dependency scheduling, quality budgets, leases, user-message checkpoints, and SSE events. SDK completion is not task acceptance. Handoffs, automatic SDK Sessions, and persisted SDK RunState are not enabled. SDK tracing and sensitive-data capture are explicitly disabled; no OpenAI key environment variable is used.
+
+The tested Python 3.10 dependency set is `openai-agents==0.17.8`, `openai==2.36.0`, and `pydantic==2.14.0`. Upgrade these as a tested set: newer OpenAI 2.x versions can change SDK usage schemas despite satisfying declared version ranges. Each actual model request, including tool continuations and retries, reads the latest Vault key. API and format retries share one bounded retry budget, and HTTP-client retries are disabled.
+
+Set `MAX_AGENT_TURNS` (default 24, range 1-64) and `MAX_TOOL_CALLS_PER_SUBTASK` (default 20, range 0-100) in the deployment environment. The API snapshots them when creating a task; they are not administrator UI settings. Existing task snapshots without these fields use fixed compatibility defaults of 24 and 20. Tool usage is consumed before execution and stored on each subtask, including failed/interrupted calls, so format correction, quality revision, and Worker reclaim do not reset the budget. New plan versions have new subtask budgets; earlier usage remains recorded. These limits are separate from model retries and quality revision limits.
+
+For an existing deployment, stop the Worker, rebuild the backend image, apply migration `0004_agent_sdk_limits` with `docker compose --profile setup run --build --rm migrate`, and then rebuild/restart the API and Worker. Apply migrations before starting the new Worker; no existing application database is modified automatically at startup. Keep a single Worker replica. SDK integration does not add task-level leases, shared rate limits, side-effect recovery, or a new Sandbox.
+
 ## Cleanup
 
 These commands affect this Compose project only. Run them from the repository root.
@@ -94,4 +104,10 @@ python -m pip install -e ".[dev]"
 python -m pytest -q
 ```
 
-The current tests use isolated/mocked dependencies and do not require PostgreSQL or Docker to be running.
+The default tests use isolated/mocked dependencies and make no real OpenAI or Tavily requests. SDK tests exercise the actual Runner and OpenAI client with an HTTP mock. PostgreSQL integration tests are skipped unless `TEST_DATABASE_URL` is set to a dedicated PostgreSQL database whose name ends in `_test`:
+
+```sh
+TEST_DATABASE_URL=postgresql+asyncpg://test_user:test_password@localhost:5432/orchestrator_test python -m pytest -q
+```
+
+Integration tests create and remove randomly named schemas only in that dedicated database. They cover atomic tool budgets, stale leases/cancellation, snapshot settings, migration upgrade/downgrade, instruction requeue races, and the SDK planning/subtask/review/synthesis path. Real-model quality, cost, latency, and multi-Worker operation are not certified by these tests.

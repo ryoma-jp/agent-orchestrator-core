@@ -1213,54 +1213,15 @@ class SmallOutput(BaseModel):
 
 @pytest.mark.asyncio
 async def test_model_json_fallback_when_schema_mode_is_unsupported(
-    monkeypatch,
+    sdk_transport,
 ):
-    import app.openai_client as client_module
-
-    clients = []
-
-    class FakeResponses:
-        def __init__(self):
-            self.requests = []
-
-        async def create(self, **request):
-            self.requests.append(request)
-            if "text" in request:
-                response = httpx.Response(
-                    400,
-                    request=httpx.Request("POST", "https://example.invalid"),
-                    json={"error": {"message": "json_schema unsupported"}},
-                )
-                from openai import APIStatusError
-
-                raise APIStatusError(
-                    "json_schema structured output unsupported",
-                    response=response,
-                    body=response.json(),
-                )
-            return SimpleNamespace(output_text='{"answer":"validated"}')
-
-    class FakeClient:
-        def __init__(self, **kwargs):
-            self.kwargs = kwargs
-            self.responses = FakeResponses()
-            clients.append(self)
-
-        async def close(self):
-            return None
-
-    monkeypatch.setattr(client_module, "AsyncOpenAI", FakeClient)
-    monkeypatch.setattr(
-        client_module,
-        "get_settings",
-        lambda: SimpleNamespace(
-            openai_base_url="",
-            max_agent_attempts=3,
-            agent_timeout_seconds=30,
-        ),
-    )
-    monkeypatch.setattr(
-        client_module, "read_openai_api_key", lambda: "test-key"
+    transport = sdk_transport(
+        [
+            httpx.Response(
+                400, json={"error": {"message": "json_schema unsupported"}}
+            ),
+            '{"answer":"validated"}',
+        ]
     )
 
     result = await StructuredModelClient().generate(
@@ -1273,21 +1234,18 @@ async def test_model_json_fallback_when_schema_mode_is_unsupported(
     )
 
     assert result.answer == "validated"
-    assert clients[0].kwargs["base_url"] == "https://api.openai.com/v1"
-    requests = [
-        request for client in clients for request in client.responses.requests
-    ]
+    assert str(transport.clients[0].base_url) == "https://api.openai.com/v1/"
+    requests = transport.requests
     assert len(requests) == 2
     assert "text" in requests[0]
-    assert "text" not in requests[1]
+    assert not requests[1].get("text", {}).get("format")
+    assert all(client.is_closed() for client in transport.clients)
 
 
 @pytest.mark.asyncio
 async def test_tool_call_is_validated_executed_and_returned_to_model(
-    monkeypatch,
+    sdk_transport,
 ):
-    import app.openai_client as client_module
-
     calls = []
 
     class ToolArguments(BaseModel):
@@ -1312,60 +1270,20 @@ async def test_tool_call_is_validated_executed_and_returned_to_model(
             )
         ]
     )
-    first_response = SimpleNamespace(
-        id="response-1",
-        output=[
-            SimpleNamespace(
-                type="function_call",
-                name="test_search",
-                arguments='{"query":"latest release"}',
-                call_id="call-1",
-            )
-        ],
-        output_text="",
+    transport = sdk_transport(
+        [
+            [
+                {
+                    "id": "function-1",
+                    "type": "function_call",
+                    "name": "test_search",
+                    "arguments": '{"query":"latest release"}',
+                    "call_id": "call-1",
+                }
+            ],
+            '{"answer":"Release notes found."}',
+        ]
     )
-    final_response = SimpleNamespace(
-        id="response-2",
-        output=[],
-        output_text='{"answer":"Release notes found."}',
-    )
-
-    class FakeResponses:
-        def __init__(self):
-            self.requests = []
-
-        async def create(self, **request):
-            self.requests.append(request)
-            if len(self.requests) == 1:
-                return first_response
-            return final_response
-
-    class FakeClient:
-        def __init__(self, **_kwargs):
-            self.responses = FakeResponses()
-            self.closed = False
-
-        async def close(self):
-            self.closed = True
-
-    clients = []
-
-    def create_client(**kwargs):
-        client = FakeClient(**kwargs)
-        clients.append(client)
-        return client
-
-    monkeypatch.setattr(client_module, "AsyncOpenAI", create_client)
-    monkeypatch.setattr(
-        client_module,
-        "get_settings",
-        lambda: SimpleNamespace(
-            openai_base_url="",
-            max_agent_attempts=1,
-            agent_timeout_seconds=30,
-        ),
-    )
-    monkeypatch.setattr(client_module, "read_openai_api_key", lambda: "key")
     lease_checks = []
     captured_results = []
 
@@ -1389,10 +1307,18 @@ async def test_tool_call_is_validated_executed_and_returned_to_model(
     assert calls == ["latest release"]
     assert len(lease_checks) == 1
     assert captured_results[0][0] == "test_search"
-    requests = clients[0].responses.requests
+    requests = transport.requests
     assert requests[0]["tools"][0]["name"] == "test_search"
-    assert requests[1]["previous_response_id"] == "response-1"
-    assert requests[1]["input"][0]["call_id"] == "call-1"
+    assert not requests[1].get("previous_response_id")
+    assert any(
+        item.get("call_id") == "call-1"
+        and item["type"] == "function_call_output"
+        for item in requests[1]["input"]
+    )
+    assert transport.credentials == ["Bearer test-key-1", "Bearer test-key-2"]
+    assert all(request["store"] is False for request in requests)
+    assert all(client.max_retries == 0 for client in transport.clients)
+    assert all(client.is_closed() for client in transport.clients)
 
 
 @pytest.mark.asyncio
