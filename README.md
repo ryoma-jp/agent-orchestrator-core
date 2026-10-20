@@ -14,6 +14,12 @@ PostgreSQL-backed task coordination service with separate API, worker, user UI, 
 
 After initial setup, start or restart the API and both UIs with `docker compose --profile local-vault up -d`. Open `http://localhost:8080/` for the user UI or `http://localhost:8080/admin/` for the administrator UI. Add `--build` when you need to rebuild images after code changes.
 
+```sh
+docker compose --profile local-vault up -d --build
+sh scripts/provision-local-vault.sh
+docker compose --profile local-vault --profile agent up --build -d worker
+```
+
 ### Generate local passwords
 
 Use OpenSSL to generate separate 256-bit random values for PostgreSQL and the initial administrator. The hexadecimal database password is URL-safe; use the same value in both `POSTGRES_PASSWORD` and `DATABASE_URL` in `.env`. Copy the printed lines into `.env` and do not commit them.
@@ -37,7 +43,7 @@ Start the independent Worker with `docker compose --profile local-vault --profil
 
 Manager planning, checklist reviews, synthesis, and subtask generation/revision run through OpenAI Agents SDK `Agent`/`Runner` behind the shared model adapter. The application still owns PostgreSQL tasks, plans, dependency scheduling, quality budgets, leases, user-message checkpoints, and SSE events. SDK completion is not task acceptance. Handoffs, automatic SDK Sessions, and persisted SDK RunState are not enabled. SDK tracing and sensitive-data capture are explicitly disabled; no OpenAI key environment variable is used.
 
-The tested Python 3.10 dependency set is `openai-agents==0.17.8`, `openai==2.36.0`, and `pydantic==2.14.0`. Upgrade these as a tested set: newer OpenAI 2.x versions can change SDK usage schemas despite satisfying declared version ranges. Each actual model request, including tool continuations and retries, reads the latest Vault key. API and format retries share one bounded retry budget, and HTTP-client retries are disabled.
+The tested Python 3.10 dependency set is `openai-agents==0.24.0`, `openai==3.35.1`, and `pydantic==2.14.1`. OpenAI 3.x uses HTTPX2; the application retains HTTPX for its other integrations and tests use HTTPX2 for the SDK transport. Each actual model request, including tool continuations and retries, reads the latest Vault key. API and format retries share one bounded retry budget, and HTTP-client retries are disabled.
 
 Set `MAX_AGENT_TURNS` (default 24, range 1-64) and `MAX_TOOL_CALLS_PER_SUBTASK` (default 20, range 0-100) in the deployment environment. The API snapshots them when creating a task; they are not administrator UI settings. Existing task snapshots without these fields use fixed compatibility defaults of 24 and 20. Tool usage is consumed before execution and stored on each subtask, including failed/interrupted calls, so format correction, quality revision, and Worker reclaim do not reset the budget. New plan versions have new subtask budgets; earlier usage remains recorded. These limits are separate from model retries and quality revision limits.
 
@@ -107,7 +113,14 @@ python -m pytest -q
 The default tests use isolated/mocked dependencies and make no real OpenAI or Tavily requests. SDK tests exercise the actual Runner and OpenAI client with an HTTP mock. PostgreSQL integration tests are skipped unless `TEST_DATABASE_URL` is set to a dedicated PostgreSQL database whose name ends in `_test`:
 
 ```sh
+docker run --name agent-orchestrator-test-db \
+  -e POSTGRES_USER=test_user \
+  -e POSTGRES_PASSWORD=test_password \
+  -e POSTGRES_DB=orchestrator_test \
+  -p 127.0.0.1:5432:5432 \
+  -d postgres:16-alpine
 TEST_DATABASE_URL=postgresql+asyncpg://test_user:test_password@localhost:5432/orchestrator_test python -m pytest -q
+docker rm -f agent-orchestrator-test-db
 ```
 
 Integration tests create and remove randomly named schemas only in that dedicated database. They cover atomic tool budgets, stale leases/cancellation, snapshot settings, migration upgrade/downgrade, instruction requeue races, and the SDK planning/subtask/review/synthesis path. Real-model quality, cost, latency, and multi-Worker operation are not certified by these tests.

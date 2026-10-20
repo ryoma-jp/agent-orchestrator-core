@@ -32,7 +32,7 @@ from app.vault import read_openai_api_key
 ModelOutput = TypeVar("ModelOutput", bound=BaseModel)
 DEFAULT_MAX_AGENT_TURNS = 24
 DEFAULT_MAX_TOOL_CALLS = 20
-SDK_VERSION = "0.17.8"
+SDK_VERSION = "0.24.0"
 AGENT_DEFINITION_VERSION = "1"
 
 set_tracing_disabled(True)

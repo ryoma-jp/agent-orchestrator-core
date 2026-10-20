@@ -2,7 +2,7 @@ import os
 import json
 from types import SimpleNamespace
 
-import httpx
+import httpx2
 import pytest
 from openai import AsyncOpenAI
 
@@ -32,7 +32,7 @@ def sdk_transport(monkeypatch):
             output = next(pending)
             if isinstance(output, Exception):
                 raise output
-            if isinstance(output, httpx.Response):
+            if isinstance(output, httpx2.Response):
                 return output
             if isinstance(output, str):
                 output = [
@@ -50,7 +50,7 @@ def sdk_transport(monkeypatch):
                         ],
                     }
                 ]
-            return httpx.Response(
+            return httpx2.Response(
                 200,
                 json={
                     "id": f"response-{len(requests)}",
@@ -68,8 +68,8 @@ def sdk_transport(monkeypatch):
         def create_client(**kwargs):
             client = AsyncOpenAI(
                 **kwargs,
-                http_client=httpx.AsyncClient(
-                    transport=httpx.MockTransport(respond)
+                http_client=httpx2.AsyncClient(
+                    transport=httpx2.MockTransport(respond)
                 ),
             )
             clients.append(client)

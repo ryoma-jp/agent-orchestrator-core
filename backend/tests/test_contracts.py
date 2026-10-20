@@ -3,6 +3,7 @@ from types import SimpleNamespace
 
 import pytest
 import httpx
+import httpx2
 from fastapi import HTTPException
 from pydantic import BaseModel, ValidationError
 from starlette.requests import Request
@@ -1217,7 +1218,7 @@ async def test_model_json_fallback_when_schema_mode_is_unsupported(
 ):
     transport = sdk_transport(
         [
-            httpx.Response(
+            httpx2.Response(
                 400, json={"error": {"message": "json_schema unsupported"}}
             ),
             '{"answer":"validated"}',
