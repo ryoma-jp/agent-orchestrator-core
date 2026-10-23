@@ -35,6 +35,9 @@ class Settings(BaseSettings):
     vault_api_secret_id_file: str | None = None
     vault_worker_role_id_file: str | None = None
     vault_worker_secret_id_file: str | None = None
+    workspace_root: str = ".data/workspaces"
+    workspace_internal_token: SecretStr | None = None
+    api_internal_base_url: str = "http://api:8000"
 
     model_config = SettingsConfigDict(
         env_file=".env", env_prefix="", extra="ignore"

@@ -12,10 +12,10 @@
 |---|---|---|
 | 実行基盤 | PostgreSQL、FastAPI、独立API／Worker、PostgreSQLジョブ行のロックと期限付きリース | Worker間のタスク実行リース、fencing token、共有同時実行枠・RPM／TPM制御、複数Worker運用保証 |
 | エージェント実行方式 | OpenAI Agents SDKのAgent／Runnerを共通実行アダプター経由で利用。タスク制御・永続化は独自オーケストレーターに維持 | Handoffs、動的なAgent.as_tool()委譲、Session自動保存、承認用RunStateの永続化 |
-| エージェント | 構造化計画、成果物目標・チェックリストによる個別受け入れと最終成果物判定、設定上限付き品質修正、準完了状態、依存関係に沿った読み取り専用サブタスクの並行実行、Tavily検索Function Calling、結果統合、最大3回の設定可能な試行 | Tavily以外のツール拡張、ファイル・シェル・外部更新操作、承認、Sandbox |
-| 拡張 | Worker内の読み取り専用Tavily Web検索 | 動的プライベートスキル、RAGアダプター、成果物ストレージ、コンテキスト要約 |
+| エージェント | 構造化計画、成果物目標・チェックリストによる個別受け入れと最終成果物判定、設定上限付き品質修正、準完了状態、依存関係に沿った読み取り専用サブタスクの並行実行、Tavily検索Function Calling、入力テキスト添付の計画入力、要求ファイルの構造化出力・Workspace保存、ツール予算超過時の部分成果レビューと追加予算承認、最大3回の設定可能な試行 | ファイル／シェル操作ツール、任意形式添付の解析、副作用操作の承認、タスクSandbox内でのエージェント実行 |
+| 拡張 | TaskFileメタデータ、タスクUUID別永続Workspace、所有者スコープのファイルAPI、削除アウトボックスと再試行ワーカー | Workerから分離したタスクSandbox、ターミナル、Git cloneと認証ブローカー、動的プライベートスキル、RAGアダプター、コンテキスト要約 |
 | 認証・管理 | WebセッションとCSRF、ユーザー別Bearerアクセスキー、管理者によるアカウント・モデル・品質修正上限・Vaultキー管理 | より細かな権限・監査、利用量／コスト集計 |
-| UI・イベント | User UI、Admin UI、品質判定の進捗・準完了表示、DBイベントのSSE配信とLast-Event-ID以降の再送 | 承認／副作用解決UI、成果物ダウンロードUI |
+| UI・イベント | User UIのタスク別Explorer（アップロード、一覧、テキスト編集、ダウンロード、削除）、追加ツール予算の承認／拒否、Admin UI、品質判定の進捗・準完了表示、DBイベントのSSE配信とLast-Event-ID以降の再送 | タスクごとの隔離Terminal、Git認証UI、副作用操作の承認／解決UI |
 
 この表は機能の有無を示す。後続節では現行実装と将来設計を区別して記載する。
 
@@ -48,7 +48,7 @@
 - ネットワークから切断中に新たなモデル応答を生成することはできない。現行実装はジョブリース失効後の再取得を行うが、途中計画からの復元ではなく、会話を再読込してタスク処理を再試行する。
 
 ## 3. システム構成
-以下の図は将来の目標構成を含む。現行コードにはAPI、Worker、PostgreSQL、Vault、User/Admin UI、nginxと、Worker内のAgents SDK実行アダプター・Tavily読み取り専用検索・品質判定がある。追加のツール登録、Skill Registry、Sandbox、RAG、成果物ストレージ、Worker間共有レート制御は未実装である。
+以下の図は将来の目標構成を含む。現行コードにはAPI、Worker、PostgreSQL、Vault、User/Admin UI、nginxと、Worker内のAgents SDK実行アダプター・Tavily読み取り専用検索・品質判定がある。APIは名前付きボリューム上にタスクUUID別Workspaceを作成し、所有者スコープのExplorerファイルAPIを提供する。Workerは内部API経由でテキスト添付を計画入力として読み、ユーザーが要求したファイルだけをWorkspaceへ保存する。会話向け回答は会話履歴とタスク結果に保存する。削除要求は永続ジョブでWorkspace清掃後にDB cascadeする。Workerから分離されたタスク別Sandbox、Terminal、Git clone／認証、追加のツール登録、Skill Registry、RAG、Worker間共有レート制御は未実装である。
 
 ```mermaid
 flowchart TB
@@ -102,7 +102,9 @@ flowchart TB
     Vault["HashiCorp Vault<br/>KV v2: OpenAI/Tavilyキー"]
     Tavily["Tavily Search API"]
     Skills["Private Skills"]
-    Sandbox["Sandbox service/container<br/>task_idごとの一時ワークスペース"]
+    Sandbox["Sandbox service/container<br/>task_idごとの永続Workspace"]
+    Terminal["Web Terminal<br/>task Workspace内のみ"]
+    Explorer["File Explorer<br/>task Workspace内のみ"]
     Knowledge["Private Knowledge DB / vector store"]
 
     Browser --> Nginx
@@ -117,7 +119,11 @@ flowchart TB
     OpenAIClient --> OpenAI
     TavilyAdapter --> Tavily
     SkillRegistry --> Skills
-    Safety -->|隔離ツール実行・成果物入出力| Sandbox
+    Safety -->|隔離されたコマンド・ファイル操作| Sandbox
+    UserUI -->|ターミナル接続| Terminal
+    UserUI -->|ファイル一覧・読書き| Explorer
+    Terminal --> Sandbox
+    Explorer --> Sandbox
     RAGAdapter --> Knowledge
     API -->|管理者AppRole: KV v2へ書込| Vault
     OpenAIClient -->|Worker AppRole: 呼び出しごとにキー読取| Vault
@@ -129,17 +135,17 @@ flowchart TB
 | コンポーネント | 責務 |
 |---|---|
 | Admin UI container | 管理者専用の画面を配信。ユーザー管理など管理者権限を要する操作を提供 |
-| User UI container | 一般ユーザー専用の画面を配信。ログインユーザー自身のタスク・アカウント操作を提供 |
-| API層 | 入力検証、セッション／Bearerアクセスキー認証、タスク・会話・アカウント・管理設定操作、SSE接続を提供。タスクの所有者を検証し、OpenAIキーをクライアントに返さない |
-| タスクサービス | 永続DBを介したタスク受付・状態変更・ジョブ登録を行う。エージェント実行はWorkerへ委譲する |
+| User UI container | 一般ユーザー専用の画面を配信。ログインユーザー自身のタスク・アカウント操作と、全タスク共通のファイルExplorerを提供。Terminalは未実装 |
+| API層 | 入力検証、セッション／Bearerアクセスキー認証、タスク・会話・アカウント・管理設定操作、所有者スコープのWorkspaceファイルAPI、SSEを提供。OpenAIキーやWorkspace内部トークンをクライアントに返さない |
+| タスクサービス | 永続DBを介したタスク受付・状態変更・ジョブ登録を行い、タスクごとのWorkspaceを確保する。エージェント実行はWorkerへ委譲する |
 | オーケストレーター | Worker内でDBから状態を読み、管理エージェントへ計画・内容評価・統合を依頼する。依存関係に沿った起動、機械的検証、品質修正予算、リース検査、追加指示の検出、状態・イベントの確定をコードで制御する。SDK導入後も維持する |
 | 管理エージェント | 作業の目的・制約を解釈し、計画・チェックリスト・内容評価・修正方針・統合回答を構造化出力する。DB更新、実行権限、上限変更の主体にはしない |
 | サブエージェント | 割り当てられたサブタスクの成果を生成・修正し、許可された読み取り専用ツールを利用する。自己申告の成功を成果の受け入れとはみなさない |
 | エージェント実行器 | 共通実行アダプターがプロンプト・入力・Pydantic出力型をSDKのAgentへ設定し、Runnerによるモデル／ツールループを実行する。タスク状態は直接確定しない |
 | OpenAIクライアント | Agents SDKからモデル接続アダプターを通じて公式OpenAI Python SDKを呼び出す。各要求直前のVaultキー取得、タイムアウト、限定再試行、必要なJSONフォールバックを維持する。共有RPM／TPM制御・利用量の永続集計は未実装 |
-| Worker | PostgreSQLのジョブを `FOR UPDATE SKIP LOCKED` で取得し、期限付きジョブリースを更新しながら計画・サブタスク実行・品質レビュー／修正・結果統合を行う |
-| ツール／スキル／Sandbox／RAG | Tavilyの読み取り専用検索をWorkerに実装。Tavily以外の追加ツール、動的スキル、Sandbox、RAGは将来の拡張設計 |
-| 永続化 | PostgreSQLにユーザー、セッション、設定、タスク、会話、計画、品質レビュー、サブタスク、イベント、ジョブを保存する。承認・独立した成果物ストレージ・要約・タスク実行リースは未実装 |
+| Worker | PostgreSQLの実行ジョブを `FOR UPDATE SKIP LOCKED` で取得し、期限付きリースを更新しながら計画・サブタスク実行・品質レビュー／修正・結果統合を行う。内部API経由で許可されたテキスト添付を読み、会話向け回答と要求ファイルを保存する |
+| ツール／スキル／Workspace | Tavily読み取り専用検索をWorkerに実装。TaskFile APIと永続Workspaceを実装。タスク別実行Sandbox、Terminal、Git操作、動的スキル、RAGは未実装 |
+| 永続化 | PostgreSQLにタスク状態、保留中のツール予算承認、TaskFileメタデータ、削除ジョブを保存し、ファイル内容はタスクUUID別Workspaceボリュームに保存する。副作用承認・要約・タスク実行リースは未実装 |
 | SSE配信 | PostgreSQLに保存済みのイベントを取得して順序付きでクライアントに配信し、Last-Event-IDによる再接続を支援 |
 
 ## 4. エージェント構成と通信
@@ -213,7 +219,7 @@ flowchart TB
 
 #### 現行実装: 成果物の受け入れとタスク完了
 
-管理エージェントは会話からタスク全体の最終チェックリストを作成し、計画の各サブタスクに成果物目標と個別の受け入れチェックリストを割り当てる。項目には必須／任意と検証方式（モデル判断、空でないこと、出典の有無、Markdown引用形式）を設定する。計画とチェックリストは会話sequenceおよび計画バージョンとともにPostgreSQLへ保存する。計画プロンプトはユーザー要求にない条件を追加しないよう指示するが、曖昧さを検出したときに必ずユーザー確認へ移る保証はない。`needs_attention`はサブタスクが追加情報を要求した場合に使用する。
+管理エージェントは会話からタスク全体の最終チェックリストを作成し、計画の各サブタスクに成果物目標と個別の受け入れチェックリストを割り当てる。項目には必須／任意と検証方式（モデル判断、空でないこと、要求ファイルの有無、出典の有無、Markdown引用形式）を設定する。計画とチェックリストは会話sequenceおよび計画バージョンとともにPostgreSQLへ保存する。計画プロンプトはユーザー要求にない条件を追加しないよう指示するが、曖昧さを検出したときに必ずユーザー確認へ移る保証はない。`needs_attention`はサブタスクが追加情報を要求した場合に使用する。
 
 チェックリストは計画バージョンに属し、ユーザー指示の会話sequenceとともに保存する。品質レビューは上書きせず履歴として保存し、ユーザーの追加指示で再計画する場合は新しい計画バージョンを作成する。計画の自動修正案を採用して部分的に更新する機能や、既存の受け入れ済み成果だけを選択して再検証する機能はない。
 
@@ -221,17 +227,21 @@ flowchart TB
 
 サブタスク結果を統合した後、管理エージェントは最終回答を作成し、独立した最終チェックリストで評価する。必須項目が満たされた場合は`succeeded`、品質修正上限後も未達が残る場合は未達項目を含む完了レポートとともに`partially_completed`を確定する。モデル・ツール・DBなどの実行障害は品質未達と区別し、通常の`failed`として扱う。
 
-チェック項目は、成果物が空でないこと、出典URLがあること、回答中のMarkdown引用が出典URLと一致することをコードで判定し、内容の妥当性などモデル判断が必要なものを管理エージェントが判定する。モデル評価だけに依存する項目では、チェック項目ごとの判定、簡潔な根拠テキスト、成果物の証拠内容を記録する。証拠の位置情報や隠れた思考過程は保存しない。
+チェック項目は、成果物が空でないこと、要求されたファイル成果物があること、出典URLがあること、回答またはファイル中のMarkdown引用が出典URLと一致することをコードで判定し、内容の妥当性などモデル判断が必要なものを管理エージェントが判定する。ファイル出力要求がある場合は最終チェックリストに必須の`artifact_present`項目を設ける。モデル判断の各項目では、判定・簡潔な根拠に加えて、未達を解消するために追加の読み取り専用ツール呼び出しが必要かを`requires_additional_tool_calls`として構造化して記録する。追加調査が不要なら既存の証拠だけで修正し、必要な場合に限りユーザー承認要求を作成する。証拠の位置情報や隠れた思考過程は保存しない。
+
+ユーザーがファイル出力を依頼した場合、統合応答は会話向けの`answer`と、ファイルごとの`filename`・`content`を持つ`artifacts`を別々に返す。指定ファイル名があればそれを維持し、指定がなければ内容に合う名前と拡張子をエージェントが選ぶ。ファイルは`artifacts/`配下へ保存し、ファイル名は単一パス要素として検証する。ファイル本文には会話向けの案内文や自動の見出しを付加しない。`answer`には保存成功後にアプリケーションが実際の保存先を追記する。要求されたファイルの保存・TaskFileメタデータ登録に失敗した場合はタスクを成功扱いにしない。
+
+サブエージェントがツール呼び出し総数の上限に達した場合、その呼び出しは実行せず、Runnerには「追加ツールは利用できない」という制御結果として返す。Runnerは既に得た情報から最善の構造化`SubtaskResult`を返し、オーケストレーターは収集済みの出典・ツール記録とともに管理エージェントのレビューへ渡す。これだけでタスク全体を`failed`にしない。管理エージェントの項目別レビューには追加の外部調査が必要かを含める。既存情報で修正可能なら追加呼び出しなしで修正する。追加調査が必要な場合は`waiting_approval`としてユーザーへ明示的な承認を求め、承認されるまでツール予算を増やさず実行を停止する。拒否された場合は部分受け入れ結果を統合し、未達項目が残れば`partially_completed`とする。
 
 ### 4.3 サブエージェント
 
-現行実装ではサブタスクごとに設定済みWorkerモデルを用い、同一タスク内の独立した依存関係レベルを最大32件まで並行実行する。必要に応じてTavilyの読み取り専用Web検索を呼び出せる。出力は `SubtaskResult`（`succeeded`／`needs_input`／`failed`、summary、findings、sources、tool_runs、questions、error）で検証する。サブタスク個別の再開、動的スキル実行、Worker間の共有レート制限はない。
+現行実装ではサブタスクごとに設定済みWorkerモデルを用い、同一タスク内の独立した依存関係レベルを最大32件まで並行実行する。必要に応じてTavilyの読み取り専用Web検索を呼び出せる。出力は `SubtaskResult`（`succeeded`／`partial`／`needs_input`／`failed`、summary、findings、sources、tool_runs、questions、error）で検証する。サブタスク個別の再開、動的スキル実行、Worker間の共有レート制限はない。
 
-サブタスクの構造化出力は`SubtaskResult`（`succeeded`／`needs_input`／`failed`、summary、findings、sources、tool_runs、questions、error）で検証する。成果物はこの結果を指し、独立した成果物ファイルやストレージはない。受け入れ可否はサブエージェントの自己申告ではなく管理エージェントのチェックリスト判定で決め、修正時は未達項目と不足内容を渡す。
+サブタスクの構造化出力は`SubtaskResult`（`succeeded`／`partial`／`needs_input`／`failed`、summary、findings、sources、tool_runs、questions、error）で検証する。ツール予算到達時は`partial`を返し、実行済みの検索結果・記録とともに管理エージェントの受け入れ判定へ進める。成果物はこの結果を指し、独立した中間成果物ファイルやストレージはない。受け入れ可否はサブエージェントの自己申告ではなく管理エージェントのチェックリスト判定で決め、修正時は未達項目と不足内容を渡す。
 
 ### 4.4 Tool Callingと構造化データ
 
-現行Workerはサブタスク実行に限りAgents SDKのFunction Toolsを通じてTavily検索を呼び出す。ツール名と引数を登録内容・JSON Schemaで検証する。呼び出しは計画バージョン内のサブタスクごとに既定20回までとし、失敗・中断・形式再試行・品質修正・Worker再取得も同じDB使用枠を消費する。計画、サブタスク結果、レビュー、統合応答はPydantic型をAgentのoutput_typeへ設定してStructured Outputsで要求し、非対応の場合は通常JSONへ切り替えて同じ型で検証する。Tavily以外のツール実装と副作用ツールは未実装である。
+現行Workerはサブタスク実行に限りAgents SDKのFunction Toolsを通じてTavily検索を呼び出す。ツール名と引数を登録内容・JSON Schemaで検証する。サブタスクの初期上限はタスク作成時の`config_snapshot.max_tool_calls_per_subtask`（既定20回、設定範囲0〜100）とし、失敗・中断・形式再試行・品質修正・Worker再取得で使用数をリセットしない。上限到達時は追加ツールを実行せず、Runnerを部分結果のStructured Outputへ誘導する。管理エージェントが追加調査を必須と判定した場合、ユーザーの明示承認1回につき同じタスク設定スナップショットの初期上限と同数を追加する。承認回数・累積許可数にアプリケーション上限は設けず、追加調査の費用と継続判断はユーザーに委ねる。初期上限が0の場合は承認要求を出さず、部分結果を統合する。単一Runnerのツール呼び出し上限は100回とし、承認済み残数がそれを超える場合はRunner実行を複数回に分割する。計画、サブタスク結果、レビュー、統合応答はPydantic型をAgentのoutput_typeへ設定してStructured Outputsで要求し、非対応の場合は通常JSONへ切り替えて同じ型で検証する。統合応答の要求ファイル本文も構造化出力として検証する。Tavily以外のツール実装と副作用ツールは未実装である。
 
 現行実装のサブタスク結果:
 
@@ -247,7 +257,7 @@ flowchart TB
 }
 ```
 
-`needs_input`の場合は `questions` に1件以上の質問を必須とし、Workerは質問をassistantメッセージとして保存してタスクを `needs_attention` にする。統合応答は `answer` と `caveats` を持つ。成果物チェックリストの判定結果とツール実行記録は、それぞれ品質レビュー記録とサブタスク結果に保存する。
+`needs_input`の場合は `questions` に1件以上の質問を必須とし、Workerは質問をassistantメッセージとして保存してタスクを `needs_attention` にする。統合応答は会話向けの`answer`、`caveats`、要求ファイルごとの`artifacts`（`filename`と`content`）を持つ。ファイル出力要求がない場合は`artifacts`を空にする。成果物チェックリストの判定結果とツール実行記録は、それぞれ品質レビュー記録とサブタスク結果に保存する。
 
 ### 4.5 OpenAI Agents SDKによるエージェント実行
 
@@ -292,7 +302,7 @@ SDKのトレースと機密データ収集は初期導入で明示的に無効�
 
 #### 4.5.5 段階導入と性能評価
 
-サブエージェントのTool Callingループと、管理側の計画・レビュー・統合をSDKへ移行済みである。入出力契約、設定スナップショット、品質修正・部分受け入れの動作、DB状態、イベント契約を維持する。API／UIの契約やWorkerの複数レプリカ運用保証は変更しない。承認、Sandbox、複数Worker間の排他など、別途記載する機能は未実装である。
+サブエージェントのTool Callingループと、管理側の計画・レビュー・統合をSDKへ移行済みである。入出力契約、設定スナップショット、品質修正・部分受け入れ・ツール予算承認の動作、DB状態、イベント契約を維持する。API／UIの契約やWorkerの複数レプリカ運用保証は変更しない。副作用操作の承認、Sandbox、複数Worker間の排他など、別途記載する機能は未実装である。
 
 SDK採用は汎用ループの保守削減と実行機構の共通化を目的とし、それ自体で速度・品質の向上を保証しない。タスク間並行実行、完了したサブタスクからのレビュー・後続起動、必要情報に絞ったコンテキスト構築はオーケストレーター側の別の改善として扱う。レビューを並行化する場合はタスク全体の品質修正予算をDB上で原子的に確保し、上限を超過させない。同一モデル・課題・完了条件で、完了時間の中央値／P95、モデル呼び出し数、トークン・費用、必須項目充足率、修正回数、復旧時の重複実行を比較する。
 
@@ -310,11 +320,17 @@ ComposeにはPostgreSQL、API、Worker、User UI、Admin UI、nginxがある。V
 
 ### 5.2 コンテナ構成図
 
-以下の図は将来の目標構成を含み、Sandbox・成果物・プライベートスキル・RAG部分は未実装である。Agents SDKによる実行はWorker内に導入済みであり、現行ComposeはAPI、Worker、2つのUI、nginx、PostgreSQLと任意の開発用Vaultで構成する。管理者ダッシュボードと一般ユーザー用タスクUIは独立したコンテナに分離する。
+以下の図は将来の目標構成を含み、タスク別OS Sandbox／Terminal、Git認証、プライベートスキル、RAG部分は未実装である。タスクUUID別の永続Workspace、所有者スコープのExplorerファイルAPI、削除ジョブは実装済みである。Agents SDKによる実行はWorker内に導入済みであり、現行ComposeはAPI、Worker、2つのUI、nginx、PostgreSQLと任意の開発用Vaultで構成する。管理者ダッシュボードと一般ユーザー用タスクUIは独立したコンテナに分離する。
 
 リバースプロキシにはnginxを推奨する。初期デプロイは単一ホスト上のコンテナ構成であり、nginxはTLS終端とUI/APIへの経路振り分けを担う。SSE向けにプロキシバッファリングを無効化し、長時間接続を許容するタイムアウトを設定する。実行環境の標準基盤などに別のリバースプロキシ要件がある場合は差し替え可能とする。
 
-コマンド実行にはタスクごとの非特権・リソース制限付き一時コンテナを使用する。コンテナの作成・破棄を担当するSandboxサービスだけが制限付きDocker APIへ接続し、WorkerにはDocker制御権限を与えない。Sandboxサービスは`task_id`ごとの作業領域を管理し、`needs_attention`中は作業領域を保持する。タスクが再開して正常終了するか、ユーザーが終了を選択したときに一時コンテナと作業領域を破棄する。成果物は作業領域から検証後に独立した永続ボリュームへ移し、タスクの存在中は保持する。
+すべてのタスクに`task_id`で分離した永続Workspaceを作成し、タスク状態が`succeeded`、`partially_completed`、`failed`、`cancelled`となった後も、タスクが削除されるまで保持する。タスク作成トランザクションではWorkspace準備要求を耐久キューへ登録し、SandboxサービスがWorkspaceを作成して準備完了を記録するまでエージェント実行を開始しない。準備中もUser UIには全タスク共通のExplorer／Terminal領域を表示し、準備状態を示す。Workspaceにはユーザー入力ファイル、ユーザーがターミナルから取得したGitリポジトリ、エージェントの重要な途中成果物・最終成果物、ユーザー編集を含める。User UIは全タスクで同じターミナルとエクスプローラを提供し、両者がアクセスできるルートを当該タスクのWorkspace内に限定する。タスク終了時にWorkspaceや成果物を別領域へ移動・破棄しない。
+
+Workspaceとターミナルプロセスの管理はWorkerから分離したSandboxサービスが担当する。Sandboxサービスだけが用途を限定したDocker APIへ接続し、WorkerにDocker制御権限を与えない。各タスクのWorkspaceを永続ストレージへマウントし、Sandboxコンテナやターミナルプロセスの再起動後もファイルを保持する。CPU・メモリ・ストレージのタスク別上限は初期設計では保留する。影響が確認された場合に、使用量・実行状況を踏まえて制限、同時実行数、保持方針等を追加する。
+
+Gitの認証が必要な操作ではユーザーに認証操作を促す。資格情報はWorker、モデル入力、コマンド履歴、ターミナル記録、`.git/config`、Workspace、DB、ログへ保存しない。認証情報を扱うUI／短時間の認証ブローカーからSandbox内のGit操作へ一時的に提供し、操作終了後に失効・破棄する。認証情報を含むURLをコマンド引数に渡さない。Gitを含む外向き通信はSandboxサービスの制御経路を通し、ユーザーが指定したリモートなど許可された宛先に限定する。
+
+タスク削除要求を受けると、まずタスクの新規アクセス・操作を拒否し、永続的な削除ジョブを登録する。Sandboxサービスは当該タスクの全ターミナル接続を閉じ、PTY・シェル・子プロセス・コンテナを停止し、Workspace、アップロード、clone、成果物、エクスプローラのタスク別状態を冪等に削除する。削除完了を確認した後、DB上のタスク、会話、計画、判定、イベント、ジョブ、ファイル関連メタデータを同一トランザクションで削除する。外部ストレージ削除とDB削除は単一トランザクションにできないため、失敗時は削除ジョブを保持して再試行し、部分削除状態をユーザーから隠したまま最終的な全消去まで処理する。
 
 ```mermaid
 flowchart TB
@@ -333,7 +349,7 @@ flowchart TB
             Subagents["サブエージェント実行群<br/>成果生成・修正"]
             AgentRunner["共通実行アダプター<br/>OpenAI Agents SDK Agent／Runner"]
             OpenAIClient["モデル接続アダプター<br/>公式OpenAI Python SDK"]
-            ArtifactWriter["成果物検証・登録"]
+            ArtifactWriter["Workspace成果物保存・メタデータ記録"]
             WorkerLoop --> Orchestrator
             Orchestrator -->|状態取得・結果確定| TaskRepository
             TaskRepository -->|最新の会話・計画・状態| Orchestrator
@@ -348,20 +364,23 @@ flowchart TB
         end
         PostgreSQL[("PostgreSQL container/service<br/>tasks・会話・events・approvals・jobs・leases")]
         Vault["HashiCorp Vault<br/>KV v2"]
-        ArtifactStorage[("成果物用永続ボリューム")]
+        ArtifactStorage[("task_id別Workspace永続ボリューム")]
         PrivateSkills[("Private skills mount<br/>ワーカーへ読み取り専用")]
-        API -->|成果物を読み取り専用で配信| ArtifactStorage
-        ArtifactWriter -->|検証済み成果物を書込| ArtifactStorage
+        API -->|認可済みWorkspaceファイル操作| SandboxService
+        ArtifactWriter -->|成果物ファイルとメタデータを保存| ArtifactStorage
         API -->|管理API用AppRoleでキー更新| Vault
     end
 
     subgraph SandboxNetwork["分離されたSandbox実行ネットワーク"]
         SandboxService["Sandbox service/container<br/>ワークスペース管理"]
         LimitedDockerAPI["制限付きDocker API"]
-        TaskSandbox["task_idごとの非特権・制限付き一時コンテナ"]
+        TaskSandbox["task_idごとの隔離コンテナ／Terminal"]
+        TerminalGateway["Terminal WebSocket Gateway"]
         Egress["Egress制御<br/>DB設定の許可リストを強制"]
         SandboxService --> LimitedDockerAPI
         SandboxService --> TaskSandbox
+        SandboxService -->|永続Workspaceをマウント| ArtifactStorage
+        TerminalGateway --> TaskSandbox
         TaskSandbox --> Egress
     end
 
@@ -374,12 +393,13 @@ flowchart TB
     Nginx -->|REST / SSE| API
     AdminUI -->|管理者セッション| API
     UserUI -->|ユーザーセッション| API
+    UserUI -->|認可済みTerminal WebSocket| TerminalGateway
     API -->|タスク・メッセージ・イベント・ジョブを永続化| PostgreSQL
     TaskRepository -->|ジョブ取得・リース、会話・計画・状態の読込／更新| PostgreSQL
     OpenAIClient -->|呼び出しごとにWorker用AppRoleでキー取得| Vault
     OpenAIClient -->|公式SDKでモデル呼び出し| OpenAI
     Subagents -->|許可されたスキルをロード| PrivateSkills
-    Subagents -->|ツール要求・成果物入出力| SandboxService
+    Subagents -->|許可されたWorkspace操作| SandboxService
     Manager -->|検索アダプター経由| Knowledge
 ```
 
@@ -391,14 +411,14 @@ flowchart TB
 | Admin UI | 管理者ダッシュボードの静的資産を配信 | 独立したステートレスコンテナ。一般ユーザー用UIの資産と混在させず、秘密情報を含めない |
 | User UI | 一般ユーザー用タスクUIの静的資産を配信 | 独立したステートレスコンテナ。管理者専用画面・権限情報を含めない |
 | API | REST、SSE、認証、入力検証、会話・アカウント・管理操作、DBへの受付記録 | 現行Composeでは1サービス。API自体にプロセス内タスク状態を保持しない |
-| Worker | DBジョブの取得、ジョブリース更新、タスク計画・読み取り専用サブタスク実行・統合 | `agent`プロファイルで起動。初期運用は1レプリカ |
+| Worker | DBジョブの取得、ジョブリース更新、タスク計画・読み取り専用サブタスク実行・統合 | `agent`プロファイルで起動。初期運用は1レプリカ。Docker制御権限やGit認証情報を与えない |
 | PostgreSQL | ユーザー、セッション、設定、タスク、会話、サブタスク、イベント、ジョブを保存 | Composeの名前付きボリュームを使用。マイグレーションはセットアップ用サービスで適用 |
-| Sandbox／成果物ストレージ | 現行実装なし。チェック対象となる成果物データはサブタスク結果内に保持 | 将来設計。Workerから隔離した実行環境と専用成果物保存先が必要 |
+| Workspace／Sandbox | APIコンテナがタスクUUID別の永続ボリューム上にファイルを保存し、TaskFileメタデータと所有者スコープAPIを提供。削除ジョブがWorkspace清掃後にTaskをcascade削除 | Workerから分離したタスク別Sandbox／Terminal、Sandbox内Git cloneと認証ブローカー。現行ファイル領域はOSプロセス単位のSandboxではない |
 | HashiCorp Vault | KV v2でシステム共通OpenAI APIキーを保存 | 管理APIは書込専用の限定AppRole、Workerは読取専用AppRoleを使用 |
 
-プライベートスキル、ナレッジDB、Sandbox、成果物に関するこの節の説明は将来設計であり、現行の実行経路には存在しない。現行実装ではシェル、ファイル変更、外部更新操作を公開しない。Vault AppRoleの読取／書込分離と、秘密値をDB・UIへ返さない処理は実装済みである。
+プライベートスキル、ナレッジDB、タスク別実行Sandbox、Terminalに関する説明は将来設計であり、現行実行経路には存在しない。現行実装はAPI経由の所有者スコープされたWorkspaceファイル操作と、API起動時の削除ジョブ処理を提供するが、任意コマンド実行やタスク間のOSレベル隔離は提供しない。Vault AppRoleの読取／書込分離と、秘密値をDB・UIへ返さない処理は実装済みである。
 
-Sandboxと成果物の隔離・配信、外向き通信の制御は将来の安全境界として設計する。これらのサービスが追加されるまでは、Workerはホスト操作や副作用を実行しない。
+WorkspaceファイルAPIの所有者認可と削除ジョブによるファイル／DB清掃は実装済みである。タスク別SandboxのOS隔離、Terminal接続終了、Git通信・認証制御は将来の安全境界であり、実装されるまではシェルを公開しない。
 
 APIはタスク、初期メッセージ、イベント、ジョブをDBへコミットしてから受付成功を返す。Workerはジョブの期限付きリースを定期更新する。リース切れジョブは再取得可能だが、副作用の不確定状態を識別する機能はなく、現行Workerの失敗時はジョブ／タスク試行回数に応じて再試行または`failed`になる。
 
@@ -407,17 +427,17 @@ APIはタスク、初期メッセージ、イベント、ジョブをDBへコミ
 
 管理エージェントとサブエージェントは独立したコンテナではなく、Worker内の論理的な実行単位とする。SDK導入後もタスクごとの調整コンテキストはオーケストレーターがDBから構築し、管理エージェントへ計画・内容評価・統合を依頼する。サブエージェントの起動・結果収集・保存はオーケストレーターが行う。Agent定義を共用しても、Runnerの実行コンテキストや履歴を別タスクへ持ち越さない。サブエージェントは割り当てられたサブタスクの範囲で動作し、会話履歴全体ではなく実行に必要な情報と依存タスクの受け入れ済み成果だけを受け取る。結果はオーケストレーターが保存し、内容評価が必要な場合に管理エージェントへ渡す。
 
-現行実装では、計画バージョン、タスク全体とサブタスクごとのチェックリスト、項目ごとの受け入れ判定、品質修正回数をPostgreSQLへ保存する。品質判定記録と対応イベント、サブタスク状態の更新はDBセッションで保存する。Worker再取得時は保存済みの計画・結果を参照して処理するが、途中チェックポイントからの一般的な再開を保証せず、ジョブ再試行では計画を作り直す場合がある。独立した成果物ストレージはない。
+現行実装では、計画バージョン、タスク全体とサブタスクごとのチェックリスト、項目ごとの受け入れ判定、品質修正回数をPostgreSQLへ保存する。品質判定記録と対応イベント、サブタスク状態の更新はDBセッションで保存する。Worker再取得時は保存済みの計画・結果を参照して処理するが、途中チェックポイントからの一般的な再開を保証せず、ジョブ再試行では計画を作り直す場合がある。サブタスクの中間成果物を独立した成果物ストレージへ保存する機能はない。ユーザーが要求した最終ファイルはTaskFileメタデータとWorkspaceファイルとして保存する。
 
 **PostgreSQLをタスク状態・会話履歴の唯一の正本とし、Worker間で会話履歴キャッシュを共有・永続化しない。** 現行Workerはジョブ取得時にタスク、会話、設定を読み込む。同じ会話sequenceに保存済み計画があれば計画とサブタスク状態・結果も読み込んで再利用する。要約や独立した成果物は保存していない。計画・統合要求には会話全件と必要なサブタスク結果を渡すため、会話のプルーニングはない。長時間実行中はDB上のリースと会話sequenceをチェックポイントで確認し、追加指示を検出した場合に現在の処理を確定せず再キューするが、全てのタスク状態を各チェックポイントで再読込するわけではない。
 
-モデル応答やサブエージェント出力を得た後、現行Workerは計画、サブタスク結果、品質レビュー、対応イベントをDBへ保存してから次へ進む。独立した成果物参照や実行途中のモデル応答は保存しない。Workerが停止した場合、次のWorkerは同一会話sequenceの計画と完了済み／レビュー済みサブタスク結果を再利用する。処理中のモデル／ツール要求は完了状態から復元せず再試行する。
+モデル応答やサブエージェント出力を得た後、現行Workerは計画、サブタスク結果、品質レビュー、対応イベントをDBへ保存してから次へ進む。実行途中のモデル応答やサブタスクの中間成果物は保存しない。ユーザーが要求した最終ファイルはWorkspaceへ保存し、その相対パスとサイズをTaskFileメタデータに記録する。Workerが停止した場合、次のWorkerは同一会話sequenceの計画と完了済み／レビュー済みサブタスク結果を再利用する。処理中のモデル／ツール要求は完了状態から復元せず再試行する。
 
 各タスクを制御するオーケストレーターの実行は同時に一つだけとし、その配下でサブエージェントを設定上限内で並行実行する。ジョブリースに加えてPostgreSQL上で`task_id`単位の実行リースを取得し、リース保持者のみが会話ターンや計画を確定できるようにする。リース取得・更新には期限と所有者を記録し、期限切れやWorker停止後は別Workerが引き継ぐ。メッセージ追加が長時間処理と競合した場合は、追加メッセージを先にDBへ確定し、実行中Workerが次のチェックポイントで読み込む。リースを失ったWorkerは新たなツール実行を開始せず、実行中のサブエージェントとツール呼び出しへキャンセルを伝播し、状態を書き戻さない。外部副作用を取り消せない場合は実行結果を不確定として記録し、自動再実行を避ける。これにより、DBの状態をWorker内の古いメモリーで上書きしたり、複数Workerが同じタスクの管理ターンを並列に進めたりすることを防ぐ。
 
 この方式ではモデル呼び出し前後や判断チェックポイントごとにDBアクセスが発生するが、Worker再起動後の復旧、Worker間の状態一貫性、タスク別会話の分離を単純なルールで実現できる。会話全体をWorkerメモリーへ長期キャッシュする最適化は初期設計では行わない。将来読み取りキャッシュが必要になった場合も、キャッシュは破棄可能な性能最適化に限定し、更新順序・無効化・排他の正本として利用しない。
 
-コンテナは非rootユーザーで実行し、読み取り専用ルートファイルシステム、明示的なCPU・メモリ上限、ヘルスチェック、graceful shutdownを設定する。Worker終了時は新しいジョブの取得を止め、実行中ジョブの状態・リースを安全に解放または期限切れにする。Compose等の単一ホスト構成は初期デプロイに適するが、高可用性や複数ホストへの拡張時にはPostgreSQLをマネージドサービス等へ移し、ジョブのリース・排他制御が全ワーカーで共有されることを維持する。
+各サービスは非rootユーザーで実行し、可能な範囲で読み取り専用ルートファイルシステム、ヘルスチェック、graceful shutdownを設定する。タスクSandbox単位のCPU・メモリ・ストレージ上限は初期設計では保留し、問題が確認された場合に使用状況に基づき対策する。Worker終了時は新しいジョブの取得を止め、実行中ジョブの状態・リースを安全に解放または期限切れにする。Compose等の単一ホスト構成は初期デプロイに適するが、高可用性や複数ホストへの拡張時にはPostgreSQLをマネージドサービス等へ移し、ジョブのリース・排他制御が全ワーカーで共有されることを維持する。
 
 ## 6. タスク実行・状態管理
 
@@ -434,51 +454,54 @@ stateDiagram-v2
     running --> partially_completed
     running --> failed
     running --> needs_attention
+    running --> waiting_approval: 追加ツール予算の承認要求
+    waiting_approval --> queued: ユーザーが承認または拒否
     planning --> queued: 新しい指示／再試行
     running --> queued: 新しい指示
     needs_attention --> queued: ユーザーが返信
     succeeded --> queued: 新しいユーザー指示で同じタスクを継続
     partially_completed --> queued: 新しいユーザー指示で同じタスクを継続
+    failed --> queued: 原因修正後にユーザーが追加指示
     queued --> cancelled
     planning --> cancelled
     running --> cancelled
     needs_attention --> cancelled
-    failed --> [*]
+    waiting_approval --> cancelled
     cancelled --> [*]
 ```
 
 - `queued`: 受付済みまたは再実行待ち
 - `planning`: Workerが計画を生成中
 - `running`: サブタスク実行、品質レビュー、修正、最終成果物判定または結果統合を実行中
-- `waiting_approval`: DB制約上定義されているが、現行実装では使用しない
+- `waiting_approval`: 管理エージェントが追加調査を必要と判定し、上限追加のユーザー承認を待つ状態。承認／拒否API以外では再開しない
 - `succeeded`: 完了条件を満たして正常終了。追加メッセージで同一タスクを再キューできる
 - `partially_completed`: 品質修正上限まで処理したが必須チェック項目に未達が残り、未達内容をユーザーへ提示して応答を確定した状態。`error`とは区別し、追加メッセージで同一タスクを再キューできる
-- `failed`: モデル・ツール・DBなどの実行障害、または回復不能な処理エラーでタスクを完了できなかった状態。追加メッセージでは再開できない
+- `failed`: モデル・ツール・DBなどの実行障害でタスクを完了できなかった状態。原因を修正した後、ユーザーが追加メッセージを送ると同じタスクを再キューできる。追加指示がない限り自動再開しない
 - `cancelled`: キャンセルAPIにより終了。追加メッセージでは再開できない
 - `needs_attention`: サブタスクがユーザーからの追加情報を求めて停止中。会話への返信で再キューする。副作用の結果確認や承認期限切れを意味しない
 
-状態更新と対応イベントは同じDBセッションでコミットする。DB制約には`waiting_approval`等も列挙されているが、全遷移を検証する共通状態機械はない。サブタスクのDB制約上の状態は`pending`、`ready`、`running`、`waiting_approval`、`reviewing`、`revising`、`accepted`、`partially_accepted`、`succeeded`、`failed`、`blocked`、`cancelled`であり、Workerは品質レビューに応じて`reviewing`、`revising`、`accepted`、`partially_accepted`も使用する。
+状態更新と対応イベントは同じDBセッションでコミットする。ツール予算承認の`waiting_approval`遷移は専用APIで検証するが、他の全遷移を網羅する共通状態機械はない。サブタスクのDB制約上の状態は`pending`、`ready`、`running`、`waiting_approval`、`reviewing`、`revising`、`accepted`、`partially_accepted`、`succeeded`、`failed`、`blocked`、`cancelled`であり、Workerは品質レビューとツール予算承認に応じてこれらを使用する。
 
 現行DBはタスク状態`partially_completed`とサブタスク状態`reviewing`、`revising`、`accepted`、`partially_accepted`を定義する。成果物生成が成功しただけでは受け入れ済みにせず、管理エージェントの個別チェックリスト判定を通じて状態を確定する。品質修正上限後の部分受け入れは後続処理に結果として渡される。
 
-タスクは`succeeded`後も会話スレッドとして保持する。`partially_completed`も同様に保持し、`succeeded`、`partially_completed`または`needs_attention`中の新規メッセージは保存してタスクを`queued`にし、ジョブを登録する。`queued`、`planning`、`running`の間に届いたメッセージは保存し、Workerがチェックポイントで新sequenceを検出した場合に再キューする。`failed`と`cancelled`は追加メッセージで継続できない。承認待ちは現行実装に存在しない。
+タスクは`succeeded`後も会話スレッドとして保持する。`partially_completed`も同様に保持し、`succeeded`、`partially_completed`、`failed`または`needs_attention`中の新規メッセージは保存してタスクを`queued`にし、ジョブを登録する。`failed`からの再開はAPIキー設定など失敗原因を修正した後にユーザーが追加指示を送った場合に限り、自動再試行は行わない。`queued`、`planning`、`running`の間に届いたメッセージは保存し、Workerがチェックポイントで新sequenceを検出した場合に再キューする。`cancelled`は追加メッセージで継続できない。`waiting_approval`は追加ツール予算の明示承認にのみ使用し、チャット返信では解決しない。
 
 品質修正上限後の未達は`partially_completed`状態と構造化された完了レポートで表し、`error`は実行障害に限定する。`partially_completed`は結果の削除、一覧、追加指示などにおいて応答確定済みとして扱うが、`succeeded`とは明確に表示する。
 
-現行の`needs_attention`では、Workerが重複を除いた質問をassistantメッセージとして保存し、処理ジョブを完了する。ユーザーが通常のメッセージAPIで回答すると新しいジョブを登録する。操作結果確認用のresolve API、承認期限管理、Sandbox保持・破棄は実装されていない。
+現行の`needs_attention`では、Workerが重複を除いた質問をassistantメッセージとして保存し、処理ジョブを完了する。ユーザーが通常のメッセージAPIで回答すると新しいジョブを登録する。ツール予算の`waiting_approval`は別状態であり、要求ID付き承認APIだけが再開できる。副作用操作のresolve API、承認期限管理、Sandbox保持・破棄は実装されていない。
 
 ### 6.2 実行シーケンス
 
-以下は現行の品質判定とSDK実行を含むシーケンスである。承認、Sandbox、途中実行状態の完全復元など、別途未実装と記載した機能は含まない。個々のエージェント実行には4.5節の共通実行アダプターを使用する。
+以下は現行の品質判定、ツール予算承認、SDK実行を含むシーケンスである。副作用承認、Sandbox、途中実行状態の完全復元など、別途未実装と記載した機能は含まない。個々のエージェント実行には4.5節の共通実行アダプターを使用する。
 
 1. UIが指示をREST APIへ送信する。APIは入力を検証し、`queued`タスク、初期メッセージ、イベント、ジョブをDBへコミットしてからタスクIDを返す。
 2. Workerが`FOR UPDATE SKIP LOCKED`でジョブを取得し、期限付きリースを設定してタスクを`planning`にする。
 3. オーケストレーターはタスク設定スナップショットと会話履歴を読み、同一会話sequenceの計画があればDBから再利用し、なければ管理エージェントの計画用Runnerを実行する。計画にはタスク全体の最終チェックリスト、各サブタスクの成果物目標・依存関係・受け入れチェックリストを含め、オーケストレーターが整合性を検証して計画バージョンと会話sequenceを付けて保存する。
-4. オーケストレーターは依存関係を満たすサブタスクを選び、設定上限内でサブエージェントのRunnerを並行実行する。ツールの使用はSDKのループ内で許可済みアダプターを経由し、成果・出典・実行記録を返す。オーケストレーターが成果物・状態・進捗イベントをDBへ保存する。`needs_input`があれば質問をassistantメッセージとして保存し、タスクを`needs_attention`にしてジョブを終了する。
-5. オーケストレーターは機械的チェックを実行し、内容判断が必要な項目を管理エージェントのレビュー用Runnerへ依頼する。項目別の結果・根拠を検証して受け入れ可否を確定し、判定記録とイベントをDBへ保存する。受け入れ済みまたは部分受け入れ済みの成果を依存先へ渡す。未達なら管理エージェントの不足指摘に基づき、オーケストレーターが品質修正予算を確認して修正用Runnerを起動する。計画の自動変更案の採用や欠落作業の追加は行わない。
+4. オーケストレーターは依存関係を満たすサブタスクを選び、設定上限内でサブエージェントのRunnerを並行実行する。ツールの使用はSDKのループ内で許可済みアダプターを経由し、成果・出典・実行記録を返す。ツール総数上限に達した場合は追加ツールを実行せず、Runnerに収集済み情報から部分的な構造化結果を生成させる。オーケストレーターが成果物・状態・進捗イベントをDBへ保存する。`needs_input`があれば質問をassistantメッセージとして保存し、タスクを`needs_attention`にしてジョブを終了する。
+5. オーケストレーターは機械的チェックを実行し、内容判断が必要な項目を管理エージェントのレビュー用Runnerへ依頼する。項目別の結果・根拠と追加の読み取り専用ツールが必要かを検証して受け入れ可否を確定し、判定記録とイベントをDBへ保存する。受け入れ済みまたは部分受け入れ済みの成果を依存先へ渡す。未達が既存情報で修正可能なら追加ツールなしで修正Runnerを起動する。未達の解消に追加調査が必要なら、Task/Subtask状態と要求数を保存してタスクを`waiting_approval`にし、Workerジョブを終了する。ユーザー承認時だけ同じ計画・サブタスクを再開し、拒否時は部分受け入れ結果を統合へ渡す。計画の自動変更案の採用や欠落作業の追加は行わない。
 6. 実行チェックポイントで新しいユーザーメッセージを検出した場合、現在のジョブを完了し、新しいジョブを登録する。再実行時は最新会話sequenceに基づく新しい計画バージョンを作成し、古い判定記録を履歴として保持する。
-7. 全サブタスクの処理が完了した後、管理エージェントの統合用Runnerで最終回答を生成し、別のレビュー用Runnerと機械的チェックで最終チェックリストを評価する。オーケストレーターは全必須項目の充足時だけ`succeeded`、品質修正上限後の未達は不足内容を含む応答とともに`partially_completed`とする。実行障害は`failed`、ユーザー回答待ちは`needs_attention`とする。Runnerの終了だけでこれらの状態を決定しない。
-8. オーケストレーターはリースと最新会話sequenceを再確認し、最終回答、完了レポート、判定記録、タスク状態、イベント、ジョブ状態をDBトランザクションで保存する。UIにはDBに確定した状態とユーザー向け進捗・未達要約を表示し、モデルの隠れた思考過程は表示・保存しない。
+7. 全サブタスクの処理が完了した後、管理エージェントの統合用Runnerで会話向け回答と要求ファイル本文・ファイル名を別々に生成し、ファイル本文を含めてレビュー用Runnerと機械的チェックで最終チェックリストを評価する。オーケストレーターは全必須項目の充足時だけ`succeeded`、品質修正上限後の未達は不足内容を含む応答とともに`partially_completed`とする。実行障害は`failed`、ユーザー回答待ちは`needs_attention`とする。Runnerの終了だけでこれらの状態を決定しない。
+8. オーケストレーターはリースと最新会話sequenceを再確認し、要求ファイルをTaskFileメタデータとともにWorkspaceへ保存する。保存に成功した後で最終回答、完了レポート、判定記録、タスク状態、ファイルパスを含むイベント、ジョブ状態をDBへ確定する。保存が失敗した要求ファイルを成功扱いにしない。UIにはDBに確定した状態とユーザー向け進捗・未達要約を表示し、タスク完了イベントに応じてExplorerのファイル一覧を再取得する。モデルの隠れた思考過程は表示・保存しない。
 
 キャンセルAPIはタスクを`cancelled`にし、未完了ジョブを完了扱いにする。進行中のOpenAI要求に即時キャンセルを伝播する仕組みはなく、要求は応答またはタイムアウトまで継続し得る。その後のWorker書き込みはジョブリース検査で拒否される。副作用操作の不確定状態確認は未実装である。
 
@@ -498,10 +521,10 @@ SDK導入後は以下の上限を別々に強制する。モデル／ツール�
 |---|---|
 | モデル/API・形式再試行 | 共通アダプターが既存の最大試行回数内で制御する。SDK／下位HTTPクライアントの独立した自動再試行を無効化または同じ予算へ統合し、再試行の積み重なりを防ぐ |
 | Runnerの`max_turns` | 一回のRunner実行で有限のモデルターン上限を設定する。ツール呼び出し件数や品質修正回数と同一視しない |
-| ツール呼び出し総数 | 計画バージョン内のサブタスクごとに有限上限を設け、形式再試行・品質修正・Worker再取得をまたいで実行開始前にDB上で使用枠を原子的に確保する。失敗・中断した呼び出しも消費済みとし、Runner再生成で予算をリセットしない。旧計画の消費記録も保持する |
+| ツール呼び出し総数 | サブタスクごとに初期上限とBigIntegerの永続使用数・許可総数を持ち、形式再試行・品質修正・Worker再取得をまたいで実行開始前にDB上で使用枠を原子的に確保する。失敗・中断した実行も消費済みとし、Runner再生成で使用数をリセットしない。管理エージェントが追加調査を必要と判定した場合、ユーザーの明示承認1回につき当該タスクの`config_snapshot.max_tool_calls_per_subtask`と同数を許可総数へ加算する。承認回数・累積許可総数にアプリケーション上限は設けず、拒否・保留中は増加しない。初期上限0では追加要求を出さない |
 | 品質修正・Workerジョブ再試行 | オーケストレーターが既存の独立した予算を適用する。SDKのターン数を代用しない |
 
-Runnerターン上限は既定24・許容範囲1〜64、サブタスクのツール総数上限は既定20・許容範囲0〜100として、タスク作成時の`config_snapshot`へ固定する。モデル出力から変更できない。旧スナップショットでは最新環境設定ではなく固定互換既定値24・20を使用する。ツール使用数は`subtasks.tool_calls_used`へ保存し、タスク・ジョブ・サブタスクのロックとリース検査を伴うトランザクションで消費する。SDKの失敗した実行を無条件に丸ごと再実行せず、DBに保存した進捗とツールのリスク分類を確認する。副作用ツールを導入する際は、総数制限とは別に実行記録と冪等性・不確定状態の解決を設計する。
+Runnerターン上限は既定24・許容範囲1〜64、サブタスクの初期ツール上限は既定20・許容範囲0〜100として、タスク作成時の`config_snapshot`へ固定する。モデル出力から変更できない。旧スナップショットでは最新環境設定ではなく固定互換既定値24・20を使用する。消費数は`subtasks.tool_calls_used`、現在の許可総数は`subtasks.tool_calls_limit`へ保存する。承認要求は`tasks.pending_tool_approval`に1件だけ保持し、APIが要求ID・所有者・計画・サブタスク状態を検証してから許可総数へ加算する。リースと行ロックを伴うトランザクションで更新し、同じ要求の二重承認や失敗実行の自動再実行では上限を増やさない。SDKの失敗した実行を無条件に丸ごと再実行せず、DBに保存した進捗とツールのリスク分類を確認する。副作用ツールを導入する際は、総数制限とは別に実行記録と冪等性・不確定状態の解決を設計する。
 
 ### 6.4 コンテキスト管理
 
@@ -556,7 +579,7 @@ flowchart TB
 
 ツールはモデルやエージェント固有の実装から分離し、Public側の共通契約と登録済みアダプターを通じて実行する。現行実装はWorkerに共通Tool Registry／Function Calling境界を持ち、Tavily検索だけを登録する。ツール定義は一意な名前・バージョン、説明、引数JSON Schema、リスク分類、実行タイムアウト、構造化された結果・エラー形式を持つ。実装は非同期実行を基本とする。Tavilyなど外部サービス固有のAPI形式は各アダプター内に閉じ込め、オーケストレーターとエージェントには共通形式だけを見せる。複数ツールの管理UIは将来拡張である。
 
-Tool Callingの制御ループと実行判断はWorker側が担う。モデルが返したツール名と引数は登録済みツールの許可リストおよびJSON Schemaで検証してから実行し、未登録ツールや不正な引数は実行しない。承認機構が未実装の現行Registryは`read_only`以外のツールをモデルへ公開せず、実行要求も拒否する。ツールの利用可否はタスク実行時の設定で制限し、モデル出力だけで権限やネットワーク許可範囲を拡張できないようにする。ツールの実行要求・結果・エラーはタスクに紐付けて記録し、再試行はリスク分類と冪等性を考慮する。副作用を伴うツールは承認境界を通し、ファイル・シェル操作はWorker上で直接実行せずSandboxへ委譲する。
+Tool Callingの制御ループと実行判断はWorker側が担う。モデルが返したツール名と引数は登録済みツールの許可リストおよびJSON Schemaで検証してから実行し、未登録ツールや不正な引数は実行しない。副作用操作の承認機構が未実装の現行Registryは`read_only`以外のツールをモデルへ公開せず、実行要求も拒否する。ツール予算の追加承認はこの権限境界を変更せず、既登録の読み取り専用ツールの累積上限だけを増やす。ツールの利用可否はタスク実行時の設定で制限し、モデル出力だけで権限やネットワーク許可範囲を拡張できないようにする。ツールの実行要求・結果・エラーはタスクに紐付けて記録し、再試行はリスク分類と冪等性を考慮する。副作用を伴うツールは承認境界を通し、ファイル・シェル操作はWorker上で直接実行せずSandboxへ委譲する。
 
 SDK導入後も実行場所はWorker内とし、モデルとツール結果の往復をRunnerへ移す。SDKへ登録するのはアプリケーションが許可したツールアダプターだけとし、Function Toolsの実行直前に引数・権限・リース・呼び出し予算を検査する。Tavilyの出典と実行記録はモデルの自己申告ではなく実際のツール結果から取得して既存のサブタスク結果へ付加する。SDK既定のツール例外処理に依存せず、入力・権限違反、検索の回復可能な失敗、リース喪失を区別する。特にリース喪失やキャンセルはモデル向けの通常ツール結果へ変換して実行を続けず、Runnerを停止する。
 
@@ -593,21 +616,28 @@ UIの認証はサーバー側セッションで行い、管理者UIと一般ユ�
 | `POST` | `/api/account/access-key` | ログイン中ユーザーのアクセスキーを発行または再発行 |
 | `POST` | `/api/tasks` | タスクを作成し、実行をキューに登録 |
 | `GET` | `/api/tasks` | 所有タスク一覧を取得。`limit`は1〜100に制限 |
-| `GET` | `/api/tasks/{task_id}` | 所有タスクの状態、指示、結果、エラー、準完了時の完了レポートを取得。サブタスク一覧は返さない |
-| `DELETE` | `/api/tasks/{task_id}` | `succeeded`、`partially_completed`、`failed`、`cancelled`のタスクを削除 |
+| `GET` | `/api/tasks/{task_id}` | 所有タスクの状態、指示、結果、エラー、準完了レポート、保留中のツール予算承認要求を取得。サブタスク一覧は返さない |
+| `DELETE` | `/api/tasks/{task_id}` | 終端タスクの削除を要求し、削除ジョブIDと受付状態を`202 Accepted`で返す。Workspace清掃後にDB関連レコードを削除 |
 | `GET` | `/api/tasks/{task_id}/messages` | タスク固有の会話履歴を時系列で取得 |
 | `POST` | `/api/tasks/{task_id}/messages` | タスク固有の会話へユーザー指示を追加し、必要に応じて実行を継続 |
 | `POST` | `/api/tasks/{task_id}/cancel` | タスクをキャンセル |
+| `POST` | `/api/tasks/{task_id}/tool-budget-approval` | `waiting_approval`中の所有タスクについて、保留中の要求IDを指定してタスク初期設定と同数の追加ツール呼び出しを承認または拒否。チャット文面での暗黙承認は行わない |
 | `GET` | `/api/tasks/{task_id}/events` | `Last-Event-ID`対応のSSEイベントストリーム |
+| `GET` | `/api/tasks/{task_id}/workspace/files` | 所有者のWorkspace内ファイル一覧と、入力／ソース／途中成果物／最終成果物のメタデータを取得 |
+| `POST` | `/api/tasks/{task_id}/workspace/files` | ユーザー入力ファイルをアップロードし、会話sequenceを更新して実行中タスクを再計画対象にする |
+| `GET`／`PUT`／`DELETE` | `/api/tasks/{task_id}/workspace/files/{path}` | Workspace内ファイルの参照・ダウンロード、編集、削除 |
+| `GET` (WebSocket) | `/api/tasks/{task_id}/terminal` | 将来設計。所有者認可済みのTerminal Gatewayを介してタスクSandboxへ接続 |
 | `GET` | `/api/health` | `{"status":"ok"}`を返す簡易ヘルス応答。依存サービスの診断はしない |
 
 タスク作成要求は`instruction`（1〜20,000文字）を受け取る。追加メッセージは`content`（1〜20,000文字）を受け取る。タスクには認証ユーザーの`owner_id`を設定し、初期タスク、会話メッセージ、イベント、ジョブをDBへ保存してから応答する。タスクAPIはWebセッションまたはユーザー別Bearerアクセスキーを受け付け、ブラウザーセッションの更新要求にはCSRF検証を行う。タスク一覧は`limit`のみ受け付け、状態フィルターやoffset/cursorページングはない。
 
-追加指示はタスク所有者を検証して連番付きで保存する。`succeeded`、`partially_completed`、`needs_attention`では新しいジョブを登録する。`queued`、`planning`、`running`ではWorkerのチェックポイントで新sequenceを検出して再キューする。`failed`と`cancelled`では追加指示を拒否する。準完了の完了レポートは未達項目とユーザー向け説明を返すが、隠れた思考過程や他タスクの情報は含めない。入力検証失敗は秘密値を含まない汎用422本文を返す。承認、resolve、成果物APIは現行実装にない。
+追加指示と入力ファイル追加はタスク所有者を検証して連番付き会話へ保存する。`succeeded`、`partially_completed`、`failed`、`needs_attention`では新しいジョブを登録する。`failed`からの再開はAPIキー設定など失敗原因を修正した後のユーザー操作に限り、自動再試行は行わない。`queued`、`planning`、`running`ではWorkerのチェックポイントで新sequenceを検出して再キューする。`cancelled`では追加指示・ファイル追加を拒否する。`waiting_approval`中は通常メッセージ／ファイル追加で承認を代替できず、要求IDを指定する承認APIだけを受け付ける。承認時は追加分を同じSubtaskの永続上限に加算して同じ計画を再開し、拒否時は保存済み部分結果を部分受け入れとして続行する。計画時にUTF-8テキスト添付の内容を上限内で読み込む。会話向け回答は会話履歴とタスク結果に保存する。要求ファイルがある場合だけ、その本文を指定名またはエージェントが選んだ名前でTaskFileとしてWorkspaceへ保存する。要求ファイルがない応答はWorkspaceへ複製しない。準完了の完了レポートは未達項目とユーザー向け説明を返すが、隠れた思考過程や他タスクの情報は含めない。入力検証失敗は秘密値を含まない汎用422本文を返す。副作用操作の承認／resolve APIとTerminal WebSocketは未実装である。
 
-Worker内のモデル要求とジョブ処理は設定回数まで再試行される。タスク削除は応答確定済み状態（`succeeded`、`partially_completed`、`failed`、`cancelled`）で許可する。外部キーのcascadeにより会話、計画、チェックリスト、品質判定記録、サブタスク、イベント、ジョブを削除する。承認履歴・独立した実行履歴・成果物ファイルは現行DBに存在しない。
+Worker内のモデル要求とジョブ処理は設定回数まで再試行される。タスク削除は応答確定済み状態（`succeeded`、`partially_completed`、`failed`、`cancelled`）で受け付ける。現行実装は受付時にタスクへの新規操作を拒否し、Taskの削除要求時刻と外部キーcascadeに依存しない永続削除ジョブを記録する。API起動時の削除ワーカーがWorkspaceを冪等に削除し、確認後にTaskと関連レコードをcascade削除する。失敗時は期限付きリースとバックオフで再試行し、タスクを一覧・詳細から隠したまま全消去を待つ。現在Terminalプロセスは存在せず、将来Sandboxを導入する際は同じ清掃ジョブでTerminal接続・PTY・シェルと子プロセス・コンテナも停止する。削除完了後はタスク本文・ファイル内容を含む関連データを保持しない。
 
-将来のresolve API、承認決定API、成果物ダウンロードAPIの要求形式と認可・保存方式は、これらの機能を実装する際に別途定義する。
+副作用操作の承認／resolve APIとGit認証連携の要求形式・認可方式は各機能の実装時に別途定義する。ツール予算承認APIは所有者セッションとCSRFを検証し、`waiting_approval`中の未解決要求IDだけを受け付ける。WorkspaceファイルAPIの認可と保存方式は本節および10.3節に定める。
+
+WorkspaceファイルAPIは実装済みで、所有者・削除状態を確認し、相対パスの遡りとシンボリックリンクを拒否する。ファイル内容の正本はAPIコンテナだけがマウントする永続ボリュームであり、ブラウザーにはAPI経由で提供する。Terminal WebSocketと独立Sandboxは未実装である。将来Terminalを追加する場合も同じ所有者境界を適用し、ホストパスや他タスクのWorkspaceを公開しない。Git認証ブローカーも未実装であり、資格情報をWorker等へ残さない仕組みを別途導入する。
 
 アクセスキーは外部RESTクライアント専用のBearer認証資格情報とし、ログインUIのセッション認証とは分ける。各ユーザーにつき有効なキーは最大1本とする。発行・再発行時に十分なエントロピーを持つキーを生成し、平文は発行応答で一度だけ返し、DBにはハッシュのみを保存する。再発行は旧キーを同一トランザクションで失効させ、自動期限は設けない。一般ユーザーは自身のキーのみを発行・再発行できる。
 
@@ -623,10 +653,11 @@ Worker内のモデル要求とジョブ処理は設定回数まで再試行さ�
 - `subtask.status_changed`
 - `agent.progress`
 - `task.completed` / `task.failed`
+- `task.tool_budget_approval_requested` / `task.tool_budget_approval_resolved`
 
-現行イベントには`task.partially_completed`、`quality.checklists_created`、`quality.review_completed`が含まれる。品質イベントは計画バージョン、対象、判定結果や項目数をpayloadに記録する。チェックリストと項目別根拠の正本はDBの計画・判定記録とし、SSEイベントは再取得可能な進捗通知として扱う。
+現行イベントには`task.partially_completed`、`quality.checklists_created`、`quality.review_completed`、`task.tool_budget_approval_requested`、`task.tool_budget_approval_resolved`が含まれる。承認要求イベントは要求ID、対象サブタスク、追加回数、理由を含み、秘密情報や隠れた思考過程は含めない。決定イベントは承認／拒否と結果状態を記録する。品質イベントは計画バージョン、対象、判定結果や項目数をpayloadに記録する。チェックリストと項目別根拠の正本はDBの計画・判定記録とし、SSEイベントは再取得可能な進捗通知として扱う。タスク完了イベントには保存済み成果物の相対パスを含め、UIがExplorer一覧を更新できるようにする。
 
-SSEエンドポイントはタスク所有者を検証し、DBのイベントID順に最大200件ずつ読み取る。`Last-Event-ID`以降を再送し、新規イベントがない間は設定間隔（既定1秒）でkeep-aliveを送る。ツール、承認、成果物、要約イベントは現行実装にない。UIは会話本文をイベントへ重複記録せず、必要に応じてメッセージAPIから再取得する。
+SSEエンドポイントはタスク所有者を検証し、DBのイベントID順に最大200件ずつ読み取る。`Last-Event-ID`以降を再送し、新規イベントがない間は設定間隔（既定1秒）でkeep-aliveを送る。独立した成果物イベントは設けず、完了イベントに保存済みファイルの相対パスを含める。UIは会話本文をイベントへ重複記録せず、必要に応じてメッセージAPIから再取得する。
 
 ## 9. データ設計
 
@@ -637,20 +668,23 @@ SSEエンドポイントはタスク所有者を検証し、DBのイベントID�
 | `users` | `id`, `email`, `password_hash`, `role`, `is_active`, `must_change_password`, `created_at` | 管理者・一般ユーザーのアカウントと権限。平文パスワードは保存しない |
 | `api_access_keys` | `id`, `user_id`, `key_hash`, `created_at`, `revoked_at` | ユーザーにつき有効キーを最大1本保持。ハッシュのみ保存し、自動期限は設けない |
 | `web_sessions` | `id`, `user_id`, `session_token_hash`, `csrf_token_hash`, `created_at`, `last_seen_at`, `absolute_expires_at`, `revoked_at` | Web UIのサーバー側セッション。アイドル30分、絶対有効期間12時間。Cookieには不透明なセッショントークンのみを保持 |
-| `tasks` | `id`, `owner_id`, `instruction`, `status`, `created_at`, `updated_at`, `result`, `error`, `config_snapshot` | タスク本体と所有者。初期指示と会話履歴を保持し、作成時の実行設定を保存 |
+| `tasks` | `id`, `owner_id`, `instruction`, `status`, `deletion_requested_at`, `pending_tool_approval`, `created_at`, `updated_at`, `result`, `error`, `config_snapshot` | タスク本体と所有者。初期指示と会話履歴、承認待ちの対象サブタスク・要求ID・追加回数を保持し、作成時の実行設定を保存。削除要求後は新規アクセス・操作を拒否 |
+| `task_workspaces`（将来） | `task_id`, `status`, `sandbox_ref`, `created_at`, `updated_at` | Sandbox分離後のWorkspace準備／利用可能／削除状態を管理。ホストパスやファイル内容は保存しない |
 | `system_settings` | `id`, `settings_json`, `openai_key_configured`, `version`, `updated_by`, `updated_at` | 管理画面から変更するアプリ運用設定とOpenAIキー設定済み状態の正本。キー自体・接続先等のデプロイ設定は格納しない |
 | `conversation_messages` | `id`, `task_id`, `sequence`, `role`, `content`, `created_at` | タスク固有のユーザー指示と管理エージェント応答を時系列で保存 |
-| `subtasks` | `id`, `task_id`, `title`, `instruction`, `status`, `dependencies`, `model_id`, `skill_names`, `attempt`, `artifact_goal`, `acceptance_checklist`, `plan_version`, `quality_revision_count`, `tool_calls_used`, `result`, `error`, `created_at` | 計画された作業単位、成果物目標、受け入れチェックリスト、実行結果・品質修正・ツール使用数を保存 |
+| `subtasks` | `id`, `task_id`, `title`, `instruction`, `status`, `dependencies`, `model_id`, `skill_names`, `attempt`, `artifact_goal`, `acceptance_checklist`, `plan_version`, `quality_revision_count`, `tool_calls_used`, `tool_calls_limit`, `result`, `error`, `created_at` | 計画された作業単位、成果物目標、受け入れチェックリスト、実行結果、品質修正回数、消費済みツール数とユーザー承認後の累積許可数を保存 |
 | `task_plans` | `id`, `task_id`, `version`, `conversation_sequence`, `summary`, `final_checklist`, `change_reason`, `created_at` | タスク計画と最終チェックリストを会話sequenceに結び付け、再計画前の版も保持 |
 | `quality_reviews` | `id`, `task_id`, `plan_version`, `target_type`, `target_id`, `revision_round`, `checklist_results`, `verdict`, `reviewer_model_id`, `created_at` | サブタスク成果物および最終成果物の判定を追記専用で保存 |
 | `events` | `id`, `task_id`, `type`, `payload_json`, `created_at` | SSE再送と画面進捗。`subtask_id`列は持たず、必要な識別子はpayloadに含める |
-| `jobs` | `id`, `task_id`, `status`, `available_at`, `lease_owner`, `lease_expires_at`, `attempt`, `created_at` | Workerが取得する耐久ジョブキューと期限付きリース |
+| `jobs` | `id`, `task_id`, `status`, `available_at`, `lease_owner`, `lease_expires_at`, `attempt`, `created_at` | Workerが取得するタスク実行用耐久ジョブキューと期限付きリース |
+| `task_files` | `id`, `task_id`, `workspace_rel_path`, `role`, `source_kind`, `source_ref`, `size_bytes`, `created_at`, `updated_at` | 入力、ソース、重要な途中成果物、最終成果物のパス・由来・サイズを管理する。ファイル内容はWorkspaceに保存 |
+| `task_deletion_jobs` | `task_id`, `status`, `attempt`, `available_at`, `lease_owner`, `lease_expires_at`, `created_at` | Workspace清掃後にTaskを削除する耐久ジョブ。Taskへのcascade FKを持たず、清掃完了時にTask削除と同一トランザクションで除去 |
 
-現行DBには`users`、`system_settings`、`api_access_keys`、`web_sessions`、`tasks`、`conversation_messages`、`subtasks`、`task_plans`、`quality_reviews`、`events`、`jobs`の11テーブルがある。`subtasks`には成果物目標・チェックリスト・計画バージョン・品質修正回数を保存する。計画バージョンはタスク内で一意とし、品質判定は上書きせず履歴として残す。判定記録にはチェック項目ごとの結果、短い判断根拠、成果物中の証拠、判定モデルを含める。隠れた思考過程は保存しない。タスク所有者以外へタスク詳細を返さず、タスク削除時は関連する計画・判定記録も削除する。
+現行DBには`users`、`system_settings`、`api_access_keys`、`web_sessions`、`tasks`、`conversation_messages`、`subtasks`、`task_plans`、`quality_reviews`、`events`、`jobs`、`task_files`、`task_deletion_jobs`の13テーブルがある。`task_workspaces`はSandbox分離時の将来拡張である。`tasks.pending_tool_approval`は現在保留中の要求だけを保持し、決定後に消去する。承認履歴は専用テーブルを増やさず、要求・決定イベントへ記録する。`tasks.deletion_requested_at`は削除受付後のアクセス遮断に使う。TaskFileの内容は名前付きWorkspaceボリュームを正本とし、DBには入力／ソース／途中成果物／最終成果物の区分、相対パス、由来、サイズ等のメタデータを保存する。タスク削除ジョブはTaskへの外部キーを持たず、Workspace清掃の失敗時も残して再試行する。`subtasks`には成果物目標・チェックリスト・計画バージョン・品質修正回数・承認後の累積ツール上限を保存する。計画バージョンはタスク内で一意とし、品質判定は上書きせず履歴として残す。判定記録にはチェック項目ごとの結果、短い判断根拠、成果物中の証拠、判定モデルを含める。隠れた思考過程は保存しない。タスク所有者以外へタスク詳細を返さない。
 
 `users.email`は一意、roleは`admin`または`user`、有効なアクセスキーはユーザーにつき最大1本となる部分一意インデックスで制約する。所有タスクAPIは`owner_id`で認可する。管理設定として保存するmanager／workerモデル、最大同時サブタスク数、最大試行回数、品質修正上限は、新規タスク作成時に`config_snapshot`へコピーする。承認期限やSandbox許可リストは設定・DBモデルに存在しない。
 
-独立したツール実行テーブルは未実装である。Tavilyの実行要求要約・成否・エラーコードと検索出典は、サブタスクの`result` JSONBに保存する。承認、成果物、利用量、要約、タスク単位リース、共有レート制御のテーブルも未実装であり、将来追加する場合はAPI・状態遷移・データ保持要件に合わせてマイグレーションを設計する。
+独立したツール実行テーブルは未実装である。Tavilyの実行要求要約・成否・エラーコードと検索出典は、サブタスクの`result` JSONBに保存する。ツール予算承認の保留要求は`tasks.pending_tool_approval`に保存し、決定はイベントへ記録する。副作用承認の履歴、利用量、要約、タスク単位リース、共有レート制御のテーブルは未実装であり、将来追加する場合はAPI・状態遷移・データ保持要件に合わせてマイグレーションを設計する。
 
 `jobs`取得ではPostgreSQL行ロック（`FOR UPDATE SKIP LOCKED`）を用い、status／available_at／lease_expires_atのインデックスで期限切れジョブを再取得する。タスク実行リースやfencing tokenはない。`conversation_messages(task_id, sequence)`は一意で、roleは`user`または`assistant`に限定する。イベントはグローバル採番IDを持ち、`task_id`で絞り込んでID順に配信する。タスク／メッセージ／イベント／ジョブの更新は各API・Worker処理のDBセッションでコミットされる。
 
@@ -682,14 +716,17 @@ SDK導入のために既存のTask／Subtask／JobをSDKのSessionやRunStateへ
 - APIキーはモデル要求にのみ用い、ユーザーUIへ返さない。Vault障害・キー未設定時はモデル要求を失敗させ、環境変数等のキーへフォールバックしない。キーを含むエラーのログマスキングは別途確認・運用すべき事項である。
 - Tavily APIキーは別のKV v2パス（`VAULT_TAVILY_KEY_PATH`）に保存し、Worker用AppRoleだけに読取権限を与える。管理APIはTavilyキーを読み書きせず、運用者がSecret Storeへ登録する。キーを環境変数、DB、イベント、ログ、UIへ複製しない。
 
-### 10.3 承認とサンドボックス
-この節は将来設計であり、現行Workerはツール、承認、Sandbox、副作用実行、成果物作成を提供しない。実装前に以下の安全境界を設ける。
+### 10.3 Sandbox、ターミナル、Workspace
+現行実装はAPIコンテナが管理する名前付き永続ボリューム上にタスクUUID別Workspaceを作成し、所有者スコープのExplorerファイルAPI、入力テキスト添付の計画入力、会話向け回答と要求ファイルの保存、再試行可能なWorkspace削除を提供する。任意コマンドを実行するTerminalやタスクごとのOSレベルSandboxは未実装である。以下では現行境界とTerminal／Sandbox導入時の要件を区別する。
 
-- ファイル書き換え、シェルコマンド、外部APIの更新系呼び出しなど副作用を伴うツールは、実行前に承認を要求する。読み取り専用処理も許可されたパス・ネットワーク範囲を超えない。
-- 承認対象は操作内容、対象リソース、引数の要約、要求時点の識別子を固定して表示する。承認後に引数が変わった場合は承認を無効化して再確認する。
-- コマンド・ファイル操作はWorkerとは分離したSandboxサービス／コンテナで実行する。`task_id`ごとの隔離ワークスペースは複数のツール呼び出し間で維持し、正常終了時に破棄する。`needs_attention`中は解決まで保持し、再開後の正常終了またはユーザーの終了選択時に破棄する。成果物のみを明示的な検証済み経路で取り出し、ユーザー指定のホストパスや資格情報はマウントしない。
-- Sandboxからの外向き通信は既定で禁止し、管理者が設定した宛先許可リストに一致する通信のみ許可する。ネットワーク、プロセス権限、CPU・メモリ・実行時間を制限し、ユーザー指示・モデル出力から許可リストを変更できない。
-- サンドボックスを利用できない場合、危険な操作をホスト上で代替実行してはならない。該当ツールを失敗または承認不能として報告する。
+- 全タスクに永続WorkspaceとExplorerを割り当てる。現行APIは認証済み所有者の当該Workspaceだけを操作対象とし、ホストファイルシステムや他タスクを公開しない。TerminalとTerminal Gatewayは未実装である。
+- 現行のユーザー操作は所有者認可済みファイルAPIを通し、ファイル操作をWorkspaceルート内に限定する。シェルコマンド実行は提供しない。エージェントにも任意ファイル／シェルツールを公開しない。
+- Workerから分離したタスク別Sandboxサービス、非特権コンテナ、Terminal Gateway、PTY／プロセス管理は将来設計である。現行WorkspaceボリュームをマウントするのはAPIコンテナのみで、Workerは内部API経由の入力読み取り・成果物書き込みに限定する。Terminal導入時もWorkerにDocker制御権限を与えない。
+- Explorerはファイル一覧、アップロード、テキストプレビュー／編集、ダウンロード、削除を提供する。`task_files`に入力／ソース／途中成果物／最終成果物の区分、相対パス、由来、サイズを記録する。HTTPアップロードは100MBまで。Workerが読む添付は指定拡張子のUTF-8テキストかつファイルごとに1MBまでとし、計画入力全体は100,000文字までとする。エージェントが要求ファイルを生成した場合だけ、構造化成果物を`artifacts/`配下へ保存する。会話向け回答をWorkspaceへ複製しない。ユーザーが名前を指定しない場合はエージェントが内容に応じて命名する。
+- Git clone等のリモート操作は未実装である。将来認証が必要な場合はユーザーに操作を促し、資格情報をWorker、モデル入力、ターミナル履歴・記録、`.git/config`、Workspace、DB、ログへ保存しない短時間の認証経路からSandboxへ提供して破棄する。Git通信はユーザー指定・許可済みの宛先に限定する。
+- タスク状態が終端になってもWorkspace、アップロード、成果物をタスク削除まで保持する。現行削除ワーカーは削除要求後にタスク操作を拒否し、Workspace清掃後にDB関連データを削除する。失敗時は削除ジョブを再試行する。Terminal／Sandbox導入後はPTY、シェル・子プロセス、コンテナ、Terminal接続も同じ削除フローに追加する。
+- タスク別CPU・メモリ・ストレージ上限は初期設計では保留する。問題が確認された場合に使用状況を観測し、上限、同時実行数、保持方針等を追加する。Terminal／Sandbox導入時のネットワークとプロセス権限は別の隔離要件として制御する。
+- サンドボックスを利用できない場合、コマンドやファイル操作をWorker／ホスト上で代替実行してはならない。該当操作を失敗として報告する。
 - スキルコードは任意コード実行能力を持つ信頼境界として扱う。許可されたプライベートソースのみをロードし、ロード元とバージョンを記録する。
 
 ### 10.4 UI・ログの安全性
@@ -723,9 +760,12 @@ SDK導入後の例外は共通実行アダプターで分類し、ターン上�
 - **ログイン**: メールアドレス／パスワードで認証し、サーバー側セッションを開始する。
 - **初回ログイン**: 管理者が設定した初期パスワードでログインした場合、本人がパスワードを変更するまで他の画面・APIを利用できない。
 - **タスクダッシュボード／詳細**: ログインユーザー自身のタスク一覧、状態、会話、進捗を表示し、新規タスクを作成する。チェックリスト進捗と、最終回答が準完了の場合の未達項目・制約を表示する。ユーザー所有権はAPI側で検証する。
+- **Workspace／Explorer**: 全タスクにタスクごとの永続ファイル領域を用意し、入力アップロード、一覧、テキストプレビュー／編集、ダウンロード、削除を提供する。ツリー表示はReact Arborist、コード編集はCodeMirror 6（`@uiw/react-codemirror`）を利用し、所有者認可、Workspaceパス検査、TaskFileメタデータ、削除ライフサイクルはアプリケーションが担う。Workerが読む添付は許可したUTF-8テキスト形式に限る。タスク終了後もタスク削除まで保持する。TerminalとGit cloneは未実装であり、隔離Sandboxを追加するまでホストコマンドを公開しない。
 - **タスクへの追加指示**: 実行中の追加指示は会話に保存し、処理中呼び出しの完了・保存後のチェックポイントで反映する。
 - **要確認**: `needs_attention`で表示されたエージェントの質問に会話で返信して処理を継続する。承認・副作用結果の解決UIはない。
-- **タスク削除**: `succeeded`、`partially_completed`、`failed`、`cancelled`のタスクを削除できる。成果物ファイルのダウンロード機能はない。
+- **追加ツール予算承認**: `waiting_approval`のタスク詳細に対象サブタスク、追加調査理由、追加回数を表示し、承認／拒否ボタンを提供する。要求IDを伴うAPI応答だけを承認として扱い、チャット返信や再接続で承認状態を推測しない。
+- **追加ツール予算の承認**: `waiting_approval`では対象サブタスク、追加調査が必要な理由、追加回数を表示する。要求IDに結び付いた承認／拒否ボタンのみで決定し、通常のチャット返信を承認として解釈しない。承認後は同じ計画・サブタスクを再開し、拒否後は保存済み部分結果を統合する。副作用操作の承認UIは未実装である。
+- **タスク削除**: 終端タスクの削除要求を`202 Accepted`で受け付け、直ちに一覧・詳細・ファイル操作から隠す。削除ジョブがWorkspace清掃後に会話・TaskFileメタデータ等をDB cascadeで削除し、失敗時は再試行する。Terminal／Sandbox導入後は接続・PTY・プロセス・コンテナも清掃対象に加える。
 - **アカウント設定**: 本人確認付きパスワード変更と、外部RESTクライアント用アクセスキーの発行・再発行を提供する。アクセスキーは発行時のみ平文表示し、再表示しない。
 - **進捗表示**: エージェントの内部思考をそのまま表示せず、状態、進捗要約、実行中ツール、承認待ち、生成された成果物を表示する。通信断時は再接続状態を明示し、SSE再開後にサーバー上の確定状態と同期する。画面上の表示だけをタスク状態の正として扱わない。
 
@@ -746,7 +786,7 @@ Runnerターン上限とサブタスクのツール総数上限はサーバー�
 | `INITIAL_ADMIN_PASSWORD` | 初期管理者作成用の初期パスワード。Secret Store等から一時注入し、初期化後は除去 |
 | `SESSION_COOKIE_SECURE` | セッションCookieの`Secure`属性。TLS終端環境ではtrueに設定 |
 | `MAX_CONCURRENT_AGENTS` / `MAX_AGENT_ATTEMPTS` | 初期値。最大試行数は1〜3に制限 |
-| `MAX_AGENT_TURNS` / `MAX_TOOL_CALLS_PER_SUBTASK` | SDKのRunnerターン上限（既定24、1〜64）とサブタスクの永続ツール総数上限（既定20、0〜100）。APIが新規タスクへ保存し、再試行・品質修正でツール予算をリセットしない |
+| `MAX_AGENT_TURNS` / `MAX_TOOL_CALLS_PER_SUBTASK` | SDK Runner単体のターン上限（既定24、1〜64）とサブタスクの初期ツール上限（既定20、0〜100）。APIが新規タスクへ保存する。追加承認1回の加算数は当該タスクの初期上限と同数で、累積上限は設けない。再試行・品質修正・Worker再取得で消費数をリセットしない |
 | `MAX_QUALITY_REVISIONS_PER_SUBTASK` / `MAX_QUALITY_REVISIONS_PER_TASK` | 品質修正上限の環境初期値。品質修正の有限上限であり、モデル/API再試行やWorkerジョブ再試行とは別に設定 |
 | `VAULT_ADDR` | HashiCorp Vaultの接続先 |
 | `VAULT_KV_MOUNT` | Vault KV v2のmount名 |
@@ -770,7 +810,7 @@ Runnerターン上限とサブタスクのツール総数上限はサーバー�
 | 機能領域 | 現行実装状況 |
 |---|---|
 | アカウント・認証 | Webセッション、CSRF、Bearerアクセスキー、管理者によるユーザー作成／パスワード再設定を実装 |
-| タスク・会話 | タスク作成、追加メッセージ、キャンセル、終端タスク削除、所有者スコープを実装 |
+| タスク・会話 | タスク作成、追加メッセージ、キャンセル、所有者スコープ、終端タスクの非同期削除要求を実装。Workspace清掃後にDB cascade |
 | エージェント実行 | 構造化計画、依存関係付き読み取り専用サブタスク、質問待ち、結果統合を実装 |
 | SDK実行基盤 | 管理側の計画・レビュー・統合とサブタスクの成果生成・修正を共通アダプター経由でSDK実行する。Vault更新、JSONフォールバック、停止・上限・DB復旧境界をテスト。実モデルでの品質・速度・費用測定は未実施 |
 | 品質判定 | サブタスクごとと最終回答のチェックリストを機械的検証／モデルレビューし、DBに判定履歴を保存。修正上限後の未達は`partially_completed`として完了レポートへ記録 |
@@ -778,15 +818,17 @@ Runnerターン上限とサブタスクのツール総数上限はサーバー�
 | 永続キュー・SSE | PostgreSQLジョブリース、期限切れ再取得、同一会話sequenceの保存計画・完了済み／レビュー済みサブタスク結果の再利用、イベント保存、Last-Event-ID再送を実装。実行中Runner状態からの復元は未実装 |
 | ツール・Web検索 | Worker内のTavily読み取り専用Function Callingと出典保存を実装。追加プロバイダー・副作用ツールは未実装 |
 | 全体レート制御 | 1タスク内の並行数とモデル要求再試行のみ。Worker間共有RPM／TPM・同時実行枠は未実装 |
-| 副作用実行 | 副作用Tool Calling、承認、Sandbox、外向き通信制御、成果物は未実装 |
+| Workspace／Explorer | Task UUID別永続ファイル領域、TaskFileメタデータ、入力アップロード、テキスト編集・ダウンロード、入力テキストの計画取込、要求ファイルの構造化出力・保存と完了時のExplorer更新を実装。タスク別OS Sandbox、ターミナル、Git cloneは未実装 |
+| 副作用実行 | エージェント向け副作用Tool Calling、副作用操作の承認、タスク別Sandbox、Terminal、Git認証ブローカー、外向き通信制御は未実装 |
 | 拡張・集計 | プライベートスキル、RAG、コンテキスト要約、利用量／コスト集計は未実装 |
-| 運用・UI | 分離したUser/Admin UIを実装。管理画面はアカウント、基本設定、品質修正上限、Vaultキー、タスクメタデータを扱う。User UIは品質進捗と準完了レポートを表示 |
+| 運用・UI | 分離したUser/Admin UIを実装。User UIは品質進捗、準完了レポート、タスク別Explorerを提供。管理画面はアカウント、基本設定、品質修正上限、Vaultキー、タスクメタデータを扱う |
 
 | 観点 | 受け入れ条件 |
 |---|---|
 | SDKと作業管理の分離 | 計画・サブタスク実行・レビュー・統合をSDKで実行でき、Task／Subtask／Jobは既存DBで管理される。Runner終了だけで受け入れ済み・タスク成功にせず、既存の品質条件で確定する |
 | SDK実行コンテキスト | 同じAgent定義を並行利用しても、別タスク・別サブタスクの入力、履歴、結果が混在しない。会話・計画・判定の正本はPostgreSQLにあり、自動Session保存によりユーザー会話を二重記録しない |
 | SDK実行の上限・復旧 | Runnerターン数、ツール総数、モデル/API再試行、品質修正、Workerジョブ再試行がそれぞれ有限上限で停止する。SDK／HTTPの再試行で上限が増幅せず、再取得・修正でもツール予算がリセットされない。受け入れ済み成果を理由なく再実行しない |
+| ツール上限到達と追加承認 | 上限到達時に未実行ツール要求を制御結果として返し、既収集の出典・ツール記録を含む部分SubtaskResultが管理エージェントのレビューへ届く。追加調査不要なら既存情報で修正する。必要な場合は`waiting_approval`を永続化し、要求ID付きの明示承認のみで同一計画を再開する。追加数はタスク初期スナップショットと同数で、拒否・保留中は追加呼び出しがなく、部分受け入れ結果が統合へ渡る。アプリケーションによる累積承認上限はなく、リトライ・修正で消費数がリセットされない |
 | SDKの認証・安全境界 | ツール後の継続要求・再試行を含む各モデル要求でVaultの最新キーを使用する。未許可ツール、リース喪失、キャンセルをSDKが迂回せず、古い実行結果をDBへ確定しない。トレース・SDK状態・例外を経由して秘密値や隠れた思考過程を漏らさない |
 | SDK移行の互換性・性能評価 | 既存のStructured Outputs／JSONフォールバック、出典、質問待ち、修正上限、追加指示、キャンセル、SSE契約を回帰テストする。SDK部分はモデル応答をモックし、DB境界・リース・使用枠の競合はPostgreSQLで検証する。同一条件の実測で速度・費用・品質・復旧の差を確認する |
 | マルチタスク | 複数の独立タスクを投入でき、UIで個別の状態・イベントを追跡できる |
@@ -795,6 +837,7 @@ Runnerターン上限とサブタスクのツール総数上限はサーバー�
 | アクセスキー | 1ユーザー1本を維持し、平文は発行時のみ返し、ハッシュのみ保存し、再発行で旧キーが直ちに無効化される |
 | 計画と並行実行 | 依存タスクは順序を守り、独立タスクは設定上限内で並行実行される。各サブタスクに成果物目標・チェックリストを割り当て、レビュー済みの結果を依存先へ渡す |
 | 成果物受け入れ判定 | 個別チェックリストで各サブタスク成果物を判定する。必須／任意項目、判定方式、根拠が保存され、受け入れ不可なら未達項目に絞った修正が設定上限内で実行される |
+| 要求ファイル出力 | ファイル要求を会話向け回答と分けた構造化成果物として生成する。明示されたファイル名は維持し、省略時はエージェントが内容に合う名前を決める。本文をWorkspaceへ保存・検証してから完了を確定し、Explorerが保存済みファイルを表示する |
 | 最終成果物判定 | サブタスク用とは独立した最終チェックリストを用い、全必須項目の充足時だけ`succeeded`となる。品質修正上限後に未達が残る場合、未達内容を含む応答を`partially_completed`として確定し、実行障害の`failed`と区別する |
 | 品質判定の監査 | 計画バージョンと計画時の会話sequence、チェックリスト、項目別判定、簡潔な根拠、証拠参照、品質修正回数がDBに保存される。品質レビュー行は計画バージョンを記録するが、個別の会話sequenceは保持しない。判定履歴は上書きされず、隠れた思考過程は保存しない |
 | 品質修正上限 | サブタスク単位とタスク全体の上限を管理画面で設定でき、タスク作成時のスナップショットが適用される。モデル/API再試行とは別に制御する。追加タスク／再計画をタスク全体の品質修正上限へ算入する機能は未実装 |
@@ -803,10 +846,12 @@ Runnerターン上限とサブタスクのツール総数上限はサーバー�
 | 構造化出力 | 不正な計画・結果・ツール引数を拒否し、成功として扱わない |
 | ツール・Tavily検索 | 登録済みツールとスキーマで引数を検証し、未許可ツールを実行しない。Tavily検索は最小限のクエリをサーバー側キーで実行し、出典URLをタスク履歴と回答に保持する。外部応答内の指示を実行せず、タイムアウト・応答サイズ・再試行を制限する |
 | 自己修復 | 形式崩れ・ツールエラーに対する試行が最大3回で停止する |
-| 承認・要確認 | 副作用操作は承認前に実行されず、却下後は実行されない。期限切れ操作は`needs_attention`で再表示され、再承認／却下される。実行結果不明時は操作ごとの実施済み／未実施確認後に限り再開し、終了選択は`cancelled`となる。`failed`は同一タスクで再開されない |
-| 成果物 | 所有者のみが個別ダウンロードでき、APIは読み取り専用で配信する。タスク削除で成果物と関連データが削除され、実行中・承認待ち・未解決タスクは削除できない |
-| サンドボックス | Workerから分離したSandboxでタスク単位のワークスペースを呼び出し間で維持し、通常の終了時に破棄する。`needs_attention`中は保持し、再開後の正常終了またはユーザーの終了選択で破棄する。成果物のみを許可経路で出力し、ホスト外への意図しないファイルアクセスや権限昇格を制限する |
-| Sandboxネットワーク | 外向き通信は既定拒否であり、管理者許可リストの宛先だけが到達可能となる |
+| 追加ツール予算の承認 | 上限到達時に部分結果を保持して管理エージェントが不足を判定する。追加調査が必要な場合だけ`waiting_approval`へ遷移し、所有者の明示承認1回で当該タスクの初期ツール上限と同数を追加する。拒否時は部分結果を統合する。累積承認上限は設けず、各RunnerはSDKのターン／実行上限内で分割し、既存の消費数は再開・品質修正でリセットされない |
+| 副作用操作の承認 | 副作用操作は承認前に実行されず、却下後は実行されない。期限切れ操作は`needs_attention`で再表示され、再承認／却下される。実行結果不明時は操作ごとの実施済み／未実施確認後に限り再開し、終了選択は`cancelled`となる。現行のツール予算承認とは別機能で未実装 |
+| Workspace／Explorer／ターミナル | 現行は全タスクに永続Workspaceと所有者スコープExplorerを提供し、タスク終了後も削除まで保持する。TerminalとOSレベルSandboxは未実装。CPU・メモリ・ストレージのタスク別制限は初期設計では保留 |
+| Git認証 | Git clone／リモート操作は未実装。導入時はユーザー操作を促し、資格情報をWorker、モデル、履歴、`.git/config`、Workspace、DB、ログに残さない一時認証経路が必要 |
+| タスク削除 | 削除要求直後にタスク操作を拒否し、永続削除ジョブを登録する。現行はWorkspaceファイル清掃後にDB関連情報を削除し、失敗時は冪等に再試行する。Terminal／Sandbox導入後は接続・プロセス・コンテナも清掃対象に加える |
+| Sandboxネットワーク | 外向き通信は既定拒否とし、Git操作はユーザー指定・許可済みリモートへの経路に限定する |
 | 資産分離 | 公開コアにプライベートスキル・ナレッジ・キーが含まれず、アダプター経由で接続できる |
 | SSE再接続 | 切断後、Last-Event-ID以降のイベントを再取得して状態を同期できる |
 | 永続化・復旧 | 再起動後に状態を復元し、安全に再開できない副作用処理を`needs_attention`として提示する |
@@ -827,6 +872,7 @@ Runnerターン上限とサブタスクのツール総数上限はサーバー�
 - **モデル非固定**: APIで利用可能なモデルやパラメーターは変化するため、設定・起動時検証・エラー診断で追従し、架空のモデルIDを既定値として前提にしない。
 - **コアがRAG製品を選ばない**: 独自データと公開コードを分離し、Vector DB選定・移行をプラグイン側で可能にする。
 - **イベントを状態の補助記録として保存**: SSE、監査、再接続に同一イベント列を使いつつ、現在状態は正規化テーブルを正とする。
+- **タスク単位の永続Workspaceを提供**: 現行はExplorer経由の入力・編集・成果物ファイルをタスク削除まで保持し、最終回答をファイル保存する。TerminalとGit cloneはタスク別Sandboxおよび認証・ネットワーク境界を整備してから導入する。削除ジョブはWorkspace清掃後にDB情報を削除する。
 - **品質判定を段階化**: サブタスク成果物の受け入れと最終成果物の完了判定を別のチェックリストで行う。品質修正は有限の予算内で未達項目に基づいて行い、上限到達時は実行失敗と区別した`partially_completed`で不足を明示する。
 - **拡張候補**: 組織・チーム単位の細かな権限管理、Workerの複数ホスト配置、負荷要件に応じた専用メッセージブローカー、複数プロバイダー、詳細な利用量／コスト制限、管理者向けスキル署名・承認、イベント保持期間管理。
 

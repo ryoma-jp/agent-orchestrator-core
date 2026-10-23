@@ -172,6 +172,7 @@ class StructuredModelClient:
             raise AgentExecutionError("invalid_agent_limits")
         tool_calls_used = 0
         tool_budget_lock = asyncio.Lock()
+        tool_budget_exhausted = False
         tool_failure: BaseException | None = None
         tools = []
 
@@ -183,18 +184,45 @@ class StructuredModelClient:
 
         def make_tool(definition):
             async def invoke(_context, arguments):
-                nonlocal tool_calls_used, tool_failure
+                nonlocal tool_calls_used, tool_budget_exhausted, tool_failure
                 try:
+                    budget_result = None
                     async with tool_budget_lock:
                         if tool_failure is not None:
                             raise tool_failure
-                        if tool_calls_used >= max_tool_calls:
-                            raise AgentExecutionError(
-                                "tool_call_limit_exceeded"
+                        if tool_budget_exhausted or (
+                            tool_calls_used >= max_tool_calls
+                        ):
+                            tool_budget_exhausted = True
+                            budget_result = {
+                                "error": "tool_call_limit_exceeded",
+                                "message": (
+                                    "No more tool calls are available. "
+                                    "Use existing evidence and finalize."
+                                ),
+                            }
+                        elif before_tool_call is not None:
+                            try:
+                                await before_tool_call()
+                            except AgentExecutionError as exc:
+                                if str(exc) != "tool_call_limit_exceeded":
+                                    raise
+                                tool_budget_exhausted = True
+                                budget_result = {
+                                    "error": "tool_call_limit_exceeded",
+                                    "message": (
+                                        "No more tool calls are available. "
+                                        "Use existing evidence and finalize."
+                                    ),
+                                }
+                        if budget_result is None:
+                            tool_calls_used += 1
+                    if budget_result is not None:
+                        if on_tool_result is not None:
+                            on_tool_result(
+                                definition["name"], arguments, budget_result
                             )
-                        if before_tool_call is not None:
-                            await before_tool_call()
-                        tool_calls_used += 1
+                        return json.dumps(budget_result, ensure_ascii=False)
                     result = await tool_registry.execute(
                         definition["name"], arguments
                     )

@@ -83,6 +83,11 @@ class MessageCreate(BaseModel):
     content: str = Field(min_length=1, max_length=20_000)
 
 
+class ToolBudgetApprovalDecision(BaseModel):
+    request_id: uuid.UUID
+    approved: bool
+
+
 class MessageView(BaseModel):
     id: uuid.UUID
     sequence: int
@@ -102,5 +107,24 @@ class TaskView(BaseModel):
     result: str | None
     error: dict | None
     completion_report: dict | None = None
+    pending_tool_approval: dict | None = None
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class TaskFileView(BaseModel):
+    id: uuid.UUID
+    path: str = Field(validation_alias="workspace_rel_path")
+    role: Literal["input", "source", "intermediate", "final"]
+    source_kind: str
+    source_ref: str | None
+    size_bytes: int
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = ConfigDict(from_attributes=True, populate_by_name=True)
+
+
+class TaskDeletionView(BaseModel):
+    task_id: uuid.UUID
+    status: Literal["pending", "leased"]

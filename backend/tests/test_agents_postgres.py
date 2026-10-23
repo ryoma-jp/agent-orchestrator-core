@@ -7,12 +7,14 @@ from types import SimpleNamespace
 
 import pytest
 import pytest_asyncio
+from fastapi import HTTPException
 from alembic.migration import MigrationContext
 from alembic.operations import Operations
 from sqlalchemy import func, select, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
+from starlette.requests import Request
 
 from app.agent_schemas import (
     ChecklistItem,
@@ -31,11 +33,16 @@ from app.models import (
     Subtask,
     SystemSettings,
     Task,
+    TaskDeletionJob,
+    TaskFile,
     User,
 )
 from app.openai_client import AgentExecutionError
 from app.orchestrator import _reserve_subtask_tool_call, execute_task
 from app.schemas import TaskCreate
+from app import workspaces
+from app.routers import tasks as task_router
+from app import workspace_cleanup
 from test_agents_runtime import registry, tool_call
 
 pytestmark = pytest.mark.asyncio
@@ -149,6 +156,89 @@ async def reserve(state, owner="test-worker"):
     )
 
 
+def request_with_body(body: bytes) -> Request:
+    messages = [{"type": "http.request", "body": body, "more_body": False}]
+
+    async def receive():
+        return messages.pop(0)
+
+    return Request(
+        {
+            "type": "http",
+            "method": "PUT",
+            "path": "/",
+            "headers": [],
+        },
+        receive,
+    )
+
+
+async def test_task_workspace_files_are_owner_scoped_and_deleted_with_task(
+    database, monkeypatch, tmp_path
+):
+    state = await seed(database)
+    settings = SimpleNamespace(
+        workspace_root=str(tmp_path / "workspaces"),
+        workspace_internal_token=None,
+    )
+    monkeypatch.setattr(task_router, "get_settings", lambda: settings)
+    monkeypatch.setattr(workspaces, "get_settings", lambda: settings)
+    async with database.sessions() as session:
+        await task_router.upload_task_file(
+            state.task.id,
+            request_with_body(b"task input"),
+            "brief.txt",
+            state.user,
+            session,
+        )
+        files = await task_router.list_task_files(
+            state.task.id, state.user, session
+        )
+        assert [(file.path, file.role) for file in files] == [
+            ("inputs/brief.txt", "input")
+        ]
+        with pytest.raises(HTTPException) as error:
+            await task_router.list_task_files(
+                state.task.id,
+                User(
+                    id=uuid.uuid4(),
+                    email="other@example.org",
+                    password_hash="unused",
+                    role="user",
+                ),
+                session,
+            )
+        assert error.value.status_code == 404
+
+        state.task.status = "succeeded"
+        await session.commit()
+        deletion = await task_router.delete_task(
+            state.task.id, state.user, session
+        )
+        assert deletion.status == "pending"
+        assert await session.get(Task, state.task.id) is not None
+        assert (
+            await session.get(TaskDeletionJob, state.task.id)
+        ).status == "pending"
+        with pytest.raises(HTTPException) as error:
+            await task_router.list_task_files(
+                state.task.id, state.user, session
+            )
+        assert error.value.status_code == 404
+
+    monkeypatch.setattr(
+        workspace_cleanup, "SessionFactory", database.sessions
+    )
+    leased_task_id = await workspace_cleanup._lease_deletion("test-cleaner")
+    assert leased_task_id == state.task.id
+    workspaces.delete_task_workspace(leased_task_id)
+    await workspace_cleanup._complete_deletion(leased_task_id, "test-cleaner")
+    async with database.sessions() as session:
+        assert await session.get(Task, state.task.id) is None
+        assert await session.scalar(select(func.count(TaskFile.id))) == 0
+    assert not (tmp_path / "workspaces" / str(state.task.id)).exists()
+
+
 async def test_new_instruction_at_sdk_boundary_requeues_once(database):
     from app.orchestrator import InstructionChanged, _agent_options
 
@@ -242,7 +332,7 @@ async def test_tool_budget_cannot_consume_another_tasks_subtask(database):
 
 
 async def test_snapshot_freezes_server_limits_without_changing_admin_contract(
-    database, monkeypatch
+    database, monkeypatch, tmp_path
 ):
     import app.routers.tasks as task_router
     from app.config import Settings
@@ -253,8 +343,10 @@ async def test_snapshot_freezes_server_limits_without_changing_admin_contract(
         worker_model="worker",
         max_agent_turns=12,
         max_tool_calls_per_subtask=4,
+        workspace_root=str(tmp_path / "workspaces"),
     )
     monkeypatch.setattr(task_router, "get_settings", lambda: settings)
+    monkeypatch.setattr(workspaces, "get_settings", lambda: settings)
     async with database.sessions() as session:
         session.add(
             SystemSettings(
@@ -295,6 +387,25 @@ async def test_sdk_budget_migration_round_trip_preserves_existing_rows(
         assert (
             await session.get(Subtask, state.subtask.id)
         ).tool_calls_used == 0
+
+
+async def test_workspace_cleanup_migration_round_trip(database):
+    state = await seed(database)
+    migration = importlib.import_module(
+        "backend.migrations.versions.0006_task_workspace_cleanup"
+    )
+
+    def migrate(connection, operation):
+        with Operations.context(MigrationContext.configure(connection)):
+            getattr(migration, operation)()
+
+    async with database.engine.begin() as connection:
+        await connection.run_sync(migrate, "downgrade")
+        await connection.run_sync(migrate, "upgrade")
+    async with database.sessions() as session:
+        task = await session.get(Task, state.task.id)
+        assert task.deletion_requested_at is None
+        assert await session.get(TaskDeletionJob, state.task.id) is None
 
 
 @pytest.mark.parametrize("accepted", [True, False])
@@ -356,7 +467,7 @@ async def test_task_uses_sdk_for_plan_work_review_and_synthesis(
             work.model_dump_json(),
             review.model_dump_json(),
             IntegratedAnswer(
-                answer="Final answer", caveats=[]
+                answer="Final answer", caveats=[], artifacts=[]
             ).model_dump_json(),
             final_review.model_dump_json(),
         ]

@@ -20,12 +20,14 @@ def normalize_checklist_results(
     for item in checklist:
         evidence = ""
         deficiency = ""
+        requires_additional_tool_calls = False
         if item.verification_mode == "non_empty":
             passed = bool(artifact_text.strip())
             evidence = "Artifact contains text." if passed else ""
             deficiency = "The artifact is empty." if not passed else ""
         elif item.verification_mode == "source_present":
             passed = bool(allowed_sources)
+            requires_additional_tool_calls = not passed
             evidence = (
                 ", ".join(sorted(allowed_sources)[:5]) if passed else ""
             )
@@ -34,18 +36,40 @@ def normalize_checklist_results(
             citations = set(_MARKDOWN_LINK.findall(artifact_text))
             verified = citations & allowed_sources
             passed = bool(verified)
+            requires_additional_tool_calls = not passed and not allowed_sources
             evidence = ", ".join(sorted(verified)[:5])
             deficiency = (
                 "No citation links to an attached source."
                 if not passed
                 else ""
             )
+        elif item.verification_mode == "artifact_present":
+            files = (
+                artifact.get("artifacts", [])
+                if isinstance(artifact, dict)
+                else []
+            )
+            filenames = [
+                file["filename"]
+                for file in files
+                if isinstance(file, dict)
+                and isinstance(file.get("filename"), str)
+                and isinstance(file.get("content"), str)
+                and file["content"].strip()
+            ] if isinstance(files, list) else []
+            passed = bool(filenames)
+            evidence = ", ".join(filenames[:5])
+            if not passed:
+                deficiency = "No non-empty requested file was generated."
         else:
             proposed_result = proposed.get(item.id)
             passed = bool(proposed_result and proposed_result.passed)
             if proposed_result is not None:
                 evidence = proposed_result.evidence.strip()
                 deficiency = proposed_result.deficiency.strip()
+                requires_additional_tool_calls = (
+                    proposed_result.requires_additional_tool_calls
+                )
             if passed and not evidence:
                 passed = False
                 deficiency = "The review did not provide supporting evidence."
@@ -61,6 +85,9 @@ def normalize_checklist_results(
                 "passed": passed,
                 "evidence": evidence,
                 "deficiency": deficiency,
+                "requires_additional_tool_calls": (
+                    requires_additional_tool_calls
+                ),
             }
         )
     return normalized
@@ -110,5 +137,13 @@ def _artifact_text(artifact: object) -> str:
     findings = artifact.get("findings")
     if isinstance(findings, list):
         parts.extend(findings)
+    artifacts = artifact.get("artifacts")
+    if isinstance(artifacts, list):
+        parts.extend(
+            item["content"]
+            for item in artifacts
+            if isinstance(item, dict)
+            and isinstance(item.get("content"), str)
+        )
     text_parts = [part for part in parts if isinstance(part, str)]
     return "\n".join(text_parts)

@@ -1,22 +1,32 @@
-import { Fragment, useEffect, useState, type FormEvent } from 'react'
+import { Fragment, Suspense, lazy, useEffect, useRef, useState, type FormEvent } from 'react'
+import { Tree, type NodeRendererProps } from 'react-arborist'
 import {
   Activity, ArrowUpRight, Ban, Check, ChevronDown, Clock3, Command,
-  Copy, KeyRound, LoaderCircle, LogOut, MessageSquareText, Plus, Send,
-  Sparkles, Trash2, X,
+  Copy, Download, FileText, Folder, FolderOpen, KeyRound, LoaderCircle,
+  LogOut, MessageSquareText, Plus, Save, Send, Sparkles, Trash2, Upload, X,
 } from 'lucide-react'
 
+const CodeTextEditor = lazy(() => import('./CodeTextEditor'))
+
 type User = { id: string; email: string; role: string; must_change_password: boolean }
+type ToolBudgetApproval = {
+  request_id: string; subtask_id: string; subtask_title: string;
+  additional_calls: number; reason: string; plan_version: number
+}
 type Task = {
   id: string; instruction: string; status: string; created_at: string; updated_at: string;
   result: string | null; error: { code?: string; message?: string } | null;
-  completion_report: { plan_version: number; unmet_items: { target_type: string; subtask_title: string | null; item_id: string; description: string; evidence: string; deficiency: string }[] } | null
+  completion_report: { plan_version: number; unmet_items: { target_type: string; subtask_title: string | null; item_id: string; description: string; evidence: string; deficiency: string }[] } | null;
+  pending_tool_approval: ToolBudgetApproval | null
 }
 type Message = { id: string; sequence: number; role: 'user' | 'assistant'; content: string; created_at: string }
 type ProgressItem = { id: string; conversationSequence: number; content: string }
+type WorkspaceFile = { id: string; path: string; role: string; source_kind: string; size_bytes: number; updated_at: string }
+type ExplorerNodeData = { id: string; name: string; file?: WorkspaceFile; children?: ExplorerNodeData[] }
 
 async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
   const headers = new Headers(init.headers)
-  if (init.body) headers.set('Content-Type', 'application/json')
+  if (init.body && !headers.has('Content-Type')) headers.set('Content-Type', 'application/json')
   if (init.method && init.method !== 'GET') {
     const csrf = document.cookie.match(/(?:^|; )agent_csrf=([^;]+)/)?.[1]
     if (csrf) headers.set('X-CSRF-Token', decodeURIComponent(csrf))
@@ -40,6 +50,7 @@ function App() {
   const [apiConnected, setApiConnected] = useState<boolean | null>(null)
   const [tasks, setTasks] = useState<Task[]>([])
   const [active, setActive] = useState<Task | null>(null)
+  const [detailTab, setDetailTab] = useState<'thread' | 'files'>('thread')
   const [messages, setMessages] = useState<Message[]>([])
   const [progress, setProgress] = useState<ProgressItem[]>([])
   const [busy, setBusy] = useState(false)
@@ -49,6 +60,8 @@ function App() {
 
   const refreshTasks = async () => setTasks(await api<Task[]>('/tasks'))
   const refreshMessages = async (taskId: string) => setMessages(await api<Message[]>(`/tasks/${taskId}/messages`))
+
+  useEffect(() => setDetailTab('thread'), [active?.id])
 
   useEffect(() => {
     api<{ status: string }>('/health')
@@ -161,6 +174,23 @@ function App() {
     finally { setBusy(false) }
   }
 
+  const decideToolBudgetApproval = async (approved: boolean) => {
+    if (!active?.pending_tool_approval) return
+    setBusy(true); setError('')
+    try {
+      const updated = await api<Task>(`/tasks/${active.id}/tool-budget-approval`, {
+        method: 'POST',
+        body: JSON.stringify({
+          request_id: active.pending_tool_approval.request_id,
+          approved,
+        }),
+      })
+      setActive(updated)
+      await refreshTasks()
+    } catch (reason) { setError((reason as Error).message) }
+    finally { setBusy(false) }
+  }
+
   const cancelTask = async () => {
     if (!active || !window.confirm('Stop this task? The current run will be cancelled.')) return
     setBusy(true); setError('')
@@ -239,6 +269,20 @@ function App() {
           {active ? <>
             <div className="detail-top"><div><div className="eyebrow">TASK THREAD</div><div className={`status-pill pill-${active.status}`}>{statusLabel[active.status] ?? active.status}</div></div><div className="detail-actions">{['queued', 'planning', 'running', 'waiting_approval', 'needs_attention'].includes(active.status) ? <button className="icon-btn" title="Cancel task" disabled={busy} onClick={cancelTask}><Ban size={16} /></button> : ['succeeded', 'partially_completed', 'failed', 'cancelled'].includes(active.status) ? <button className="icon-btn" title="Delete task" disabled={busy} onClick={deleteTask}><Trash2 size={16} /></button> : null}<button className="icon-btn" title="Close task" onClick={() => setActive(null)}><X size={17} /></button></div></div>
             <h2 className="detail-title">{active.instruction}</h2>
+            <div className="detail-tabs" role="tablist" aria-label="Task views">
+              <button role="tab" aria-selected={detailTab === 'thread'} className={detailTab === 'thread' ? 'selected' : ''} onClick={() => setDetailTab('thread')}><MessageSquareText size={14} /> Conversation</button>
+              <button role="tab" aria-selected={detailTab === 'files'} className={detailTab === 'files' ? 'selected' : ''} onClick={() => setDetailTab('files')}><FolderOpen size={14} /> Files</button>
+            </div>
+            {active.status === 'waiting_approval' && active.pending_tool_approval && <article className="partial-block approval-block" role="alert">
+              <strong>追加調査の許可が必要です</strong>
+              <p>{active.pending_tool_approval.subtask_title}で追加の読み取り専用調査が必要です（追加{active.pending_tool_approval.additional_calls}回、累積上限100回）。</p>
+              <p>{active.pending_tool_approval.reason}</p>
+              <div className="reply-actions">
+                <button className="primary-btn" type="button" disabled={busy} onClick={() => decideToolBudgetApproval(true)}><Check size={15} /> 許可する</button>
+                <button className="outline-btn" type="button" disabled={busy} onClick={() => decideToolBudgetApproval(false)}><X size={15} /> 拒否して部分結果で続行</button>
+              </div>
+            </article>}
+            {detailTab === 'files' ? <WorkspacePanel taskId={active.id} refreshOnCompletion={['succeeded', 'partially_completed', 'failed'].includes(active.status)} /> : <>
             <div className="thread" aria-live="polite">{messages.map((message) => <Fragment key={message.id}><article className={`message message-${message.role}`}><div className="message-avatar">{message.role === 'user' ? user.email[0].toUpperCase() : <Sparkles size={14} />}</div><div><div className="message-meta">{message.role === 'user' ? 'You' : 'Relay'} <time>{new Date(message.created_at).toLocaleTimeString('ja-JP', { hour: '2-digit', minute: '2-digit' })}</time></div><p>{message.content}</p></div></article>{message.role === 'user' && renderProgress(message.sequence)}</Fragment>)}
               {active.status === 'queued' && <div className="progress-note"><LoaderCircle size={15} /> Waiting for an available worker</div>}
               {active.status === 'needs_attention' && <div className="clarification-note" role="status"><MessageSquareText size={15} /> Reply below to continue this task.</div>}
@@ -246,7 +290,8 @@ function App() {
               {active.result && !messages.some((message) => message.role === 'assistant' && message.content === active.result) && <article className="result-block"><div className="result-label"><Check size={14} /> RESULT</div><p>{active.result}</p></article>}
               {active.error && <article className="error-block"><strong>{active.error.code ?? 'Task error'}</strong><p>{active.error.message ?? 'The task could not be completed.'}</p></article>}
             </div>
-            <form className="reply-box" onSubmit={sendMessage}><textarea name="content" placeholder={active.status === 'needs_attention' ? 'Answer the questions above to continue...' : 'Add context or a follow-up...'} rows={3} maxLength={20000} required /><div className="reply-actions"><span><MessageSquareText size={14} /> Messages stay in this task</span><button className="send-btn" title="Send message" disabled={busy}><Send size={16} /></button></div></form>
+            {active.status !== 'waiting_approval' && <form className="reply-box" onSubmit={sendMessage}><textarea name="content" placeholder={active.status === 'needs_attention' ? 'Answer the questions above to continue...' : 'Add context or a follow-up...'} rows={3} maxLength={20000} required /><div className="reply-actions"><span><MessageSquareText size={14} /> Messages stay in this task</span><button className="send-btn" title="Send message" disabled={busy}><Send size={16} /></button></div></form>}
+            </>}
           </> : <div className="detail-empty"><div className="detail-empty-mark"><Activity size={23} /></div><h3>Work, in motion.</h3><p>Select a task to open its conversation, or start a new one.</p><button className="outline-btn" onClick={() => setShowCreate(true)}><Plus size={16} /> Start a task</button></div>}
         </aside>
       </div>
@@ -255,6 +300,207 @@ function App() {
     {showCreate && <div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) setShowCreate(false) }}><section className="compose-modal" aria-labelledby="compose-title"><div className="modal-head"><div><div className="eyebrow">NEW THREAD</div><h2 id="compose-title">What are we working on?</h2></div><button className="icon-btn" title="Close" onClick={() => setShowCreate(false)}><X size={18} /></button></div><form onSubmit={createTask}><textarea name="instruction" autoFocus rows={5} maxLength={20000} placeholder="Describe the outcome you need..." required /><div className="modal-footer"><span>Each task has its own conversation and history.</span><button className="primary-btn" disabled={busy}><Plus size={16} /> Create task</button></div></form></section></div>}
     {showAccount && <AccountModal user={user} onClose={() => setShowAccount(false)} />}
   </div>
+}
+
+function buildExplorerTree(files: WorkspaceFile[]): ExplorerNodeData[] {
+  const roots: ExplorerNodeData[] = []
+  const folders = new Map<string, ExplorerNodeData>()
+  for (const file of files) {
+    const parts = file.path.split('/')
+    let parent = roots
+    let currentPath = ''
+    for (const [index, name] of parts.entries()) {
+      currentPath = currentPath ? `${currentPath}/${name}` : name
+      if (index === parts.length - 1) {
+        parent.push({ id: `file:${file.path}`, name, file })
+        continue
+      }
+      let folder = folders.get(currentPath)
+      if (!folder) {
+        folder = { id: `folder:${currentPath}`, name, children: [] }
+        folders.set(currentPath, folder)
+        parent.push(folder)
+      }
+      parent = folder.children ?? []
+    }
+  }
+  return roots
+}
+
+function ExplorerTreeRow({ node, style, dragHandle }: NodeRendererProps<ExplorerNodeData>) {
+  return <div
+    ref={dragHandle}
+    style={style}
+    className={`explorer-node ${node.isSelected ? 'selected' : ''}`}
+    onClick={(event) => node.handleClick(event)}
+    onDoubleClick={() => { if (node.isInternal) node.toggle() }}
+    title={node.data.file?.path ?? node.data.name}
+  >
+    {node.isLeaf ? <FileText size={14} /> : node.isOpen ? <FolderOpen size={14} /> : <Folder size={14} />}
+    <span>{node.data.name}</span>
+  </div>
+}
+
+function WorkspacePanel({ taskId, refreshOnCompletion }: { taskId: string; refreshOnCompletion: boolean }) {
+  const [files, setFiles] = useState<WorkspaceFile[]>([])
+  const [selected, setSelected] = useState<WorkspaceFile | null>(null)
+  const [content, setContent] = useState('')
+  const [loading, setLoading] = useState(true)
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState('')
+  const fileTreeElement = useRef<HTMLDivElement>(null)
+  const [treeSize, setTreeSize] = useState({ width: 180, height: 320 })
+
+  const refresh = async () => {
+    const items = await api<WorkspaceFile[]>(`/tasks/${taskId}/workspace/files`)
+    setFiles(items)
+    setSelected((current) => current ? items.find((file) => file.path === current.path) ?? null : null)
+  }
+
+  useEffect(() => {
+    let alive = true
+    setLoading(true)
+    api<WorkspaceFile[]>(`/tasks/${taskId}/workspace/files`)
+      .then((items) => { if (alive) setFiles(items) })
+      .catch((reason) => { if (alive) setError((reason as Error).message) })
+      .finally(() => { if (alive) setLoading(false) })
+    setSelected(null)
+    setContent('')
+    return () => { alive = false }
+  }, [taskId])
+
+  useEffect(() => {
+    if (!refreshOnCompletion) return
+    let alive = true
+    api<WorkspaceFile[]>(`/tasks/${taskId}/workspace/files`)
+      .then((items) => {
+        if (!alive) return
+        setFiles(items)
+        setSelected((current) => current ? items.find((file) => file.path === current.path) ?? null : null)
+      })
+      .catch((reason) => { if (alive) setError((reason as Error).message) })
+    return () => { alive = false }
+  }, [taskId, refreshOnCompletion])
+
+  useEffect(() => {
+    const element = fileTreeElement.current
+    if (!element) return
+    const observer = new ResizeObserver(([entry]) => {
+      setTreeSize({
+        width: Math.floor(entry.contentRect.width),
+        height: Math.floor(entry.contentRect.height),
+      })
+    })
+    observer.observe(element)
+    return () => observer.disconnect()
+  }, [])
+
+  const fileUrl = (path: string) => `/api/tasks/${taskId}/workspace/files/${path.split('/').map(encodeURIComponent).join('/')}`
+  const download = async (file: WorkspaceFile) => {
+    const response = await fetch(fileUrl(file.path), { credentials: 'include' })
+    if (!response.ok) throw new Error(`Download failed (${response.status})`)
+    const blob = await response.blob()
+    const link = document.createElement('a')
+    link.href = URL.createObjectURL(blob)
+    link.download = file.path.split('/').at(-1) ?? 'download'
+    link.click()
+    URL.revokeObjectURL(link.href)
+  }
+
+  const selectFile = async (file: WorkspaceFile) => {
+    setSelected(file)
+    setError('')
+    const extension = file.path.split('.').at(-1)?.toLowerCase() ?? ''
+    const editable = ['md', 'txt', 'json', 'py', 'ts', 'tsx', 'js', 'jsx', 'css', 'html', 'xml', 'yaml', 'yml', 'toml', 'sh', 'sql', 'csv', 'log'].includes(extension)
+    if (!editable || file.size_bytes > 1_000_000) { setContent(''); return }
+    try {
+      const response = await fetch(fileUrl(file.path), { credentials: 'include' })
+      if (!response.ok) throw new Error(`Read failed (${response.status})`)
+      setContent(await response.text())
+    } catch (reason) { setError((reason as Error).message) }
+  }
+
+  const upload = async (event: FormEvent<HTMLInputElement>) => {
+    const selectedFiles = Array.from(event.currentTarget.files ?? [])
+    event.currentTarget.value = ''
+    if (selectedFiles.length === 0) return
+    setBusy(true); setError('')
+    try {
+      let lastUploaded: WorkspaceFile | null = null
+      for (const file of selectedFiles) {
+        lastUploaded = await api<WorkspaceFile>(`/tasks/${taskId}/workspace/files?filename=${encodeURIComponent(file.name)}`, {
+          method: 'POST',
+          headers: { 'Content-Type': file.type || 'application/octet-stream' },
+          body: file,
+        })
+      }
+      await refresh()
+      if (lastUploaded) await selectFile(lastUploaded)
+    } catch (reason) { setError((reason as Error).message) }
+    finally { setBusy(false) }
+  }
+
+  const save = async () => {
+    if (!selected) return
+    setBusy(true); setError('')
+    try {
+      const updated = await api<WorkspaceFile>(`/tasks/${taskId}/workspace/files/${selected.path.split('/').map(encodeURIComponent).join('/')}?role=${selected.role}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'text/plain; charset=utf-8' },
+        body: content,
+      })
+      await refresh()
+      setSelected(updated)
+    } catch (reason) { setError((reason as Error).message) }
+    finally { setBusy(false) }
+  }
+
+  const remove = async (file: WorkspaceFile) => {
+    if (!window.confirm(`Delete ${file.path}?`)) return
+    setBusy(true); setError('')
+    try {
+      await api(`/tasks/${taskId}/workspace/files/${file.path.split('/').map(encodeURIComponent).join('/')}`, { method: 'DELETE' })
+      if (selected?.path === file.path) { setSelected(null); setContent('') }
+      await refresh()
+    } catch (reason) { setError((reason as Error).message) }
+    finally { setBusy(false) }
+  }
+
+  const textFile = selected && ['md', 'txt', 'json', 'py', 'ts', 'tsx', 'js', 'jsx', 'css', 'html', 'xml', 'yaml', 'yml', 'toml', 'sh', 'sql', 'csv', 'log'].includes(selected.path.split('.').at(-1)?.toLowerCase() ?? '') && selected.size_bytes <= 1_000_000
+  const treeData = buildExplorerTree(files)
+
+  return <section className="workspace-panel" aria-label="Task files">
+    <div className="workspace-toolbar"><div><div className="eyebrow">TASK WORKSPACE</div><strong>{files.length} files</strong></div><label className="icon-btn workspace-upload" title="Upload input files"><Upload size={16} /><input type="file" multiple onChange={upload} disabled={busy} /></label></div>
+    {error && <div className="workspace-error" role="alert">{error}</div>}
+    {loading ? <div className="workspace-empty">Loading files...</div> : files.length === 0 ? <div className="workspace-empty"><FolderOpen size={21} /><strong>No files yet</strong><span>Upload task inputs or save an artifact here.</span></div> : <div className="workspace-browser">
+      <div className="file-list" aria-label="Files" ref={fileTreeElement}>
+        {treeSize.width > 0 && treeSize.height > 0 && <Tree<ExplorerNodeData>
+          data={treeData}
+          width={treeSize.width}
+          height={treeSize.height}
+          rowHeight={27}
+          indent={12}
+          disableDrag
+          disableDrop
+          disableEdit
+          onSelect={(nodes) => {
+            const file = nodes[0]?.data.file
+            if (file) void selectFile(file)
+          }}
+        >{ExplorerTreeRow}</Tree>}
+      </div>
+      <div className="file-editor">
+        {selected ? <>
+          <div className="file-editor-head"><strong title={selected.path}>{selected.path}</strong><div><button className="icon-btn" title="Download file" onClick={() => void download(selected).catch((reason) => setError((reason as Error).message))}><Download size={15} /></button><button className="icon-btn file-delete" title="Delete file" disabled={busy} onClick={() => void remove(selected)}><Trash2 size={14} /></button></div></div>
+          {textFile ? <><Suspense fallback={<div className="code-editor-host workspace-empty">Loading editor...</div>}><div className="code-editor-host"><CodeTextEditor
+            filename={selected.path}
+            value={content}
+            onChange={(value: string) => setContent(value)}
+          /></div></Suspense><button className="primary-btn file-save" disabled={busy} onClick={save}><Save size={15} /> Save</button></> : <div className="workspace-empty">Preview is unavailable. Download to open this file.</div>}
+        </> : <div className="workspace-empty"><FolderOpen size={20} /><span>Select a file to inspect it.</span></div>}
+      </div>
+    </div>}
+  </section>
 }
 
 function Login({ onSubmit, busy, error }: { onSubmit: (email: string, password: string) => void; busy: boolean; error: string }) {

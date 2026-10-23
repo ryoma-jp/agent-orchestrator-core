@@ -176,20 +176,40 @@ async def test_cancellation_propagates_from_tool_boundary(sdk_transport):
 
 
 @pytest.mark.asyncio
-async def test_tool_budget_is_not_reset_by_output_correction(sdk_transport):
+@pytest.mark.parametrize("limit_source", ["runner", "database"])
+async def test_tool_budget_exhaustion_returns_control_result(
+    sdk_transport, limit_source
+):
     transport = sdk_transport(
         [
-            tool_call(),
-            '{"wrong":true}',
+            tool_call(call_id="call-1"),
             tool_call(call_id="call-2"),
+            '{"answer":"partial result from existing evidence"}',
         ]
     )
     calls = []
-    with pytest.raises(
-        AgentExecutionError, match="^tool_call_limit_exceeded$"
-    ):
-        await generate(tool_registry=registry(calls), max_tool_calls=1)
+    observations = []
+    reservations = 0
+
+    async def reserve():
+        nonlocal reservations
+        reservations += 1
+        if reservations > 1:
+            raise AgentExecutionError("tool_call_limit_exceeded")
+
+    result = await generate(
+        tool_registry=registry(calls),
+        before_tool_call=reserve if limit_source == "database" else None,
+        on_tool_result=lambda _name, _arguments, value: observations.append(
+            value
+        ),
+        max_tool_calls=2 if limit_source == "database" else 1,
+    )
+
+    assert result.answer == "partial result from existing evidence"
     assert calls == ["facts"]
+    assert len(observations) == 2
+    assert observations[1]["error"] == "tool_call_limit_exceeded"
     assert len(transport.requests) == 3
 
 

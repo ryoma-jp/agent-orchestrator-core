@@ -9,6 +9,8 @@ COPY pyproject.toml ./
 COPY alembic.ini ./
 COPY backend ./backend
 RUN pip install --no-cache-dir .
+RUN mkdir -p /var/lib/agent-orchestrator/workspaces \
+    && chown app:app /var/lib/agent-orchestrator/workspaces
 
 USER app
 EXPOSE 8000

@@ -48,6 +48,8 @@ services:
       VAULT_OPENAI_KEY_PATH: ${VAULT_OPENAI_KEY_PATH:-agent-orchestrator/openai}
       VAULT_API_ROLE_ID_FILE: /run/secrets/vault-api-role-id
       VAULT_API_SECRET_ID_FILE: /run/secrets/vault-api-secret-id
+      WORKSPACE_ROOT: /var/lib/agent-orchestrator/workspaces
+      WORKSPACE_INTERNAL_TOKEN: ${WORKSPACE_INTERNAL_TOKEN:?Set WORKSPACE_INTERNAL_TOKEN in .env}
     group_add:
       - ${VAULT_CREDENTIAL_GID:-1000}
     command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
@@ -59,6 +61,7 @@ services:
     volumes:
       - ${VAULT_API_ROLE_ID_SOURCE:-./secrets/vault-api-role-id}:/run/secrets/vault-api-role-id:ro
       - ${VAULT_API_SECRET_ID_SOURCE:-./secrets/vault-api-secret-id}:/run/secrets/vault-api-secret-id:ro
+      - workspace_data:/var/lib/agent-orchestrator/workspaces
 
   worker:
     build: .
@@ -82,6 +85,8 @@ services:
       VAULT_TAVILY_KEY_PATH: ${VAULT_TAVILY_KEY_PATH:-agent-orchestrator/tavily}
       VAULT_WORKER_ROLE_ID_FILE: /run/secrets/vault-worker-role-id
       VAULT_WORKER_SECRET_ID_FILE: /run/secrets/vault-worker-secret-id
+      API_INTERNAL_BASE_URL: http://api:8000
+      WORKSPACE_INTERNAL_TOKEN: ${WORKSPACE_INTERNAL_TOKEN:?Set WORKSPACE_INTERNAL_TOKEN in .env}
     group_add:
       - ${VAULT_CREDENTIAL_GID:-1000}
     volumes:
@@ -142,3 +147,4 @@ services:
 
 volumes:
   postgres_data:
+  workspace_data:

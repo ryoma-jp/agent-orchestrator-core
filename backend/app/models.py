@@ -140,9 +140,45 @@ class Task(Base):
     result: Mapped[str | None] = mapped_column(Text)
     error: Mapped[dict | None] = mapped_column(JSONB)
     completion_report: Mapped[dict | None] = mapped_column(JSONB)
+    pending_tool_approval: Mapped[dict | None] = mapped_column(JSONB)
     config_snapshot: Mapped[dict] = mapped_column(JSONB, default=dict)
+    deletion_requested_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
     messages: Mapped[list["ConversationMessage"]] = relationship(
         cascade="all, delete-orphan"
+    )
+
+
+class TaskFile(Base):
+    __tablename__ = "task_files"
+    __table_args__ = (
+        UniqueConstraint(
+            "task_id", "workspace_rel_path", name="uq_task_files_path"
+        ),
+        CheckConstraint(
+            "role IN ('input', 'source', 'intermediate', 'final')",
+            name="ck_task_files_role",
+        ),
+        Index("ix_task_files_task_path", "task_id", "workspace_rel_path"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    task_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("tasks.id", ondelete="CASCADE"), index=True
+    )
+    workspace_rel_path: Mapped[str] = mapped_column(Text)
+    role: Mapped[str] = mapped_column(String(16), default="input")
+    source_kind: Mapped[str] = mapped_column(String(32), default="user_upload")
+    source_ref: Mapped[str | None] = mapped_column(Text)
+    size_bytes: Mapped[int] = mapped_column(BigInteger, default=0)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
 
 
@@ -181,6 +217,11 @@ class Subtask(Base):
         CheckConstraint(
             "tool_calls_used >= 0", name="ck_subtasks_tool_calls_used"
         ),
+        CheckConstraint(
+            "tool_calls_limit IS NULL OR "
+            "tool_calls_limit >= 0",
+            name="ck_subtasks_tool_calls_limit",
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -202,8 +243,9 @@ class Subtask(Base):
     attempt: Mapped[int] = mapped_column(Integer, default=0)
     quality_revision_count: Mapped[int] = mapped_column(Integer, default=0)
     tool_calls_used: Mapped[int] = mapped_column(
-        Integer, default=0, server_default="0"
+        BigInteger, default=0, server_default="0"
     )
+    tool_calls_limit: Mapped[int | None] = mapped_column(BigInteger)
     result: Mapped[dict | None] = mapped_column(JSONB)
     error: Mapped[dict | None] = mapped_column(JSONB)
     created_at: Mapped[datetime] = mapped_column(
@@ -298,6 +340,38 @@ class Job(Base):
     )
     task_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("tasks.id", ondelete="CASCADE"), index=True
+    )
+    status: Mapped[str] = mapped_column(String(16), default="pending")
+    available_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    lease_owner: Mapped[str | None] = mapped_column(String(128))
+    lease_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
+    attempt: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class TaskDeletionJob(Base):
+    __tablename__ = "task_deletion_jobs"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('pending', 'leased')",
+            name="ck_task_deletion_jobs_status",
+        ),
+        Index(
+            "ix_task_deletion_jobs_available",
+            "status",
+            "available_at",
+            "lease_expires_at",
+        ),
+    )
+
+    task_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True
     )
     status: Mapped[str] = mapped_column(String(16), default="pending")
     available_at: Mapped[datetime] = mapped_column(

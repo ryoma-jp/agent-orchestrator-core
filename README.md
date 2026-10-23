@@ -4,7 +4,7 @@ PostgreSQL-backed task coordination service with separate API, worker, user UI, 
 
 ## Initial setup
 
-1. Copy `.env.example` to `.env`. Replace the database password with a long random value in both `POSTGRES_PASSWORD` and `DATABASE_URL`, set real model IDs available to your OpenAI project, and choose a unique administrator password of at least 12 characters. Set `VAULT_CREDENTIAL_GID` to the host's `id -g` value so the non-root API and Worker can read the group-restricted credential files. Keep `.env` and Vault credentials out of version control.
+1. Copy `.env.example` to `.env`. Replace the database password with a long random value in both `POSTGRES_PASSWORD` and `DATABASE_URL`, set real model IDs available to your OpenAI project, choose a unique administrator password of at least 12 characters, and set `WORKSPACE_INTERNAL_TOKEN` to a separate long random value. Set `VAULT_CREDENTIAL_GID` to the host's `id -g` value so the non-root API and Worker can read the group-restricted credential files. Keep `.env` and Vault credentials out of version control.
 2. Start PostgreSQL and the development Vault: `docker compose up -d db` and `docker compose --profile local-vault up -d --wait vault`.
 3. Provision the local KV v2 path and API/Worker AppRoles: `sh scripts/provision-local-vault.sh`.
 4. Apply the initial schema: `docker compose --profile setup run --rm migrate`.
@@ -15,8 +15,13 @@ PostgreSQL-backed task coordination service with separate API, worker, user UI, 
 After initial setup, start or restart the API and both UIs with `docker compose --profile local-vault up -d`. Open `http://localhost:8080/` for the user UI or `http://localhost:8080/admin/` for the administrator UI. Add `--build` when you need to rebuild images after code changes.
 
 ```sh
-docker compose --profile local-vault up -d --build
+# DBと、ローカルVaultを使う場合はVaultだけ先に起動
+docker compose --profile local-vault up -d --wait db vault
 sh scripts/provision-local-vault.sh
+
+# DBスキーマを更新してからアプリを起動
+docker compose --profile setup run --build --rm migrate
+docker compose --profile local-vault up -d --build
 docker compose --profile local-vault --profile agent up --build -d worker
 ```
 
@@ -27,10 +32,12 @@ Use OpenSSL to generate separate 256-bit random values for PostgreSQL and the in
 ```sh
 db_password=$(openssl rand -hex 32)
 admin_password=$(openssl rand -hex 32)
+workspace_token=$(openssl rand -hex 32)
 printf 'POSTGRES_PASSWORD=%s\n' "$db_password"
 printf 'DATABASE_URL=postgresql+asyncpg://orchestrator:%s@db:5432/orchestrator\n' "$db_password"
 printf 'INITIAL_ADMIN_PASSWORD=%s\n' "$admin_password"
-unset db_password admin_password
+printf 'WORKSPACE_INTERNAL_TOKEN=%s\n' "$workspace_token"
+unset db_password admin_password workspace_token
 ```
 
 The optional `local-vault` profile runs HashiCorp Vault in dev mode, reachable by the application at `http://vault:8200` and from the host at `http://localhost:8201`. Its root token is for local development only; dev-mode data is in memory and is lost when the Vault container is recreated. Rerun the provisioning script after recreating it. For an external Vault, set `VAULT_ADDR` and the four `VAULT_*_SOURCE` paths in `.env` to the external server and its AppRole credentials instead. Existing `.env` files should set `VAULT_ADDR=http://vault:8200` and use the four `.local-vault/*` source paths shown in the updated `.env.example` when using the local profile.
@@ -47,7 +54,11 @@ The tested Python 3.10 dependency set is `openai-agents==0.24.0`, `openai==3.35.
 
 Set `MAX_AGENT_TURNS` (default 24, range 1-64) and `MAX_TOOL_CALLS_PER_SUBTASK` (default 20, range 0-100) in the deployment environment. The API snapshots them when creating a task; they are not administrator UI settings. Existing task snapshots without these fields use fixed compatibility defaults of 24 and 20. Tool usage is consumed before execution and stored on each subtask, including failed/interrupted calls, so format correction, quality revision, and Worker reclaim do not reset the budget. New plan versions have new subtask budgets; earlier usage remains recorded. These limits are separate from model retries and quality revision limits.
 
-For an existing deployment, stop the Worker, rebuild the backend image, apply migration `0004_agent_sdk_limits` with `docker compose --profile setup run --build --rm migrate`, and then rebuild/restart the API and Worker. Apply migrations before starting the new Worker; no existing application database is modified automatically at startup. Keep a single Worker replica. SDK integration does not add task-level leases, shared rate limits, side-effect recovery, or a new Sandbox.
+When a subtask reaches its tool-call limit, the Worker returns collected evidence for manager review instead of failing the task. If more research is required, the task pauses in `waiting_approval`; the owner may approve another batch equal to the task's initial `MAX_TOOL_CALLS_PER_SUBTASK` snapshot or reject and continue with partial results. There is no cumulative application cap; each approval is explicit and the user controls cost. Chat messages do not approve requests, and retries never reset usage. This requires migrations `0007_tool_budget_approval`, `0008_unbounded_tool_budget`, and `0009_tool_budget_snapshot`.
+
+When a task requests a file, synthesis returns its filename and complete content separately from the chat response. An explicit filename is preserved; otherwise the agent chooses a descriptive name. The Worker writes only requested artifacts under the task Workspace `artifacts/` directory through the internal file API and reports the path only after persistence succeeds. The Explorer refreshes its listing when the task completes. Chat responses remain in the task conversation and are not copied into Workspace files.
+
+For an existing deployment, stop the Worker, rebuild the backend image, apply pending migrations including `0007_tool_budget_approval`, `0008_unbounded_tool_budget`, and `0009_tool_budget_snapshot` with `docker compose --profile setup run --build --rm migrate`, and then rebuild/restart the API, both UIs, and Worker. Apply migrations before starting services; no existing application database is modified automatically at startup. Keep a single Worker replica. The User UI currently provides task-scoped file upload, listing, text editing, download, and explicit tool-budget approval; a restricted interactive terminal and per-task container Sandbox are not yet available.
 
 ## Cleanup
 

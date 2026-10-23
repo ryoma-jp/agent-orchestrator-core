@@ -1,6 +1,12 @@
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_validator,
+)
 
 
 class PlannedSubtask(BaseModel):
@@ -69,7 +75,11 @@ class ChecklistItem(BaseModel):
     description: str = Field(min_length=1, max_length=500)
     required: bool = True
     verification_mode: Literal[
-        "model", "non_empty", "source_present", "markdown_citation"
+        "model",
+        "non_empty",
+        "source_present",
+        "markdown_citation",
+        "artifact_present",
     ] = "model"
 
 
@@ -86,6 +96,7 @@ class ChecklistItemResult(BaseModel):
     passed: bool
     evidence: str = Field(max_length=2_000)
     deficiency: str = Field(max_length=1_000)
+    requires_additional_tool_calls: bool = False
 
 
 class ChecklistReviewResult(BaseModel):
@@ -97,7 +108,7 @@ class ChecklistReviewResult(BaseModel):
 class SubtaskResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    status: Literal["succeeded", "needs_input", "failed"]
+    status: Literal["succeeded", "partial", "needs_input", "failed"]
     summary: str = Field(max_length=4_000)
     findings: list[str] = Field(max_length=30)
     sources: list["SourceReference"] = Field(max_length=15)
@@ -137,8 +148,37 @@ class ToolExecutionRecord(BaseModel):
     error_code: str = Field(max_length=100)
 
 
+class GeneratedArtifact(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    filename: str = Field(min_length=1, max_length=255)
+    content: str = Field(min_length=1, max_length=200_000)
+
+    @field_validator("filename")
+    @classmethod
+    def validate_filename(cls, value: str) -> str:
+        has_separator = any(
+            separator in value for separator in ("/", "\\", "\0")
+        )
+        has_control_character = any(
+            ord(character) < 32 or ord(character) == 127
+            for character in value
+        )
+        if value in {".", ".."} or has_separator or has_control_character:
+            raise ValueError("filename must be a single path component")
+        return value
+
+
 class IntegratedAnswer(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     answer: str = Field(min_length=1, max_length=20_000)
     caveats: list[str] = Field(max_length=20)
+    artifacts: list[GeneratedArtifact] = Field(max_length=10)
+
+    @model_validator(mode="after")
+    def validate_unique_artifact_filenames(self):
+        filenames = [item.filename.casefold() for item in self.artifacts]
+        if len(set(filenames)) != len(filenames):
+            raise ValueError("artifact filenames must be unique")
+        return self

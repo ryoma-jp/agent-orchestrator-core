@@ -1,4 +1,5 @@
 import uuid
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -10,7 +11,9 @@ from starlette.requests import Request
 
 from app.agent_schemas import (
     ChecklistItem,
+    ChecklistItemResult,
     ChecklistReviewResult,
+    GeneratedArtifact,
     IntegratedAnswer,
     PlannedSubtask,
     SubtaskResult,
@@ -27,26 +30,30 @@ from app.models import (
     Task,
     User,
 )
-from app.openai_client import StructuredModelClient
+from app.openai_client import AgentExecutionError, StructuredModelClient
 from app.quality import (
     failed_required_checklist_items,
     normalize_checklist_results,
     required_checklist_items_passed,
 )
-from app.routers.tasks import add_message
+from app.routers.tasks import add_message, upload_task_file
 from app.schemas import (
     AdminSettingsUpdate,
     MessageCreate,
     TaskCreate,
+    ToolBudgetApprovalDecision,
+    TaskFileView,
     TavilyKeyRequest,
 )
 from app.security import hash_password, token_digest, verify_password
+from app.tool_budget_approval import resolve_tool_budget_approval
 from app.tools import (
     TavilySearchArguments,
     TavilySearchTool,
     ToolRegistration,
     ToolRegistry,
 )
+from app import workspaces
 
 
 def test_task_instruction_is_bounded_and_nonempty():
@@ -61,6 +68,318 @@ def test_empty_task_instruction_is_rejected():
     except ValueError:
         return
     raise AssertionError("empty instruction was accepted")
+
+
+def test_workspace_paths_reject_absolute_and_parent_paths():
+    for path in ("/etc/passwd", "../secret", "inputs/../../secret", "a\\b"):
+        with pytest.raises(workspaces.InvalidWorkspacePath):
+            workspaces.normalize_workspace_path(path)
+
+
+def test_task_file_view_serializes_workspace_path_as_path():
+    file_view = TaskFileView(
+        id=uuid.uuid4(),
+        workspace_rel_path="artifacts/final-answer.md",
+        role="final",
+        source_kind="agent",
+        source_ref="task_result",
+        size_bytes=12,
+        created_at=datetime.now(timezone.utc),
+        updated_at=datetime.now(timezone.utc),
+    )
+
+    assert file_view.model_dump()["path"] == "artifacts/final-answer.md"
+
+
+def test_tool_budget_approval_state_and_decision_are_serializable():
+    task_id = uuid.uuid4()
+    subtask = Subtask(
+        id=uuid.uuid4(),
+        task_id=task_id,
+        title="Research sources",
+        instruction="Find sources",
+        model_id="worker",
+        tool_calls_used=20,
+        tool_calls_limit=40,
+    )
+    task = Task(
+        id=task_id,
+        owner_id=uuid.uuid4(),
+        instruction="Research",
+        status="waiting_approval",
+        pending_tool_approval={
+            "request_id": str(uuid.uuid4()),
+            "subtask_id": str(subtask.id),
+            "additional_calls": 20,
+        },
+    )
+    decision = ToolBudgetApprovalDecision(
+        request_id=uuid.UUID(task.pending_tool_approval["request_id"]),
+        approved=True,
+    )
+
+    assert subtask.tool_calls_limit == 40
+    assert task.pending_tool_approval["additional_calls"] == 20
+    assert decision.approved
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    (
+        "approved",
+        "initial_limit",
+        "current_limit",
+        "expected_status",
+        "expected_limit",
+        "expected_verdict",
+    ),
+    [
+        (True, 20, 20, "revising", 40, "revision_requested"),
+        (False, 20, 20, "partially_accepted", 20, "partially_accepted"),
+        (True, 40, 40, "revising", 80, "revision_requested"),
+        (True, 20, 120, "revising", 140, "revision_requested"),
+    ],
+)
+async def test_tool_budget_decision_resumes_or_accepts_partial(
+    approved,
+    initial_limit,
+    current_limit,
+    expected_status,
+    expected_limit,
+    expected_verdict,
+):
+    task_id = uuid.uuid4()
+    owner_id = uuid.uuid4()
+    subtask_id = uuid.uuid4()
+    request_id = uuid.uuid4()
+    task = Task(
+        id=task_id,
+        owner_id=owner_id,
+        instruction="Research sources",
+        status="waiting_approval",
+        config_snapshot={"max_tool_calls_per_subtask": initial_limit},
+        pending_tool_approval={
+            "request_id": str(request_id),
+            "plan_version": 4,
+            "subtask_id": str(subtask_id),
+            "additional_calls": initial_limit,
+            "reviewer_model_id": "manager",
+        },
+    )
+    subtask = Subtask(
+        id=subtask_id,
+        task_id=task_id,
+        title="Research sources",
+        instruction="Find sources",
+        status="waiting_approval",
+        plan_version=4,
+        model_id="worker",
+        quality_revision_count=0,
+        tool_calls_used=current_limit,
+        tool_calls_limit=current_limit,
+        result={"quality_review": [{"item_id": "source", "passed": False}]},
+    )
+
+    class FakeSession:
+        def __init__(self):
+            self.scalar_values = [task, subtask]
+            self.added = []
+
+        async def scalar(self, _statement):
+            return self.scalar_values.pop(0)
+
+        def add(self, value):
+            self.added.append(value)
+
+        async def commit(self):
+            return None
+
+        async def refresh(self, _value):
+            return None
+
+    session = FakeSession()
+    result = await resolve_tool_budget_approval(
+        task_id,
+        owner_id,
+        ToolBudgetApprovalDecision(
+            request_id=request_id,
+            approved=approved,
+        ),
+        session,
+    )
+
+    assert result.status == "queued"
+    assert task.pending_tool_approval is None
+    assert subtask.status == expected_status
+    assert subtask.tool_calls_limit == expected_limit
+    assert subtask.tool_calls_used == current_limit
+    assert any(
+        isinstance(item, QualityReview)
+        and item.verdict == expected_verdict
+        for item in session.added
+    )
+    assert any(
+        isinstance(item, Job) and item.status == "pending"
+        for item in session.added
+    )
+    decision_event = next(
+        item
+        for item in session.added
+        if isinstance(item, Event)
+        and item.type == "task.tool_budget_approval_resolved"
+    )
+    assert decision_event.payload_json["approved"] is approved
+
+
+@pytest.mark.asyncio
+async def test_tool_budget_request_pauses_task_and_persists_partial_result(
+    monkeypatch,
+):
+    import app.orchestrator as orchestrator_module
+
+    task_id = uuid.uuid4()
+    job_id = uuid.uuid4()
+    subtask = Subtask(
+        id=uuid.uuid4(),
+        task_id=task_id,
+        title="Research sources",
+        instruction="Find sources",
+        status="reviewing",
+        plan_version=2,
+        model_id="worker",
+        tool_calls_used=40,
+        tool_calls_limit=40,
+    )
+    task = Task(
+        id=task_id,
+        owner_id=uuid.uuid4(),
+        instruction="Research",
+        status="running",
+        pending_tool_approval=None,
+    )
+    job = Job(
+        id=job_id,
+        task_id=task_id,
+        status="leased",
+        lease_owner="test-worker",
+        lease_expires_at=datetime.now(timezone.utc),
+    )
+
+    class FakeSession:
+        def __init__(self):
+            self.scalar_values = [task, 4, subtask]
+            self.added = []
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def scalar(self, _statement):
+            return self.scalar_values.pop(0)
+
+        async def get(self, model, _identity):
+            return job if model is Job else None
+
+        def add(self, value):
+            self.added.append(value)
+
+        async def commit(self):
+            return None
+
+    async def assert_lease(*_args):
+        return None
+
+    session = FakeSession()
+    monkeypatch.setattr(
+        orchestrator_module, "SessionFactory", lambda: session
+    )
+    monkeypatch.setattr(
+        orchestrator_module, "_assert_lease_in_session", assert_lease
+    )
+    partial_result = {
+        "status": "partial",
+        "summary": "Collected evidence before the limit.",
+        "quality_review": [
+            {
+                "item_id": "sources",
+                "description": "Support each claim",
+                "required": True,
+                "passed": False,
+                "deficiency": "More sources are needed.",
+                "requires_additional_tool_calls": True,
+            }
+        ],
+    }
+
+    requested = await orchestrator_module._pause_for_tool_budget_approval(
+        task_id=task_id,
+        job_id=job_id,
+        lease_owner="test-worker",
+        row=subtask,
+        plan_version=2,
+        conversation_sequence=4,
+        subtask_result=partial_result,
+        review_results=partial_result["quality_review"],
+        reviewer_model_id="manager",
+        additional_calls=20,
+    )
+
+    assert requested
+    assert task.status == "waiting_approval"
+    assert task.pending_tool_approval["additional_calls"] == 20
+    assert task.pending_tool_approval["subtask_id"] == str(subtask.id)
+    assert subtask.status == "waiting_approval"
+    assert subtask.result == partial_result
+    assert job.status == "completed"
+    assert any(
+        isinstance(item, Event)
+        and item.type == "task.tool_budget_approval_requested"
+        for item in session.added
+    )
+
+
+def test_workspace_paths_reject_symlinks(monkeypatch, tmp_path):
+    task_id = uuid.uuid4()
+    monkeypatch.setattr(
+        workspaces,
+        "get_settings",
+        lambda: SimpleNamespace(workspace_root=str(tmp_path / "workspaces")),
+    )
+    root = workspaces.task_workspace(task_id, create=True)
+    outside = tmp_path / "outside.txt"
+    outside.write_text("secret")
+    (root / "escape").symlink_to(outside)
+
+    with pytest.raises(workspaces.InvalidWorkspacePath):
+        workspaces.resolve_workspace_file(task_id, "escape")
+
+
+@pytest.mark.asyncio
+async def test_workspace_stream_write_is_atomic_and_task_scoped(
+    monkeypatch, tmp_path
+):
+    task_id = uuid.uuid4()
+    monkeypatch.setattr(
+        workspaces,
+        "get_settings",
+        lambda: SimpleNamespace(workspace_root=str(tmp_path / "workspaces")),
+    )
+
+    async def chunks():
+        yield b"first "
+        yield b"file"
+
+    size = await workspaces.write_workspace_stream(
+        task_id, "inputs/brief.txt", chunks()
+    )
+
+    assert size == 10
+    assert workspaces.resolve_workspace_file(
+        task_id, "inputs/brief.txt"
+    ).read_bytes() == b"first file"
+    assert not (tmp_path / "workspaces" / "brief.txt").exists()
 
 
 def test_admin_quality_revision_limits_are_bounded():
@@ -625,6 +944,69 @@ def test_deterministic_checklist_modes_override_model_review():
     assert all(result["passed"] for result in results)
 
 
+def test_requested_file_presence_and_content_are_checked():
+    checklist = [
+        ChecklistItem(
+            id="file",
+            description="Generate the requested file",
+            verification_mode="artifact_present",
+        ),
+        ChecklistItem(
+            id="citation",
+            description="Cite an attached source in the file",
+            verification_mode="markdown_citation",
+        ),
+    ]
+    source_url = "https://example.org/source"
+    review = ChecklistReviewResult(results=[])
+    generated = {
+        "answer": "Created the requested file.",
+        "artifacts": [
+            {
+                "filename": "research.md",
+                "content": f"# Findings\n\n[Source]({source_url})",
+            }
+        ],
+        "sources": [{"url": source_url}],
+    }
+
+    results = normalize_checklist_results(checklist, review, generated)
+    missing_results = normalize_checklist_results(
+        checklist,
+        review,
+        {"answer": "I cannot attach files.", "artifacts": [], "sources": []},
+    )
+
+    assert required_checklist_items_passed(results)
+    assert not required_checklist_items_passed(missing_results)
+
+
+def test_missing_required_sources_requests_additional_tool_calls():
+    results = normalize_checklist_results(
+        [
+            ChecklistItem(
+                id="source",
+                description="Cite a source",
+                verification_mode="source_present",
+            )
+        ],
+        ChecklistReviewResult(results=[]),
+        {"answer": "An unsupported claim.", "sources": []},
+    )
+
+    assert not results[0]["passed"]
+    assert results[0]["requires_additional_tool_calls"]
+
+
+@pytest.mark.parametrize(
+    "filename",
+    ["../escape.md", "nested/file.md", "nested\\file.md", "bad\nname.md"],
+)
+def test_generated_artifact_rejects_unsafe_filenames(filename):
+    with pytest.raises(ValidationError):
+        GeneratedArtifact(filename=filename, content="Document body")
+
+
 def test_missing_review_and_unsupported_citation_fail_closed():
     checklist = [
         ChecklistItem(id="support", description="Explain the claim"),
@@ -647,6 +1029,125 @@ def test_missing_review_and_unsupported_citation_fail_closed():
     assert len(failed_required_checklist_items(results)) == 2
 
 
+def test_review_preserves_additional_tool_requirement():
+    results = normalize_checklist_results(
+        [ChecklistItem(id="source", description="Find source")],
+        ChecklistReviewResult(
+            results=[
+                ChecklistItemResult(
+                    item_id="source",
+                    passed=False,
+                    evidence="",
+                    deficiency="No source supports this claim.",
+                    requires_additional_tool_calls=True,
+                )
+            ]
+        ),
+        {"answer": "A claim without source."},
+    )
+
+    assert results[0]["requires_additional_tool_calls"] is True
+
+
+@pytest.mark.asyncio
+async def test_partial_review_requests_approval_for_more_research(monkeypatch):
+    import app.orchestrator as orchestrator_module
+
+    row = SimpleNamespace(
+        id=uuid.uuid4(),
+        task_id=uuid.uuid4(),
+        title="Research sources",
+        status="running",
+        plan_version=1,
+        tool_calls_used=20,
+        tool_calls_limit=20,
+        quality_revision_count=0,
+        acceptance_checklist=[
+            {
+                "id": "sources",
+                "description": "Support the claims with sources",
+                "required": True,
+                "verification_mode": "model",
+            }
+        ],
+        artifact_goal="Provide source-backed facts",
+    )
+    requested = []
+
+    async def save_result(*_args, **_kwargs):
+        return None
+
+    async def review(*_args, **_kwargs):
+        return [
+            {
+                "item_id": "sources",
+                "description": "Support the claims with sources",
+                "required": True,
+                "passed": False,
+                "evidence": "Current sources do not cover one claim.",
+                "deficiency": "A primary source is needed.",
+                "requires_additional_tool_calls": True,
+            }
+        ]
+
+    async def pause_for_approval(**kwargs):
+        requested.append(kwargs)
+        return True
+
+    async def quality_revision_count(_task_id):
+        return 0
+
+    monkeypatch.setattr(
+        orchestrator_module, "_save_subtask_result", save_result
+    )
+    monkeypatch.setattr(orchestrator_module, "_review_checklist", review)
+    monkeypatch.setattr(
+        orchestrator_module,
+        "_quality_revision_count",
+        quality_revision_count,
+    )
+    monkeypatch.setattr(
+        orchestrator_module,
+        "_pause_for_tool_budget_approval",
+        pause_for_approval,
+    )
+    config = {
+        "manager_model": "manager",
+        "max_agent_attempts": 2,
+        "max_tool_calls_per_subtask": 40,
+        "max_quality_revisions_per_subtask": 2,
+        "max_quality_revisions_per_task": 10,
+    }
+
+    review_outcome = await orchestrator_module._review_subtask_result(
+        row,
+        SubtaskResult(
+            status="partial",
+            summary="Partial research",
+            findings=["One supported claim."],
+            sources=[],
+            tool_runs=[],
+            questions=[],
+            error="tool_call_limit_exceeded",
+        ),
+        SimpleNamespace(summary="Research claims"),
+        {},
+        [],
+        row.task_id,
+        uuid.uuid4(),
+        "test-worker",
+        1,
+        config,
+        3,
+    )
+    result, status, questions = review_outcome
+
+    assert status == "waiting_approval"
+    assert questions == []
+    assert result["quality_review"][0]["requires_additional_tool_calls"]
+    assert requested[0]["additional_calls"] == 40
+
+
 def test_subtask_result_requires_questions_for_user_input():
     result = SubtaskResult(
         status="needs_input",
@@ -658,6 +1159,20 @@ def test_subtask_result_requires_questions_for_user_input():
         error="",
     )
     assert result.questions == ["Which audience should I focus on?"]
+
+
+def test_subtask_result_accepts_tool_budget_limited_partial_output():
+    result = SubtaskResult(
+        status="partial",
+        summary="Search budget exhausted after collecting evidence.",
+        findings=["A supported finding."],
+        sources=[],
+        tool_runs=[],
+        questions=[],
+        error="tool_call_limit_exceeded",
+    )
+
+    assert result.status == "partial"
     with pytest.raises(ValidationError, match="requires a question"):
         SubtaskResult(
             status="needs_input",
@@ -762,7 +1277,13 @@ async def test_user_questions_pause_task_and_are_saved_as_assistant_message(
 
 
 @pytest.mark.asyncio
-async def test_finish_task_records_partial_outcome_without_error(monkeypatch):
+@pytest.mark.parametrize(
+    ("token_available", "artifact_requested"),
+    [(True, True), (False, True), (True, False)],
+)
+async def test_finish_task_persists_requested_artifact(
+    monkeypatch, token_available, artifact_requested
+):
     import app.orchestrator as orchestrator_module
 
     task_id = uuid.uuid4()
@@ -807,7 +1328,27 @@ async def test_finish_task_records_partial_outcome_without_error(monkeypatch):
         async def commit(self):
             return None
 
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+
+    class FakeClient:
+        def __init__(self, timeout):
+            self.timeout = timeout
+            self.requests = []
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def put(self, url, **kwargs):
+            self.requests.append((url, kwargs))
+            return FakeResponse()
+
     session = FakeSession()
+    client = FakeClient(timeout=10.0)
 
     async def assert_lease(*_args):
         return None
@@ -816,23 +1357,75 @@ async def test_finish_task_records_partial_outcome_without_error(monkeypatch):
     monkeypatch.setattr(
         orchestrator_module, "_assert_lease_in_session", assert_lease
     )
+    monkeypatch.setattr(
+        orchestrator_module,
+        "get_settings",
+        lambda: SimpleNamespace(
+            workspace_internal_token=(
+                SimpleNamespace(
+                    get_secret_value=lambda: "test-workspace-token"
+                )
+                if token_available
+                else None
+            ),
+            api_internal_base_url="http://api:8000",
+        ),
+    )
+    monkeypatch.setattr(
+        orchestrator_module.httpx,
+        "AsyncClient",
+        lambda timeout: client,
+    )
     report = {
         "plan_version": 1,
         "unmet_items": [{"item_id": "sources", "description": "Cite sources"}],
     }
 
-    await orchestrator_module._finish_task(
+    finish = orchestrator_module._finish_task(
         task_id,
         job_id,
         "worker-test",
-        IntegratedAnswer(answer="Partial answer", caveats=[]),
+        IntegratedAnswer(
+            answer="Partial answer",
+            caveats=[],
+            artifacts=(
+                [
+                    GeneratedArtifact(
+                        filename="research.md",
+                        content=(
+                            "# Findings\n\n"
+                            "The requested source-backed content."
+                        ),
+                    )
+                ]
+                if artifact_requested
+                else []
+            ),
+        ),
         2,
         fully_completed=False,
         completion_report=report,
     )
+    if artifact_requested and not token_available:
+        with pytest.raises(
+            RuntimeError, match="^workspace_artifact_persistence_unavailable$"
+        ):
+            await finish
+        assert task.status == "running"
+        assert session.added == []
+        assert client.requests == []
+        return
+
+    await finish
 
     assert task.status == "partially_completed"
-    assert task.result == "Partial answer"
+    expected_paths = (
+        ["artifacts/research.md"] if artifact_requested else []
+    )
+    expected_answer = "Partial answer"
+    if artifact_requested:
+        expected_answer += "\n\nSaved files: `artifacts/research.md`"
+    assert task.result == expected_answer
     assert task.error is None
     assert task.completion_report == report
     assert job.status == "completed"
@@ -840,6 +1433,23 @@ async def test_finish_task_records_partial_outcome_without_error(monkeypatch):
         isinstance(item, Event) and item.type == "task.partially_completed"
         for item in session.added
     )
+    completion_event = next(
+        item
+        for item in session.added
+        if isinstance(item, Event)
+        and item.type == "task.partially_completed"
+    )
+    assert completion_event.payload_json["artifact_paths"] == expected_paths
+    assert len(client.requests) == len(expected_paths)
+    if artifact_requested:
+        assert client.requests[0][0].endswith(
+            "/workspace/internal/artifacts/research.md"
+        )
+        assert client.requests[0][1]["content"] == (
+            "# Findings\n\nThe requested source-backed content.".encode(
+                "utf-8"
+            )
+        )
     assert not any(
         isinstance(item, Event) and item.type == "task.failed"
         for item in session.added
@@ -894,6 +1504,11 @@ async def test_subtask_receives_conversation_history(monkeypatch):
 
     result = await orchestrator_module._execute_subtask(
         SimpleNamespace(
+            id=uuid.uuid4(),
+            task_id=uuid.uuid4(),
+            plan_version=1,
+            tool_calls_used=0,
+            tool_calls_limit=20,
             title="Clarify profile",
             instruction="Proceed",
             artifact_goal=(
@@ -935,6 +1550,71 @@ async def test_subtask_receives_conversation_history(monkeypatch):
     assert "do not ask again" in captured["system_prompt"]
     assert "tavily_web_search" in captured["system_prompt"]
     assert "Do not use tools" not in captured["system_prompt"]
+
+
+@pytest.mark.asyncio
+async def test_tool_budget_limit_finalizes_partial_subtask(monkeypatch):
+    import app.orchestrator as orchestrator_module
+
+    row = SimpleNamespace(
+        id=uuid.uuid4(),
+        task_id=uuid.uuid4(),
+        plan_version=1,
+        tool_calls_used=19,
+        tool_calls_limit=20,
+        title="Research sources",
+        instruction="Find source-backed facts",
+        artifact_goal="Provide supported findings",
+        acceptance_checklist=[],
+        dependencies=[],
+        model_id="test-worker",
+    )
+    calls = []
+
+    async def assert_lease(*_args):
+        return None
+
+    async def generate(**options):
+        calls.append(options)
+        if len(calls) == 1:
+            options["on_tool_result"](
+                "tavily_web_search",
+                '{"query":"specific source"}',
+                {"error": "tool_call_limit_exceeded"},
+            )
+            raise AgentExecutionError("agent_turn_limit_exceeded")
+        assert options.get("tool_registry") is None
+        assert options["max_tool_calls"] == 0
+        return SubtaskResult(
+            status="partial",
+            summary="Partial evidence collected before the tool limit.",
+            findings=["One supported finding."],
+            sources=[],
+            tool_runs=[],
+            questions=[],
+            error="tool_call_limit_exceeded",
+        )
+
+    monkeypatch.setattr(
+        orchestrator_module, "_assert_lease", assert_lease
+    )
+    monkeypatch.setattr(orchestrator_module.model_client, "generate", generate)
+
+    result = await orchestrator_module._execute_subtask(
+        row,
+        SimpleNamespace(summary="Research plan"),
+        {},
+        [],
+        uuid.uuid4(),
+        "test-worker",
+        2,
+        config={"max_agent_turns": 24, "max_tool_calls_per_subtask": 20},
+    )
+
+    assert result.status == "partial"
+    assert row.tool_calls_used == 20
+    assert result.tool_runs[0].error_code == "tool_call_limit_exceeded"
+    assert len(calls) == 2
 
 
 @pytest.mark.asyncio
@@ -996,7 +1676,8 @@ async def test_subtask_progress_events_are_tagged(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_user_reply_requeues_task_waiting_for_attention():
+@pytest.mark.parametrize("initial_status", ["needs_attention", "failed"])
+async def test_user_reply_requeues_recoverable_task(initial_status):
     task_id = uuid.uuid4()
     user = User(
         id=uuid.uuid4(),
@@ -1010,9 +1691,10 @@ async def test_user_reply_requeues_task_waiting_for_attention():
         id=task_id,
         owner_id=user.id,
         instruction="Research options",
-        status="needs_attention",
+        status=initial_status,
         result="stale result",
         error={"code": "needs_input"},
+        completion_report={"unmet_items": []},
     )
 
     class FakeSession:
@@ -1046,6 +1728,7 @@ async def test_user_reply_requeues_task_waiting_for_attention():
     assert task.status == "queued"
     assert task.result is None
     assert task.error is None
+    assert task.completion_report is None
     assert any(
         isinstance(item, Job) and item.status == "pending"
         for item in session.added
@@ -1114,6 +1797,149 @@ async def test_partial_task_reply_clears_report_and_requeues():
         isinstance(item, Job) and item.status == "pending"
         for item in session.added
     )
+
+
+@pytest.mark.asyncio
+async def test_failed_task_file_upload_requeues_task(monkeypatch, tmp_path):
+    task_id = uuid.uuid4()
+    user = User(
+        id=uuid.uuid4(),
+        email="person@example.com",
+        password_hash="hash",
+        role="user",
+        is_active=True,
+        must_change_password=False,
+    )
+    task = Task(
+        id=task_id,
+        owner_id=user.id,
+        instruction="Research options",
+        status="failed",
+        result="stale result",
+        error={"code": "provider_unavailable"},
+    )
+
+    class FakeSession:
+        def __init__(self):
+            self.scalar_values = [task, None, 0]
+            self.added = []
+
+        async def scalar(self, _statement):
+            return self.scalar_values.pop(0)
+
+        def add(self, value):
+            self.added.append(value)
+
+        async def flush(self):
+            return None
+
+        async def commit(self):
+            return None
+
+        async def refresh(self, _value):
+            return None
+
+    async def write_workspace_stream(_task_id, _path, _stream):
+        return 3
+
+    monkeypatch.setattr(
+        "app.routers.tasks.resolve_workspace_file",
+        lambda *_args, **_kwargs: tmp_path / "brief.txt",
+    )
+    monkeypatch.setattr(
+        "app.routers.tasks.write_workspace_stream", write_workspace_stream
+    )
+    request = Request(
+        {"type": "http", "method": "POST", "path": "/", "headers": []}
+    )
+    session = FakeSession()
+
+    await upload_task_file(task_id, request, "brief.txt", user, session)
+
+    assert task.status == "queued"
+    assert task.result is None
+    assert task.error is None
+    assert any(
+        isinstance(item, Job) and item.status == "pending"
+        for item in session.added
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("initial_status", ["cancelled", "waiting_approval"])
+async def test_terminal_or_approval_task_rejects_follow_up_message(
+    initial_status,
+):
+    task = Task(
+        id=uuid.uuid4(),
+        owner_id=uuid.uuid4(),
+        instruction="Research options",
+        status=initial_status,
+        pending_tool_approval=(
+            {"request_id": str(uuid.uuid4())}
+            if initial_status == "waiting_approval"
+            else None
+        ),
+    )
+    user = User(
+        id=task.owner_id,
+        email="person@example.com",
+        password_hash="hash",
+        role="user",
+        is_active=True,
+        must_change_password=False,
+    )
+
+    class FakeSession:
+        async def scalar(self, _statement):
+            return task
+
+    with pytest.raises(HTTPException) as error:
+        await add_message(
+            task.id,
+            MessageCreate(content="Continue this task."),
+            user,
+            FakeSession(),
+        )
+
+    assert error.value.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_tool_budget_approval_cannot_be_bypassed_by_file_upload():
+    task = Task(
+        id=uuid.uuid4(),
+        owner_id=uuid.uuid4(),
+        instruction="Research options",
+        status="waiting_approval",
+        pending_tool_approval={"request_id": str(uuid.uuid4())},
+    )
+    user = User(
+        id=task.owner_id,
+        email="person@example.com",
+        password_hash="hash",
+        role="user",
+        is_active=True,
+        must_change_password=False,
+    )
+
+    class FakeSession:
+        async def scalar(self, _statement):
+            return task
+
+    async def receive():
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    request = Request(
+        {"type": "http", "method": "POST", "path": "/", "headers": []},
+        receive,
+    )
+    with pytest.raises(HTTPException) as error:
+        await upload_task_file(
+            task.id, request, "extra.md", user, FakeSession()
+        )
+
+    assert error.value.status_code == 409
 
 
 def test_passwords_are_hashed_and_verifiable():
