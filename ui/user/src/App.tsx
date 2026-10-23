@@ -1,7 +1,7 @@
 import { Fragment, Suspense, lazy, useEffect, useRef, useState, type FormEvent } from 'react'
 import { Tree, type NodeRendererProps } from 'react-arborist'
 import {
-  Activity, ArrowUpRight, Ban, Check, ChevronDown, Clock3, Command,
+  Activity, ArrowUpRight, Ban, Check, ChevronDown, Command,
   Copy, Download, FileText, Folder, FolderOpen, KeyRound, LoaderCircle,
   LogOut, MessageSquareText, Plus, Save, Send, Sparkles, Trash2, Upload, X,
 } from 'lucide-react'
@@ -222,9 +222,6 @@ function App() {
     const nextUser = await api<User>('/auth/me'); setUser(nextUser); await refreshTasks()
   }} />
 
-  const counts = tasks.reduce<Record<string, number>>((acc, task) => {
-    acc[task.status] = (acc[task.status] ?? 0) + 1; return acc
-  }, {})
   const latestUserMessageSequence = messages.filter((message) => message.role === 'user').at(-1)?.sequence
   const renderProgress = (conversationSequence: number) => {
     const items = progress.filter((item) => item.conversationSequence === conversationSequence)
@@ -242,8 +239,12 @@ function App() {
     <aside className="rail">
       <a className="brand" href="/" aria-label="Relay home"><span className="brand-mark"><Command size={17} /></span><span>relay<span className="brand-dot">.</span></span></a>
       <div className="rail-label">WORKSPACE</div>
-      <button className="nav-item nav-active"><Activity size={17} /> Your tasks <span className="nav-count">{tasks.length}</span></button>
-      <button className="nav-item" onClick={() => setShowCreate(true)}><Plus size={17} /> New task</button>
+      <button className="rail-new-task" onClick={() => setShowCreate(true)}><Plus size={17} /> New task</button>
+      <nav className="rail-task-list" aria-label="Tasks">
+        {tasks.length === 0 ? <p className="rail-empty">No tasks yet</p> : tasks.map((task) => <button key={task.id} className={`rail-task-row ${active?.id === task.id ? 'selected' : ''}`} title={task.instruction} onClick={() => setActive(task)}>
+          <span className={`status-dot status-${task.status}`} /><span className="rail-task-copy"><strong>{task.instruction}</strong><span className="rail-task-meta"><small>{new Date(task.updated_at).toLocaleString('ja-JP', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}</small><span className={`status-pill pill-${task.status}`}>{statusLabel[task.status] ?? task.status}</span></span></span>
+        </button>)}
+      </nav>
       <div className="rail-bottom">
         <button className="nav-item" onClick={() => setShowAccount(true)}><KeyRound size={17} /> Account & API key</button>
         <div className="account-row"><div className="avatar">{user.email[0]?.toUpperCase()}</div><div className="account-copy"><strong>{user.email.split('@')[0]}</strong><span>{user.email}</span></div><button className="icon-btn" title="Sign out" onClick={logout}><LogOut size={16} /></button></div>
@@ -254,17 +255,6 @@ function App() {
       <header className="topbar"><div className="crumb">Workspace <span>/</span> Tasks <ChevronDown size={14} /></div><div className={`live-label ${apiConnected === false ? 'is-offline' : ''}`}><i />{apiConnected === null ? 'Connecting' : apiConnected ? 'System ready' : 'API unavailable'}</div></header>
       {error && <div className="toast-error" role="alert"><span>{error}</span><button onClick={() => setError('')}><X size={15} /></button></div>}
       <div className="workspace-grid">
-        <section className="task-pane">
-          <div className="page-heading"><div><div className="eyebrow">PERSONAL WORKSPACE</div><h1>Your tasks</h1><p>Keep every thread of work moving.</p></div><button className="primary-btn" onClick={() => setShowCreate(true)}><Plus size={17} /> New task</button></div>
-          <div className="stats-strip"><div><span className="stat-number">{tasks.length.toString().padStart(2, '0')}</span><span className="stat-caption">TOTAL TASKS</span></div><div><span className="stat-number">{(counts.running ?? 0) + (counts.planning ?? 0)}</span><span className="stat-caption">IN PROGRESS</span></div><div><span className="stat-number">{counts.succeeded ?? 0}</span><span className="stat-caption">COMPLETED</span></div></div>
-          <div className="section-heading"><h2>Recent work</h2><span>{tasks.length} items</span></div>
-          <div className="task-list">
-            {tasks.length === 0 ? <div className="empty-state"><div className="empty-icon"><Sparkles size={22} /></div><h3>A clear desk.</h3><p>Start with a question, a piece of research, or a task you want to move forward.</p><button className="text-btn" onClick={() => setShowCreate(true)}>Create your first task <ArrowUpRight size={15} /></button></div> : tasks.map((task) => <button key={task.id} className={`task-row ${active?.id === task.id ? 'selected' : ''}`} onClick={() => setActive(task)}>
-              <span className={`status-dot status-${task.status}`} /><span className="task-row-copy"><strong>{task.instruction}</strong><small><Clock3 size={12} /> {new Date(task.updated_at).toLocaleString('ja-JP', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}</small></span><span className={`status-pill pill-${task.status}`}>{statusLabel[task.status] ?? task.status}</span><ArrowUpRight className="row-arrow" size={16} />
-            </button>)}
-          </div>
-        </section>
-
         <aside className="detail-pane">
           {active ? <>
             <div className="detail-top"><div><div className="eyebrow">TASK THREAD</div><div className={`status-pill pill-${active.status}`}>{statusLabel[active.status] ?? active.status}</div></div><div className="detail-actions">{['queued', 'planning', 'running', 'waiting_approval', 'needs_attention'].includes(active.status) ? <button className="icon-btn" title="Cancel task" disabled={busy} onClick={cancelTask}><Ban size={16} /></button> : ['succeeded', 'partially_completed', 'failed', 'cancelled'].includes(active.status) ? <button className="icon-btn" title="Delete task" disabled={busy} onClick={deleteTask}><Trash2 size={16} /></button> : null}<button className="icon-btn" title="Close task" onClick={() => setActive(null)}><X size={17} /></button></div></div>
