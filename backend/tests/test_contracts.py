@@ -1893,7 +1893,7 @@ async def test_subtask_receives_conversation_history(monkeypatch):
                     {
                         "title": "Verified source",
                         "url": "https://example.org/source",
-                        "content": "Supporting excerpt",
+                        "content": "S" * 10_000,
                         "score": 0.8,
                         "published_date": "2026-10-01",
                     }
@@ -1911,6 +1911,11 @@ async def test_subtask_receives_conversation_history(monkeypatch):
         )
 
     monkeypatch.setattr(orchestrator_module, "_assert_lease", assert_lease)
+    monkeypatch.setattr(
+        orchestrator_module,
+        "load_tavily_search_skill",
+        lambda: "Skill-specific CLI search instructions.",
+    )
     monkeypatch.setattr(orchestrator_module.model_client, "generate", generate)
 
     result = await orchestrator_module._execute_subtask(
@@ -1956,10 +1961,14 @@ async def test_subtask_receives_conversation_history(monkeypatch):
     assert result.sources[0].provider == "tavily"
     assert result.sources[0].url == "https://example.org/source"
     assert result.sources[0].score == 0.8
+    assert len(result.sources[0].content) == 10_000
     assert result.tool_runs[0].request_summary == "public query"
     assert result.tool_runs[0].source_count == 1
     assert "do not ask again" in captured["system_prompt"]
     assert "tavily_web_search" in captured["system_prompt"]
+    assert "Skill-specific CLI search instructions." in captured[
+        "system_prompt"
+    ]
     assert "Do not use tools" not in captured["system_prompt"]
 
 
@@ -2008,6 +2017,11 @@ async def test_tool_budget_limit_finalizes_partial_subtask(monkeypatch):
 
     monkeypatch.setattr(
         orchestrator_module, "_assert_lease", assert_lease
+    )
+    monkeypatch.setattr(
+        orchestrator_module,
+        "load_tavily_search_skill",
+        lambda: "Skill-specific CLI search instructions.",
     )
     monkeypatch.setattr(orchestrator_module.model_client, "generate", generate)
 
@@ -2784,7 +2798,9 @@ async def test_tool_registry_blocks_non_read_only_tools():
 
 
 @pytest.mark.asyncio
-async def test_tavily_search_uses_worker_key_and_filters_results(monkeypatch):
+async def test_tavily_search_uses_worker_key_and_filters_cli_results(
+    monkeypatch,
+):
     import json
 
     import app.tools as tools_module
@@ -2794,7 +2810,7 @@ async def test_tavily_search_uses_worker_key_and_filters_results(monkeypatch):
             {
                 "title": "Useful result",
                 "url": "https://example.org/article",
-                "content": "A verified-length excerpt.",
+                "content": "x" * 10_500,
                 "score": 0.9,
                 "published_date": "2026-10-12",
             },
@@ -2808,38 +2824,35 @@ async def test_tavily_search_uses_worker_key_and_filters_results(monkeypatch):
     }
     request_values = {}
 
-    class FakeResponse:
-        status_code = 200
-        headers = {}
+    class FakeProcess:
+        returncode = 0
 
-        async def __aenter__(self):
-            return self
+        async def communicate(self, input=None):
+            request_values["input"] = input
+            return json.dumps(payload).encode(), None
 
-        async def __aexit__(self, *_args):
-            return None
+        async def wait(self):
+            return self.returncode
 
-        async def aiter_bytes(self):
-            yield json.dumps(payload).encode()
+        def kill(self):
+            self.returncode = -9
 
-    class FakeClient:
-        def __init__(self, **kwargs):
-            request_values["timeout"] = kwargs["timeout"]
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *_args):
-            return None
-
-        def stream(self, method, url, **kwargs):
-            request_values.update({"method": method, "url": url, **kwargs})
-            return FakeResponse()
+    async def create_subprocess_exec(*command, **kwargs):
+        request_values["command"] = command
+        request_values.update(kwargs)
+        return FakeProcess()
 
     class NoopLimiter:
         async def acquire(self):
             return None
 
-    monkeypatch.setattr(tools_module.httpx, "AsyncClient", FakeClient)
+    monkeypatch.setattr(
+        tools_module.asyncio,
+        "create_subprocess_exec",
+        create_subprocess_exec,
+    )
+    monkeypatch.setenv("TAVILY_API_KEY", "stale-key")
+    monkeypatch.setenv("OPENAI_API_KEY", "must-not-be-forwarded")
     monkeypatch.setattr(
         tools_module, "read_tavily_api_key", lambda: "worker-secret"
     )
@@ -2858,11 +2871,91 @@ async def test_tavily_search_uses_worker_key_and_filters_results(monkeypatch):
         TavilySearchArguments(query="  current news  ", max_results=2)
     )
 
-    assert request_values["url"] == "https://api.tavily.com/search"
-    assert request_values["headers"]["Authorization"] == (
-        "Bearer worker-secret"
+    assert request_values["command"] == (
+        "tvly",
+        "search",
+        "-",
+        "--max-results",
+        "2",
+        "--json",
     )
-    assert request_values["json"]["query"] == "current news"
-    assert request_values["json"]["include_answer"] is False
+    assert request_values["input"] == b"current news"
+    assert request_values["env"]["TAVILY_API_KEY"] == "worker-secret"
+    assert "OPENAI_API_KEY" not in request_values["env"]
+    assert request_values["stderr"] == tools_module.asyncio.subprocess.DEVNULL
+    assert tool.max_response_bytes == 1_024_000
     assert len(result["results"]) == 1
     assert result["results"][0]["url"] == "https://example.org/article"
+    assert len(result["results"][0]["content"]) == 10_000
+
+
+def test_tavily_search_skill_loader_strips_frontmatter(tmp_path, monkeypatch):
+    import app.tools as tools_module
+
+    skill_file = tmp_path / "SKILL.md"
+    skill_file.write_text(
+        "---\nname: tavily-search\nallowed-tools: Bash(tvly *)\n---\n"
+        "# Search\nUse the CLI for concise web searches.\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        tools_module,
+        "get_settings",
+        lambda: SimpleNamespace(tavily_search_skill_path=str(skill_file)),
+    )
+
+    instructions = tools_module.load_tavily_search_skill()
+
+    assert instructions == "# Search\nUse the CLI for concise web searches."
+    assert "allowed-tools" not in instructions
+
+
+@pytest.mark.asyncio
+async def test_tavily_cli_timeout_stops_child_process(monkeypatch):
+    import asyncio
+
+    import app.tools as tools_module
+
+    class FakeProcess:
+        returncode = None
+        killed = False
+
+        async def communicate(self, input=None):
+            raise asyncio.TimeoutError
+
+        def kill(self):
+            self.killed = True
+            self.returncode = -9
+
+        async def wait(self):
+            return self.returncode
+
+    process = FakeProcess()
+
+    async def create_subprocess_exec(*_command, **_kwargs):
+        return process
+
+    monkeypatch.setattr(
+        tools_module.asyncio,
+        "create_subprocess_exec",
+        create_subprocess_exec,
+    )
+    monkeypatch.setattr(
+        tools_module, "read_tavily_api_key", lambda: "worker-secret"
+    )
+    monkeypatch.setattr(
+        tools_module,
+        "get_settings",
+        lambda: SimpleNamespace(
+            tavily_timeout_seconds=1,
+            max_agent_attempts=1,
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="^tavily_timeout$"):
+        await tools_module.TavilySearchTool()._search(
+            TavilySearchArguments(query="current news", max_results=1)
+        )
+
+    assert process.killed
+    assert process.returncode == -9

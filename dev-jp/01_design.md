@@ -12,7 +12,7 @@
 |---|---|---|
 | 実行基盤 | PostgreSQL、FastAPI、独立API／Worker、PostgreSQLジョブ行のロックと期限付きリース | Worker間のタスク実行リース、fencing token、共有同時実行枠・RPM／TPM制御、複数Worker運用保証 |
 | エージェント実行方式 | OpenAI Agents SDKのAgent／Runnerを共通実行アダプター経由で利用。タスク制御・永続化は独自オーケストレーターに維持 | Handoffs、動的なAgent.as_tool()委譲、Session自動保存、承認用RunStateの永続化 |
-| エージェント | 初回指示の目的を表すタスクタイトルを含む構造化計画、成果物目標・チェックリストによる個別受け入れと最終成果物判定、設定上限付き品質修正、準完了状態、依存関係に沿った読み取り専用サブタスクの並行実行、Tavily検索Function Calling、入力テキスト添付の計画入力、要求ファイルの構造化出力・Workspace保存、ツール予算超過時の部分成果レビューと追加予算承認、最大3回の設定可能な試行 | ファイル／シェル操作ツール、任意形式添付の解析、副作用操作の承認、タスクSandbox内でのエージェント実行 |
+| エージェント | 初回指示の目的を表すタスクタイトルを含む構造化計画、成果物目標・チェックリストによる個別受け入れと最終成果物判定、設定上限付き品質修正、準完了状態、依存関係に沿った読み取り専用サブタスクの並行実行、Tavily公式Agent Skillを指示へ組み込んだTavily CLI検索、入力テキスト添付の計画入力、要求ファイルの構造化出力・Workspace保存、ツール予算超過時の部分成果レビューと追加予算承認、最大3回の設定可能な試行 | ファイル／シェル操作ツール、任意形式添付の解析、副作用操作の承認、タスクSandbox内でのエージェント実行 |
 | 拡張 | TaskFileメタデータ、タスクUUID別永続Workspace、所有者スコープのファイルAPI、削除アウトボックスと再試行ワーカー | Workerから分離したタスクSandbox、ターミナル、Git cloneと認証ブローカー、動的プライベートスキル、RAGアダプター、コンテキスト要約 |
 | 認証・管理 | WebセッションとCSRF、ユーザー別Bearerアクセスキー、管理者によるアカウント・モデル・品質修正上限・Vaultキー管理 | より細かな権限・監査、利用量／コスト集計 |
 | UI・イベント | User UIの目的表現タスクタイトル表示、タスク別Explorer（空ディレクトリを含む一覧、空状態の表示、アップロード、テキスト編集、ダウンロード、削除）、追加ツール予算の承認／拒否、Admin UI、品質判定の進捗・準完了表示、DBイベントのSSE配信とLast-Event-ID以降の再送 | タスクごとの隔離Terminal、Git認証UI、副作用操作の承認／解決UI |
@@ -44,11 +44,11 @@
 - バックエンドはPython（非同期実行、プライベートPythonスキルのロードとの親和性）、HTTP APIはFastAPIを採用する。フロントエンドはTypeScriptベースとし、管理者ダッシュボードと一般ユーザー用タスクUIを別々のコンテナとして配信する。
 - 現行実装は管理エージェント／サブエージェントの実行にOpenAI Agents SDKのAgent／Runnerを使用し、下位のAPI接続には公式OpenAI Python SDKを用いる。SDK固有処理は共通実行アダプター内に閉じ込め、タスク状態、依存関係、品質修正予算、永続化・再開は独自オーケストレーターで制御する。SDKのメモリーやサーバー側会話を状態正本とせず、PostgreSQLを唯一の正本として保つ。初期導入済みの範囲と将来拡張は4.5節に定める。
 - モデル名は設定値とする。GPT-6系の名称は要求上の例であり、利用可能な実モデルID・API機能を実行環境で確認して設定する。特定のモデル名や機能をコードに固定しない。
-- 非公開ナレッジ向けVector DB／RAG検索は将来拡張であり、現行実装には含まれない。一般Web検索はWorkerからTavilyアダプターを通じて実行する読み取り専用ツールとして実装し、RAGとは別の経路で扱う。
+- 非公開ナレッジ向けVector DB／RAG検索は将来拡張であり、現行実装には含まれない。一般Web検索はWorkerにインストールしたTavily CLIと公式`tavily-ai/skills`の`tavily-search` Agent Skillを用いる読み取り専用ツールとして実行し、RAGとは別の経路で扱う。アプリケーションからTavily HTTPエンドポイントを直接呼び出さない。
 - ネットワークから切断中に新たなモデル応答を生成することはできない。現行実装はジョブリース失効後の再取得を行うが、途中計画からの復元ではなく、会話を再読込してタスク処理を再試行する。
 
 ## 3. システム構成
-以下の図は将来の目標構成を含む。現行コードにはAPI、Worker、PostgreSQL、Vault、User/Admin UI、nginxと、Worker内のAgents SDK実行アダプター・Tavily読み取り専用検索・品質判定がある。APIは名前付きボリューム上にタスクUUID別Workspaceを作成し、所有者スコープのExplorerファイルAPIを提供する。Workerは内部API経由でテキスト添付を計画入力として読み、ユーザーが要求したファイルだけをWorkspaceへ保存する。会話向け回答は会話履歴とタスク結果に保存する。削除要求は永続ジョブでWorkspace清掃後にDB cascadeする。Workerから分離されたタスク別Sandbox、Terminal、Git clone／認証、追加のツール登録、Skill Registry、RAG、Worker間共有レート制御は未実装である。
+以下の図は将来の目標構成を含む。現行コードにはAPI、Worker、PostgreSQL、Vault、User/Admin UI、nginxと、Worker内のAgents SDK実行アダプター・Tavily CLI・公式`tavily-search` Agent Skill・品質判定がある。Agent SkillsはSDKに自動認識されないため、WorkerがSkill本文をサブエージェントの指示へ読み込み、専用Function ToolからCLIを限定実行する。APIは名前付きボリューム上にタスクUUID別Workspaceを作成し、所有者スコープのExplorerファイルAPIを提供する。Workerは内部API経由でテキスト添付を計画入力として読み、ユーザーが要求したファイルだけをWorkspaceへ保存する。会話向け回答は会話履歴とタスク結果に保存する。削除要求は永続ジョブでWorkspace清掃後にDB cascadeする。Workerから分離されたタスク別Sandbox、Terminal、Git clone／認証、追加のツール登録、プライベートSkillの動的ロード、RAG、Worker間共有レート制御は未実装である。
 
 ```mermaid
 flowchart TB
@@ -73,8 +73,8 @@ flowchart TB
             OpenAIClient["モデル接続アダプター<br/>公式OpenAI Python SDK"]
             Throttling["呼び出し上限・再試行制御"]
             ToolRegistry["許可済みツールアダプター<br/>引数・権限・リース検査"]
-            TavilyAdapter["Tavily Web検索アダプター"]
-            SkillRegistry["スキルレジストリ・実行器"]
+            TavilyAdapter["Tavily CLI実行アダプター"]
+            SkillRegistry["Agent Skill読込・指示組込み"]
             RAGAdapter["RAG検索アダプター"]
             Safety["承認・サンドボックス境界"]
             Orchestrator -->|判断を依頼| Manager
@@ -100,6 +100,7 @@ flowchart TB
 
     OpenAI["OpenAI API<br/>管理者設定の共通キー"]
     Vault["HashiCorp Vault<br/>KV v2: OpenAI/Tavilyキー"]
+    TavilyCLI["Tavily CLI (tvly)"]
     Tavily["Tavily Search API"]
     Skills["Private Skills"]
     Sandbox["Sandbox service/container<br/>task_idごとの永続Workspace"]
@@ -117,7 +118,8 @@ flowchart TB
     EventStream -->|SSE| AdminUI
     EventStream -->|SSE| UserUI
     OpenAIClient --> OpenAI
-    TavilyAdapter --> Tavily
+    TavilyAdapter --> TavilyCLI
+    TavilyCLI --> Tavily
     SkillRegistry --> Skills
     Safety -->|隔離されたコマンド・ファイル操作| Sandbox
     UserUI -->|ターミナル接続| Terminal
@@ -143,8 +145,8 @@ flowchart TB
 | サブエージェント | 割り当てられたサブタスクの成果を生成・修正し、許可された読み取り専用ツールを利用する。自己申告の成功を成果の受け入れとはみなさない |
 | エージェント実行器 | 共通実行アダプターがプロンプト・入力・Pydantic出力型をSDKのAgentへ設定し、Runnerによるモデル／ツールループを実行する。タスク状態は直接確定しない |
 | OpenAIクライアント | Agents SDKからモデル接続アダプターを通じて公式OpenAI Python SDKを呼び出す。各要求直前のVaultキー取得、タイムアウト、限定再試行、必要なJSONフォールバックを維持する。共有RPM／TPM制御・利用量の永続集計は未実装 |
-| Worker | PostgreSQLの実行ジョブを `FOR UPDATE SKIP LOCKED` で取得し、期限付きリースを更新しながら計画・サブタスク実行・品質レビュー／修正・結果統合を行う。内部API経由で許可されたテキスト添付を読み、会話向け回答と要求ファイルを保存する |
-| ツール／スキル／Workspace | Tavily読み取り専用検索をWorkerに実装。TaskFile APIと永続Workspaceを実装。タスク別実行Sandbox、Terminal、Git操作、動的スキル、RAGは未実装 |
+| Worker | PostgreSQLの実行ジョブを `FOR UPDATE SKIP LOCKED` で取得し、期限付きリースを更新しながら計画・サブタスク実行・品質レビュー／修正・結果統合を行う。内部API経由で許可されたテキスト添付を読み、会話向け回答と要求ファイルを保存する。WorkerイメージにTavily CLIと公式Skill群を導入する |
+| ツール／スキル／Workspace | Workerは公式`tavily-search` Skill本文をサブエージェントの指示へ組み込み、専用Function ToolからTavily CLIの検索コマンドだけを実行する。APIはTaskFile APIと永続Workspaceを提供する。タスク別実行Sandbox、Terminal、Git操作、プライベートSkillの動的ロード、RAGは未実装 |
 | 永続化 | PostgreSQLにタスク状態、保留中のツール予算承認、TaskFileメタデータ、削除ジョブを保存し、ファイル内容はタスクUUID別Workspaceボリュームに保存する。副作用承認・要約・タスク実行リースは未実装 |
 | SSE配信 | PostgreSQLに保存済みのイベントを取得して順序付きでクライアントに配信し、Last-Event-IDによる再接続を支援 |
 
@@ -238,13 +240,13 @@ flowchart TB
 
 ### 4.3 サブエージェント
 
-現行実装ではサブタスクごとに設定済みWorkerモデルを用い、同一タスク内の独立した依存関係レベルを最大32件まで並行実行する。必要に応じてTavilyの読み取り専用Web検索を呼び出せる。出力は `SubtaskResult`（`succeeded`／`partial`／`needs_input`／`failed`、summary、findings、sources、tool_runs、questions、error）で検証する。サブタスク個別の再開、動的スキル実行、Worker間の共有レート制限はない。
+現行実装ではサブタスクごとに設定済みWorkerモデルを用い、同一タスク内の独立した依存関係レベルを最大32件まで並行実行する。必要に応じてTavily公式`tavily-search` Skillの手順に基づく読み取り専用Web検索を呼び出せる。出力は `SubtaskResult`（`succeeded`／`partial`／`needs_input`／`failed`、summary、findings、sources、tool_runs、questions、error）で検証する。サブタスク個別の再開、任意Skillの動的実行、Worker間の共有レート制限はない。OpenAI Agents SDKにAgent Skillsの自動ローダーやシェル実行器はないため、WorkerがSkill本文を指示へ明示的に組み込み、検索専用Function Toolが固定されたCLIコマンドを実行する。モデルには任意シェルを公開しない。
 
 サブタスクの構造化出力は`SubtaskResult`（`succeeded`／`partial`／`needs_input`／`failed`、summary、findings、sources、tool_runs、questions、error）で検証する。ツール予算到達時は`partial`を返し、実行済みの検索結果・記録とともに管理エージェントの受け入れ判定へ進める。成果物はこの結果を指し、独立した中間成果物ファイルやストレージはない。受け入れ可否はサブエージェントの自己申告ではなく管理エージェントのチェックリスト判定で決め、修正時は未達項目と不足内容を渡す。
 
 ### 4.4 Tool Callingと構造化データ
 
-現行Workerはサブタスク実行に限りAgents SDKのFunction Toolsを通じてTavily検索を呼び出す。ツール名と引数を登録内容・JSON Schemaで検証する。サブタスクの初期上限はタスク作成時の`config_snapshot.max_tool_calls_per_subtask`（既定20回、設定範囲0〜100）とし、失敗・中断・形式再試行・品質修正・Worker再取得で使用数をリセットしない。上限到達時は追加ツールを実行せず、Runnerを部分結果のStructured Outputへ誘導する。管理エージェントが追加調査を必須と判定した場合、ユーザーの明示承認1回につき同じタスク設定スナップショットの初期上限と同数を追加する。承認回数・累積許可数にアプリケーション上限は設けず、追加調査の費用と継続判断はユーザーに委ねる。初期上限が0の場合は承認要求を出さず、部分結果を統合する。単一Runnerのツール呼び出し上限は100回とし、承認済み残数がそれを超える場合はRunner実行を複数回に分割する。計画、サブタスク結果、レビュー、統合応答はPydantic型をAgentのoutput_typeへ設定してStructured Outputsで要求し、非対応の場合は通常JSONへ切り替えて同じ型で検証する。統合応答の要求ファイル本文も構造化出力として検証する。Tavily以外のツール実装と副作用ツールは未実装である。
+現行Workerはサブタスク実行に限りAgents SDKのFunction Toolsを通じてTavily検索を呼び出す。検索Function Toolは固定された`tvly search - --max-results <n> --json`だけを起動し、検索queryはstdinへ渡す。Tavily HTTPエンドポイントをアプリケーションから直接呼ばない。ツール名と引数を登録内容・JSON Schemaで検証する。サブタスクの初期上限はタスク作成時の`config_snapshot.max_tool_calls_per_subtask`（既定20回、設定範囲0〜100）とし、失敗・中断・形式再試行・品質修正・Worker再取得で使用数をリセットしない。上限到達時はCLIを起動せず、Runnerを部分結果のStructured Outputへ誘導する。管理エージェントが追加調査を必須と判定した場合、ユーザーの明示承認1回につき同じタスク設定スナップショットの初期上限と同数を追加する。承認回数・累積許可数にアプリケーション上限は設けず、追加調査の費用と継続判断はユーザーに委ねる。初期上限が0の場合は承認要求を出さず、部分結果を統合する。単一Runnerのツール呼び出し上限は100回とし、承認済み残数がそれを超える場合はRunner実行を複数回に分割する。計画、サブタスク結果、レビュー、統合応答はPydantic型をAgentのoutput_typeへ設定してStructured Outputsで要求し、非対応の場合は通常JSONへ切り替えて同じ型で検証する。統合応答の要求ファイル本文も構造化出力として検証する。Tavily以外のツール実装と副作用ツールは未実装である。
 
 現行実装のサブタスク結果:
 
@@ -297,7 +299,7 @@ SDK導入だけで実行途中からの完全復旧や副作用の一度限り�
 
 #### 4.5.4 ツール・モデル接続・安全境界
 
-既存のTool RegistryとTavilyアダプターをSDKのFunction Toolsへ接続する。SDKの引数検証に加え、登録済みツールの許可リスト、`read_only`制約、クエリ検査、タイムアウト、応答サイズ、出典・実行記録の取得を維持する。モデルからのツール要求は実行許可ではなく、アプリケーション側の検査に通過したものだけを実行する。SDKのGuardrailsや承認機能は補助機構であり、所有者認可、Sandbox、外向き通信制御の代替にはしない。
+既存のTool RegistryをSDKのFunction Toolsへ接続し、サブエージェント実行時に公式`tavily-search` Skill本文を指示へ組み込む。SDK自体はSkillを認識・実行しないため、SkillのCLI利用手順をモデルへ伝え、アプリケーション側の専用Function Toolが固定された`tvly search`コマンドを実行する。任意コマンドやシェル構文は受け付けない。SDKの引数検証に加え、登録済みツールの許可リスト、`read_only`制約、クエリ検査、プロセスのタイムアウト、標準出力サイズ、出典・実行記録の取得を維持する。モデルからのツール要求は実行許可ではなく、アプリケーション側の検査に通過したものだけを実行する。SDKのGuardrailsや承認機能は補助機構であり、所有者認可、Sandbox、外向き通信制御の代替にはしない。
 
 モデル接続アダプターはSDKのモデル呼び出し経路に組み込み、Runner開始時だけでなくツール後の継続要求と再試行を含む各OpenAI API要求の直前にVaultから最新キーを取得する。キーをAgentの指示・ツール引数・シリアライズ対象コンテキストへ含めず、環境変数や古いキーへフォールバックしない。Structured Outputs非対応時のJSONフォールバックとPydantic検証を維持し、SDKが同じ動作を自動提供すると仮定しない。
 
@@ -319,7 +321,7 @@ SDK採用は汎用ループの保守削減と実行機構の共通化を目的�
 
 PostgreSQLをアプリケーション状態のストアとジョブキューに使用する。タスク、会話、イベント、ジョブの受付登録は同じDBセッションでコミットする。Workerは`FOR UPDATE SKIP LOCKED`でジョブを取得し、期限付きリースを更新する。リース切れジョブは再取得され、Worker処理失敗は設定回数まで再試行される。現行実装は副作用ツールを持たないため、冪等性キーや外部副作用の実行記録はない。
 
-ComposeにはPostgreSQL、API、Worker、User UI、Admin UI、nginxがある。Vaultはローカル開発用プロファイル、マイグレーションと初期管理者作成はセットアップ用プロファイルで起動する。Sandbox、制限付きDocker API、成果物ボリューム、RAGサービスはComposeに含まれない。
+ComposeにはPostgreSQL、API、Worker、User UI、Admin UI、nginxがある。WorkerはAPIと別のDockerビルドターゲットを使用し、Tavily CLIと公式`tavily-search` Agent Skillだけを追加する。CLIは公式のPythonパッケージ導入方法で専用venvへ入れ、SkillはNode.js 22.20以降を使う公式Skills CLIで`tavily-ai/skills`から検索Skillのみを共有Skill領域へコピーする。Skillの取得処理はビルド時に行い、実行時コンテナにNode.jsやnpmを残さない。Vaultはローカル開発用プロファイル、マイグレーションと初期管理者作成はセットアップ用プロファイルで起動する。Sandbox、制限付きDocker API、成果物ボリューム、RAGサービスはComposeに含まれない。
 
 ### 5.2 コンテナ構成図
 
@@ -414,7 +416,7 @@ flowchart TB
 | Admin UI | 管理者ダッシュボードの静的資産を配信 | 独立したステートレスコンテナ。一般ユーザー用UIの資産と混在させず、秘密情報を含めない |
 | User UI | 一般ユーザー用タスクUIの静的資産を配信 | 独立したステートレスコンテナ。管理者専用画面・権限情報を含めない |
 | API | REST、SSE、認証、入力検証、会話・アカウント・管理操作、DBへの受付記録 | 現行Composeでは1サービス。API自体にプロセス内タスク状態を保持しない |
-| Worker | DBジョブの取得、ジョブリース更新、タスク計画・読み取り専用サブタスク実行・統合 | `agent`プロファイルで起動。初期運用は1レプリカ。Docker制御権限やGit認証情報を与えない |
+| Worker | DBジョブの取得、ジョブリース更新、タスク計画・読み取り専用サブタスク実行・統合。サブエージェント用Tavily CLIと公式Agent Skillsを含む | `agent`プロファイルで起動。初期運用は1レプリカ。APIイメージとは別にビルドし、Docker制御権限やGit認証情報を与えない。Tavilyキーは呼び出しごとにVaultから読み、CLI子プロセスにのみ環境変数で渡す |
 | PostgreSQL | ユーザー、セッション、設定、タスク、会話、サブタスク、イベント、ジョブを保存 | Composeの名前付きボリュームを使用。マイグレーションはセットアップ用サービスで適用 |
 | Workspace／Sandbox | APIコンテナがタスクUUID別の永続ボリューム上にファイルを保存し、TaskFileメタデータと所有者スコープAPIを提供。削除ジョブがWorkspace清掃後にTaskをcascade削除 | Workerから分離したタスク別Sandbox／Terminal、Sandbox内Git cloneと認証ブローカー。現行ファイル領域はOSプロセス単位のSandboxではない |
 | HashiCorp Vault | KV v2でシステム共通OpenAI APIキーを保存 | 管理APIは書込専用の限定AppRole、Workerは読取専用AppRoleを使用 |
@@ -542,7 +544,7 @@ Runnerターン上限は既定24・許容範囲1〜64、サブタスクの初期
 要約・履歴プルーニング・要約イベントは未実装である。現行Workerは計画と最終統合の入力に会話全件を使用するため、会話の長さに応じてモデルのコンテキスト上限へ達する可能性がある。
 
 ## 7. ツール・スキル・RAG
-この節には現行実装と将来拡張の設計を記載する。現行Workerには共通のツール登録・Function Calling実行境界とTavily検索ツールがある。動的スキルロードとRAGアダプターは未実装であり、現行の計画スキーマでも`skill_names`は受け付けるが、Workerは非空のスキル指定をエラーとして拒否する。
+この節には現行実装と将来拡張の設計を記載する。現行Workerには共通のツール登録・Function Calling実行境界、Tavily CLIを固定実行する検索ツール、公式`tavily-search` Agent Skillの指示組込みがある。OpenAI Agents SDKには汎用Agent Skillsローダーがないため、このSkillをAgentの実行入力へ明示的に読み込む。プライベートSkillの動的ロードとRAGアダプターは未実装であり、現行の計画スキーマでも`skill_names`は受け付けるが、Workerは非空のプライベートSkill指定をエラーとして拒否する。
 
 ### 7.1 スキルインターフェース
 
@@ -588,23 +590,23 @@ flowchart TB
 
 ### 7.4 共通ツール連携
 
-ツールはモデルやエージェント固有の実装から分離し、Public側の共通契約と登録済みアダプターを通じて実行する。現行実装はWorkerに共通Tool Registry／Function Calling境界を持ち、Tavily検索だけを登録する。ツール定義は一意な名前・バージョン、説明、引数JSON Schema、リスク分類、実行タイムアウト、構造化された結果・エラー形式を持つ。実装は非同期実行を基本とする。Tavilyなど外部サービス固有のAPI形式は各アダプター内に閉じ込め、オーケストレーターとエージェントには共通形式だけを見せる。複数ツールの管理UIは将来拡張である。
+ツールはモデルやエージェント固有の実装から分離し、共通契約と登録済みアダプターを通じて実行する。現行実装はWorkerに共通Tool Registry／Function Calling境界を持ち、Tavily CLI検索だけを登録する。ツール定義は一意な名前・バージョン、説明、引数JSON Schema、リスク分類、実行タイムアウト、構造化された結果・エラー形式を持つ。Tavily公式Agent Skillは検索の使い分けとCLIの利用規約を記述し、Workerがサブエージェントの指示に組み込む。実行器は引数を検証して非同期にCLIを起動し、Skill本文に任意コマンドの実行権限を与えない。Tavilyなど外部サービス固有の形式はアダプター内で共通結果へ正規化し、複数ツールの管理UIは将来拡張とする。
 
 Tool Callingの制御ループと実行判断はWorker側が担う。モデルが返したツール名と引数は登録済みツールの許可リストおよびJSON Schemaで検証してから実行し、未登録ツールや不正な引数は実行しない。副作用操作の承認機構が未実装の現行Registryは`read_only`以外のツールをモデルへ公開せず、実行要求も拒否する。ツール予算の追加承認はこの権限境界を変更せず、既登録の読み取り専用ツールの累積上限だけを増やす。ツールの利用可否はタスク実行時の設定で制限し、モデル出力だけで権限やネットワーク許可範囲を拡張できないようにする。ツールの実行要求・結果・エラーはタスクに紐付けて記録し、再試行はリスク分類と冪等性を考慮する。副作用を伴うツールは承認境界を通し、ファイル・シェル操作はWorker上で直接実行せずSandboxへ委譲する。
 
-SDK導入後も実行場所はWorker内とし、モデルとツール結果の往復をRunnerへ移す。SDKへ登録するのはアプリケーションが許可したツールアダプターだけとし、Function Toolsの実行直前に引数・権限・リース・呼び出し予算を検査する。Tavilyの出典と実行記録はモデルの自己申告ではなく実際のツール結果から取得して既存のサブタスク結果へ付加する。SDK既定のツール例外処理に依存せず、入力・権限違反、検索の回復可能な失敗、リース喪失を区別する。特にリース喪失やキャンセルはモデル向けの通常ツール結果へ変換して実行を続けず、Runnerを停止する。
+SDK導入後も実行場所はWorker内とし、モデルとツール結果の往復をRunnerへ移す。サブエージェント実行では公式`tavily-search` Skill本文をAgent指示へ組み込むが、SDKに自動Skill実行機能があるとはみなさない。SDKへ登録するのはアプリケーションが許可した検索専用Function Toolだけとし、実行直前に引数・権限・リース・呼び出し予算を検査する。Function ToolはVaultから検索のたびに最新キーを取得し、`TAVILY_API_KEY`として子プロセス環境へ一時的に渡して`tvly search`を起動する。コマンドは引数配列で組み立て、shellを介さず、任意URL・任意サブコマンドを許可しない。標準出力はJSONとして解析し、応答サイズ・結果数・本文長・URL schemeを検証する。標準エラーやキーをログ・DBへ保存しない。CLIが返した出典と実行記録は実際の結果から既存のサブタスク結果へ付加する。SDK既定のツール例外処理に依存せず、入力・権限違反、CLI障害、リース喪失を区別する。特にリース喪失やキャンセルは子プロセスを停止し、モデル向けの通常ツール結果へ変換して実行を続けない。
 
 ツールが外部サービスへ送信する情報は、実行に必要な最小限の入力に限定する。会話全体、システムプロンプト、認証情報、その他の秘密情報を無条件に転送しない。外部送信がタスク内容の機微性に照らして許可できない場合は呼び出しを行わず、理由をタスク結果に示す。ツール応答や取得文書は信頼できないデータとして扱い、その中の指示をシステム指示やユーザー指示として実行しない。
 
-### 7.5 Tavilyによる一般Web検索
+### 7.5 Tavily Agent SkillsとCLIによる一般Web検索
 
-一般情報のWeb検索には、AIエージェント向け検索サービスであるTavilyを採用する。Public側にTavilyアダプターを実装し、現行Workerではサブタスクから共通ツール契約を介して呼び出す。Tavily固有のリクエスト・レスポンス形式はアダプターで変換し、他の検索プロバイダーへ移行する場合も共通ツール契約とエージェント側の利用方法を維持できるようにする。現行ツールが受け付ける引数は検索queryと結果件数（1〜5件）に限定する。
+一般情報のWeb検索にはTavilyを採用し、Tavily公式の`tavily-ai/skills`から`tavily-search` Agent SkillをWorkerイメージへ導入する。Tavily CLIは専用venvへ`pip install tavily-cli`でインストールし、検索SkillはNode.js 22.20以降の公式Skills CLIで`npx --yes skills add tavily-ai/skills --skill tavily-search --global --agent codex --copy --yes`を実行して共有Skill領域へコピーする。Skill本文はOpenAI Agents SDKのAgent Skills自動認識を期待せず、サブエージェントの指示へ明示的に読み込む。現行Workerは検索queryと結果件数（1〜5件）だけを受け付ける専用Function Toolを登録し、検証済み引数を`tvly search - --max-results <n> --json`のstdin入力として実行する。モデルに任意シェルや他のTavily CLIコマンドを公開しない。
 
-このWeb検索は公開Web上の一般情報を対象とし、非公開ナレッジを検索するRAG／Vector DBとは別のツールとして扱う。検索結果はタイトル、URL、抜粋、検索スコア、公開日を正規化する。実際に返った出典はプロバイダー名・取得時刻とともに`subtasks.result`へ保存し、統合回答ではそのURLをMarkdownリンクで引用する。検索結果の内容自体は未検証の外部情報として扱う。
+このWeb検索は公開Web上の一般情報を対象とし、非公開ナレッジを検索するRAG／Vector DBとは別の経路で扱う。CLIのJSON結果をアプリケーション側で検証し、タイトル、HTTP(S) URL、抜粋、検索スコア、公開日を既存の共通形式へ正規化する。結果数は要求値以下、応答本文は1,024,000 byte以下、各抜粋は10,000文字以下とする。実際に返った出典はプロバイダー名・取得時刻とともに`subtasks.result`へ保存し、統合回答ではそのURLをMarkdownリンクで引用する。検索結果の内容自体は未検証の外部情報として扱う。
 
-Tavily APIキーはVaultの`VAULT_TAVILY_KEY_PATH`からWorker用AppRoleで読み取り、DB、イベント、ログ、ブラウザーには保存・返却しない。検索要求はTavilyの固定API接続先`https://api.tavily.com/search`に限定し、任意URLへのアクセスや取得ページを起点とした追加リクエストを行わない。安全検索を有効にし、結果は最大5件、応答本文は256 KB、各抜粋は1,500文字に制限する。タイムアウトと再試行回数を設定で制限し、レート制御はWorkerプロセス内で30回／分とする。Worker間で共有するレート制御は未実装である。検索クエリは必要最小限にし、APIキー・Bearer token・メールアドレス等の代表的なパターンを引数検証で拒否する。この検査は一般的な個人情報や秘密情報を完全に検出するものではない。ドメイン許可・拒否リストや検索オプションの管理UIは未実装である。
+Tavily APIキーはVaultの`VAULT_TAVILY_KEY_PATH`からWorker用AppRoleで検索ごとに読み取る。キーはコマンド引数・Skill本文・モデル入力・CLI設定ファイルへ含めず、`TAVILY_API_KEY`としてCLI子プロセスの環境へ一時的に渡す。DB、イベント、ログ、ブラウザー、永続ファイルへ保存・返却しない。検索クエリは必要最小限とし、APIキー・Bearer token・メールアドレス等の代表的なパターンを引数検証で拒否する。この検査は一般的な個人情報や秘密情報を完全に検出するものではない。CLIのタイムアウト、再試行回数、標準出力サイズ、子プロセスの終了をWorker側で制限する。Workerプロセス内のレート制御は30回／分とし、Worker間の共有レート制御は未実装である。ドメイン許可・拒否リストや検索オプションの管理UIは未実装である。
 
-現行実装は読み取り専用のTavily検索に限定する。汎用ツールの管理機能、他プロバイダー、ドメイン制限設定、外部更新操作は将来拡張であり、導入時には承認・Sandbox等の境界を別途設ける。
+現行実装は`tavily-search` Skillを通じた読み取り専用検索に限定する。Extract、Crawl、Map、Research Skillのエージェント向け実行、他プロバイダー、ドメイン制限設定、外部更新操作は対象外であり、導入時には承認・Sandbox等の境界を別途設ける。
 
 ## 8. APIとリアルタイムイベント
 
@@ -812,7 +814,7 @@ Runnerターン上限とサブタスクのツール総数上限はサーバー�
 | `VAULT_KV_MOUNT` | Vault KV v2のmount名 |
 | `VAULT_OPENAI_KEY_PATH` | システム共通OpenAIキーを保存するKV v2内のパス |
 | `VAULT_TAVILY_KEY_PATH` | Tavily APIキーを保存するKV v2内のパス。Worker AppRoleのみ読取可能 |
-| `TAVILY_TIMEOUT_SECONDS` | Tavily検索要求のタイムアウト。Worker側で1〜60秒に制限 |
+| `TAVILY_TIMEOUT_SECONDS` | Tavily CLI検索プロセスのタイムアウト。Worker側で1〜60秒に制限 |
 | `VAULT_API_ROLE_ID_FILE` / `VAULT_API_SECRET_ID_FILE` | 管理API用AppRole資格情報を読み込む制限付きファイル |
 | `VAULT_WORKER_ROLE_ID_FILE` / `VAULT_WORKER_SECRET_ID_FILE` | Worker用読取専用AppRole資格情報を読み込む制限付きファイル |
 | `OPENAI_BASE_URL` | OpenAI API接続先のデプロイ設定。標準接続先以外を利用する場合のみ設定 |
@@ -836,7 +838,7 @@ Runnerターン上限とサブタスクのツール総数上限はサーバー�
 | 品質判定 | サブタスクごとと最終回答のチェックリストを機械的検証／モデルレビューし、DBに判定履歴を保存。修正上限後の未達は`partially_completed`として完了レポートへ記録 |
 | 構造化出力 | Structured Outputsと通常JSONフォールバック、Pydantic検証、限定再試行を実装 |
 | 永続キュー・SSE | PostgreSQLジョブリース、期限切れ再取得、同一会話sequenceの保存計画・完了済み／レビュー済みサブタスク結果の再利用、イベント保存、Last-Event-ID再送を実装。実行中Runner状態からの復元は未実装 |
-| ツール・Web検索 | Worker内のTavily読み取り専用Function Callingと出典保存を実装。追加プロバイダー・副作用ツールは未実装 |
+| ツール・Web検索 | Worker内のTavily公式`tavily-search` Agent SkillとTavily CLIによる読み取り専用検索、出典保存を実装。直接のTavily HTTP呼び出し、追加プロバイダー・副作用ツールは未実装 |
 | 全体レート制御 | 1タスク内の並行数とモデル要求再試行のみ。Worker間共有RPM／TPM・同時実行枠は未実装 |
 | Workspace／Explorer | Task UUID別永続ファイル領域、TaskFileメタデータ、空ディレクトリを含む一覧と空状態表示、各ファイルの最終更新日時表示、入力アップロード、テキスト編集・ダウンロード、入力テキストの計画取込、要求ファイルの構造化出力・保存と完了時のExplorer更新を実装。タスク別OS Sandbox、ターミナル、Git cloneは未実装 |
 | 副作用実行 | エージェント向け副作用Tool Calling、副作用操作の承認、タスク別Sandbox、Terminal、Git認証ブローカー、外向き通信制御は未実装 |
@@ -864,7 +866,7 @@ Runnerターン上限とサブタスクのツール総数上限はサーバー�
 | OpenAI APIキー | 管理者がキーをVault KV v2へ登録でき、画面には設定済み状態のみ表示される。AppRole権限がAPI書込／Worker読取に分離され、各モデル呼び出しで最新キーを取得し、更新が後続呼び出しへ反映される。Vault障害・キー未設定時は明示的に失敗し、キーがDB・UI・ログへ漏れない |
 | レート制御 | 429応答でバックオフし、上限後は失敗理由が記録・表示される |
 | 構造化出力 | 不正な計画・結果・ツール引数を拒否し、成功として扱わない |
-| ツール・Tavily検索 | 登録済みツールとスキーマで引数を検証し、未許可ツールを実行しない。Tavily検索は最小限のクエリをサーバー側キーで実行し、出典URLをタスク履歴と回答に保持する。外部応答内の指示を実行せず、タイムアウト・応答サイズ・再試行を制限する |
+| ツール・Tavily検索 | Tavily公式`tavily-search` Skillの手順をサブエージェントの指示へ組み込み、固定されたTavily CLI検索だけを実行する。任意シェルや未登録ツールを実行しない。キーは検索ごとにVaultから取得してCLI子プロセス環境へ渡し、最小限のクエリを使う。出典URLをタスク履歴と回答に保持する。外部応答内の指示を実行せず、タイムアウト・応答サイズ・再試行を制限する |
 | 自己修復 | 形式崩れ・ツールエラーに対する試行が最大3回で停止する |
 | 追加ツール予算の承認 | 上限到達時に部分結果を保持して管理エージェントが不足を判定する。追加調査が必要な場合だけ`waiting_approval`へ遷移し、所有者の明示承認1回で当該タスクの初期ツール上限と同数を追加する。拒否時は部分結果を統合する。累積承認上限は設けず、各RunnerはSDKのターン／実行上限内で分割し、既存の消費数は再開・品質修正でリセットされない |
 | 副作用操作の承認 | 副作用操作は承認前に実行されず、却下後は実行されない。期限切れ操作は`needs_attention`で再表示され、再承認／却下される。実行結果不明時は操作ごとの実施済み／未実施確認後に限り再開し、終了選択は`cancelled`となる。現行のツール予算承認とは別機能で未実装 |

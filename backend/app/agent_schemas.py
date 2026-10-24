@@ -155,7 +155,7 @@ class SourceReference(BaseModel):
     provider: str = Field(min_length=1, max_length=100)
     title: str = Field(min_length=1, max_length=500)
     url: str = Field(min_length=1, max_length=2_048)
-    content: str = Field(max_length=1_500)
+    content: str = Field(max_length=10_000)
     score: float | None
     published_date: str | None
     retrieved_at: str = Field(min_length=1, max_length=64)

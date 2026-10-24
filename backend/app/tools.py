@@ -1,14 +1,15 @@
 import asyncio
 import json
+import os
 import re
 import time
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Awaitable, Callable, Literal
 from urllib.parse import urlsplit
 
-import httpx
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -144,9 +145,8 @@ class _SlidingWindowLimiter:
 
 
 class TavilySearchTool:
-    endpoint = "https://api.tavily.com/search"
-    max_response_bytes = 256_000
-    max_content_chars = 1_500
+    max_response_bytes = 1_024_000
+    max_content_chars = 10_000
 
     def __init__(self):
         self._limiter = _SlidingWindowLimiter()
@@ -187,19 +187,59 @@ class TavilySearchTool:
             raise TypeError("invalid_tavily_arguments")
         settings = get_settings()
         api_key = await asyncio.to_thread(read_tavily_api_key)
-        payload = {
-            "query": arguments.query.strip(),
-            "max_results": arguments.max_results,
-            "search_depth": "basic",
-            "include_answer": False,
-            "include_raw_content": False,
-            "include_images": False,
-            "safe_search": True,
-        }
-
-        response_payload = await self._request_with_retries(
-            api_key, payload, settings.tavily_timeout_seconds
+        attempts = min(max(settings.max_agent_attempts, 1), 3)
+        timeout_seconds = min(max(settings.tavily_timeout_seconds, 1), 60)
+        child_environment = self._child_environment(api_key)
+        command = (
+            "tvly",
+            "search",
+            "-",
+            "--max-results",
+            str(arguments.max_results),
+            "--json",
         )
+
+        for attempt in range(attempts):
+            await self._limiter.acquire()
+            process = await asyncio.create_subprocess_exec(
+                *command,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+                env=child_environment,
+            )
+            try:
+                stdout, _ = await asyncio.wait_for(
+                    process.communicate(arguments.query.strip().encode()),
+                    timeout=timeout_seconds,
+                )
+            except asyncio.TimeoutError:
+                await self._stop_process(process)
+                if attempt + 1 < attempts:
+                    await asyncio.sleep(self._retry_delay(attempt, None))
+                    continue
+                raise RuntimeError("tavily_timeout") from None
+            except asyncio.CancelledError:
+                await self._stop_process(process)
+                raise
+
+            if len(stdout) > self.max_response_bytes:
+                raise RuntimeError("tavily_response_too_large")
+            if process.returncode == 4 and attempt + 1 < attempts:
+                await asyncio.sleep(self._retry_delay(attempt, None))
+                continue
+            if process.returncode != 0:
+                raise RuntimeError("tavily_cli_failed")
+            break
+        else:
+            raise RuntimeError("tavily_attempts_exhausted")
+
+        try:
+            response_payload = json.loads(stdout)
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            raise RuntimeError("tavily_invalid_response") from exc
+        if not isinstance(response_payload, dict):
+            raise RuntimeError("tavily_invalid_response")
         raw_results = response_payload.get("results")
         if not isinstance(raw_results, list):
             raise RuntimeError("tavily_invalid_response")
@@ -247,58 +287,35 @@ class TavilySearchTool:
             "results": results,
         }
 
-    async def _request_with_retries(
-        self,
-        api_key: str,
-        payload: dict[str, object],
-        timeout_seconds: int,
-    ) -> dict[str, object]:
-        attempts = min(max(get_settings().max_agent_attempts, 1), 3)
-        for attempt in range(attempts):
-            await self._limiter.acquire()
-            try:
-                async with httpx.AsyncClient(
-                    timeout=min(max(timeout_seconds, 1), 60)
-                ) as client:
-                    async with client.stream(
-                        "POST",
-                        self.endpoint,
-                        headers={"Authorization": f"Bearer {api_key}"},
-                        json=payload,
-                    ) as response:
-                        if (
-                            response.status_code == 429
-                            or response.status_code >= 500
-                        ):
-                            retry_after = response.headers.get("retry-after")
-                            if attempt + 1 == attempts:
-                                raise RuntimeError("tavily_request_failed")
-                            await asyncio.sleep(
-                                self._retry_delay(attempt, retry_after)
-                            )
-                            continue
-                        if response.status_code >= 400:
-                            raise RuntimeError("tavily_request_failed")
-                        body = await self._read_bounded_response(response)
-                parsed = json.loads(body)
-                if not isinstance(parsed, dict):
-                    raise RuntimeError("tavily_invalid_response")
-                return parsed
-            except (httpx.TimeoutException, httpx.NetworkError) as exc:
-                if attempt + 1 == attempts:
-                    raise RuntimeError("tavily_request_failed") from exc
-                await asyncio.sleep(self._retry_delay(attempt, None))
-            except json.JSONDecodeError as exc:
-                raise RuntimeError("tavily_invalid_response") from exc
-        raise RuntimeError("tavily_attempts_exhausted")
+    @staticmethod
+    def _child_environment(api_key: str) -> dict[str, str]:
+        allowed_environment = (
+            "HOME",
+            "LANG",
+            "PATH",
+            "SSL_CERT_DIR",
+            "SSL_CERT_FILE",
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "NO_PROXY",
+        )
+        environment = {
+            name: os.environ[name]
+            for name in allowed_environment
+            if name in os.environ
+        }
+        environment["TAVILY_API_KEY"] = api_key
+        environment["NO_COLOR"] = "1"
+        return environment
 
-    async def _read_bounded_response(self, response: httpx.Response) -> bytes:
-        body = bytearray()
-        async for chunk in response.aiter_bytes():
-            body.extend(chunk)
-            if len(body) > self.max_response_bytes:
-                raise RuntimeError("tavily_response_too_large")
-        return bytes(body)
+    @staticmethod
+    async def _stop_process(process: asyncio.subprocess.Process) -> None:
+        if process.returncode is None:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+        await process.wait()
 
     @staticmethod
     def _retry_delay(attempt: int, retry_after: str | None) -> float:
@@ -308,3 +325,18 @@ class TavilySearchTool:
         except ValueError:
             pass
         return min(0.25 * (2**attempt), 2.0)
+
+
+def load_tavily_search_skill() -> str:
+    skill_path = get_settings().tavily_search_skill_path
+    try:
+        content = Path(skill_path).read_text(encoding="utf-8")
+    except OSError as exc:
+        raise RuntimeError("tavily_search_skill_unavailable") from exc
+    if not content.strip() or len(content) > 100_000:
+        raise RuntimeError("tavily_search_skill_invalid")
+    if content.startswith("---"):
+        sections = content.split("---", 2)
+        if len(sections) == 3:
+            content = sections[2]
+    return content.strip()

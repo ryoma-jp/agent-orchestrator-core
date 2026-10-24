@@ -35,7 +35,9 @@ services:
       retries: 20
 
   api:
-    build: .
+    build:
+      context: .
+      target: backend
     environment:
       DATABASE_URL: ${DATABASE_URL:?Set DATABASE_URL in .env}
       MANAGER_MODEL: ${MANAGER_MODEL:?Set MANAGER_MODEL in .env}
@@ -64,11 +66,13 @@ services:
       - workspace_data:/var/lib/agent-orchestrator/workspaces
 
   worker:
-    build: .
+    build:
+      context: .
+      target: worker
     profiles: ["agent"]
     init: true
     restart: unless-stopped
-    command: ["python", "-m", "app.worker"]
+    command: ["/usr/local/bin/python", "-m", "app.worker"]
     environment:
       DATABASE_URL: ${DATABASE_URL:?Set DATABASE_URL in .env}
       MANAGER_MODEL: ${MANAGER_MODEL:?Set MANAGER_MODEL in .env}
@@ -78,6 +82,7 @@ services:
       MAX_AGENT_TURNS: ${MAX_AGENT_TURNS:-24}
       MAX_TOOL_CALLS_PER_SUBTASK: ${MAX_TOOL_CALLS_PER_SUBTASK:-20}
       TAVILY_TIMEOUT_SECONDS: ${TAVILY_TIMEOUT_SECONDS:-20}
+      TAVILY_SEARCH_SKILL_PATH: /opt/agent-skills/tavily-search/SKILL.md
       OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
       VAULT_ADDR: ${VAULT_ADDR:-http://vault:8200}
       VAULT_KV_MOUNT: ${VAULT_KV_MOUNT:-secret}
@@ -97,7 +102,9 @@ services:
         condition: service_healthy
 
   migrate:
-    build: .
+    build:
+      context: .
+      target: backend
     profiles: ["setup"]
     environment:
       DATABASE_URL: ${DATABASE_URL:?Set DATABASE_URL in .env}
@@ -107,7 +114,9 @@ services:
         condition: service_healthy
 
   bootstrap:
-    build: .
+    build:
+      context: .
+      target: backend
     profiles: ["setup"]
     environment:
       DATABASE_URL: ${DATABASE_URL:?Set DATABASE_URL in .env}

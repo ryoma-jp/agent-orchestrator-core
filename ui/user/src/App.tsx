@@ -274,7 +274,7 @@ function App() {
             </div>
             {active.status === 'waiting_approval' && active.pending_tool_approval && <article className="partial-block approval-block" role="alert">
               <strong>追加調査の許可が必要です</strong>
-              <p>{active.pending_tool_approval.subtask_title}で追加の読み取り専用調査が必要です（追加{active.pending_tool_approval.additional_calls}回、累積上限100回）。</p>
+              <p>{active.pending_tool_approval.subtask_title}で追加の読み取り専用調査が必要です（今回の追加許可{active.pending_tool_approval.additional_calls}回、累積上限なし）。</p>
               <p>{active.pending_tool_approval.reason}</p>
               <div className="reply-actions">
                 <button className="primary-btn" type="button" disabled={busy} onClick={() => decideToolBudgetApproval(true)}><Check size={15} /> 許可する</button>

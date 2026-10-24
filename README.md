@@ -22,7 +22,7 @@ sh scripts/provision-local-vault.sh
 # DBスキーマを更新してからアプリを起動
 docker compose --profile setup run --build --rm migrate
 docker compose --profile local-vault up -d --build
-docker compose --profile local-vault --profile agent up --build -d worker
+docker compose --profile local-vault --profile agent up --build -d --force-recreate worker
 ```
 
 ### Generate local passwords
@@ -98,11 +98,11 @@ rm -rf .local-vault
 
 This also deletes the database volume and dev Vault data. Images shared with other running containers are not removed. It does not prune Docker resources belonging to other projects.
 
-The user UI supports login, task creation, conversation continuation, cancellation, terminal-task deletion, durable SSE replay, password changes, and one-time API-key rotation. The administrator UI supports account provisioning, runtime model/concurrency settings, OpenAI Vault key updates, and privacy-limited task operations. Agent execution supports structured planning, dependency-aware parallel read-only subtasks, Tavily Web search with source retention/citations, replanning on new user messages, and structured response integration. No shell, file mutation, or external write tools are exposed by this runtime.
+The user UI supports login, task creation, conversation continuation, cancellation, terminal-task deletion, durable SSE replay, password changes, and one-time API-key rotation. The administrator UI supports account provisioning, runtime model/concurrency settings, OpenAI Vault key updates, and privacy-limited task operations. Agent execution supports structured planning, dependency-aware parallel read-only subtasks, Tavily Web search through the official `tavily-search` Agent Skill and Tavily CLI, source retention/citations, replanning on new user messages, and structured response integration. The Worker loads the skill instructions into subagent prompts and exposes only a fixed search tool; it does not expose a shell, file mutation, or external write tools.
 
 ## Remaining scope
 
-Additional tool providers and side-effecting tools, human approval and `needs_attention` resolution flows, the isolated Sandbox service, dynamic private-skill loading, the RAG adapter, artifact storage/download, context summarization, usage/cost records, and database-shared RPM/TPM/concurrency slots are not implemented yet. The current Tavily tool is read-only and uses a per-Worker rate limit; the Worker exposes no shell, file mutation, or external write tools. Run a single Worker replica for this initial implementation.
+Additional tool providers and side-effecting tools, human approval and `needs_attention` resolution flows, the isolated Sandbox service, dynamic private-skill loading, the RAG adapter, artifact storage/download, context summarization, usage/cost records, and database-shared RPM/TPM/concurrency slots are not implemented yet. The Worker image installs the Tavily CLI and only the official `tavily-search` skill; searches remain read-only and use a per-Worker rate limit. Run a single Worker replica for this initial implementation.
 
 ## Development checks
 

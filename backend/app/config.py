@@ -26,6 +26,9 @@ class Settings(BaseSettings):
     job_lease_seconds: int = 60
     agent_timeout_seconds: int = 180
     tavily_timeout_seconds: int = 20
+    tavily_search_skill_path: str = (
+        "/opt/agent-skills/tavily-search/SKILL.md"
+    )
     openai_base_url: str | None = None
     vault_addr: str | None = None
     vault_kv_mount: str = "secret"
