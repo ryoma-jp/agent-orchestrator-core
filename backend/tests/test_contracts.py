@@ -576,8 +576,8 @@ def test_task_plan_rejects_duplicate_checklist_ids():
         ValidationError, match="checklist item ids must be unique"
     ):
         TaskPlan(
-        title="Task purpose",
-        summary="Plan",
+            title="Task purpose",
+            summary="Plan",
             final_checklist=[
                 ChecklistItem(id="answer", description="First"),
                 ChecklistItem(id="answer", description="Duplicate"),
@@ -1037,7 +1037,9 @@ async def test_first_plan_generates_and_persists_purpose_title(monkeypatch):
     )
     monkeypatch.setattr(orchestrator_module, "_assert_lease", assert_lease)
     monkeypatch.setattr(
-        orchestrator_module, "_assert_lease_in_session", assert_lease_in_session
+        orchestrator_module,
+        "_assert_lease_in_session",
+        assert_lease_in_session,
     )
     monkeypatch.setattr(
         orchestrator_module, "_format_task_input", format_input
@@ -1176,7 +1178,9 @@ async def test_restored_legacy_plan_generates_title_from_first_instruction(
     )
     monkeypatch.setattr(orchestrator_module, "_assert_lease", assert_lease)
     monkeypatch.setattr(
-        orchestrator_module, "_assert_lease_in_session", assert_lease_in_session
+        orchestrator_module,
+        "_assert_lease_in_session",
+        assert_lease_in_session,
     )
     monkeypatch.setattr(
         orchestrator_module,
@@ -1481,7 +1485,9 @@ def test_task_plan_requires_nonblank_title():
                     instruction="Find relevant information",
                     artifact_goal="Provide evidence",
                     acceptance_checklist=[
-                        ChecklistItem(id="evidence", description="Use evidence")
+                        ChecklistItem(
+                            id="evidence", description="Use evidence"
+                        )
                     ],
                     dependencies=[],
                     skill_names=[],
