@@ -8,6 +8,7 @@ from fastapi.responses import JSONResponse
 from app.routers import auth, tasks
 from app.routers.account import router as account_router
 from app.routers.admin import router as admin_router
+from app.routers.workspace import router as workspace_router
 from app.workspace_cleanup import run_task_deletion_worker
 
 
@@ -28,6 +29,7 @@ app = FastAPI(
 app.include_router(auth.router)
 app.include_router(account_router)
 app.include_router(tasks.router)
+app.include_router(workspace_router)
 app.include_router(admin_router)
 
 

@@ -42,6 +42,7 @@ from app.orchestrator import _reserve_subtask_tool_call, execute_task
 from app.schemas import TaskCreate
 from app import workspaces
 from app.routers import tasks as task_router
+from app.routers import workspace as workspace_router
 from app import workspace_cleanup
 from test_agents_runtime import registry, tool_call
 
@@ -73,6 +74,8 @@ async def database(monkeypatch):
     )
     sessions = async_sessionmaker(engine, expire_on_commit=False)
     monkeypatch.setattr("app.orchestrator.SessionFactory", sessions)
+    monkeypatch.setattr("app.orchestration_state.SessionFactory", sessions)
+    monkeypatch.setattr("app.planning.SessionFactory", sessions)
     try:
         async with engine.begin() as connection:
             await connection.run_sync(Base.metadata.create_all)
@@ -181,10 +184,10 @@ async def test_task_workspace_files_are_owner_scoped_and_deleted_with_task(
         workspace_root=str(tmp_path / "workspaces"),
         workspace_internal_token=None,
     )
-    monkeypatch.setattr(task_router, "get_settings", lambda: settings)
+    monkeypatch.setattr(workspace_router, "get_settings", lambda: settings)
     monkeypatch.setattr(workspaces, "get_settings", lambda: settings)
     async with database.sessions() as session:
-        await task_router.upload_task_file(
+        await workspace_router.upload_task_file(
             state.task.id,
             request_with_body(b"task input"),
             "brief.txt",
@@ -194,7 +197,7 @@ async def test_task_workspace_files_are_owner_scoped_and_deleted_with_task(
         workspace = workspaces.task_workspace(state.task.id)
         (workspace / "empty").mkdir()
         (workspace / "nested" / "empty").mkdir(parents=True)
-        files = await task_router.list_task_files(
+        files = await workspace_router.list_task_files(
             state.task.id, state.user, session
         )
         entries_by_path = {entry.path: entry for entry in files}
@@ -205,7 +208,7 @@ async def test_task_workspace_files_are_owner_scoped_and_deleted_with_task(
         assert entries_by_path["nested"].kind == "directory"
         assert entries_by_path["nested/empty"].kind == "directory"
         with pytest.raises(HTTPException) as error:
-            await task_router.list_task_files(
+            await workspace_router.list_task_files(
                 state.task.id,
                 User(
                     id=uuid.uuid4(),
@@ -228,7 +231,7 @@ async def test_task_workspace_files_are_owner_scoped_and_deleted_with_task(
             await session.get(TaskDeletionJob, state.task.id)
         ).status == "pending"
         with pytest.raises(HTTPException) as error:
-            await task_router.list_task_files(
+            await workspace_router.list_task_files(
                 state.task.id, state.user, session
             )
         assert error.value.status_code == 404
@@ -372,7 +375,7 @@ async def test_snapshot_freezes_server_limits_without_changing_admin_contract(
         settings.max_tool_calls_per_subtask = 0
         assert created.config_snapshot["max_agent_turns"] == 12
         assert created.config_snapshot["max_tool_calls_per_subtask"] == 4
-        assert created.config_snapshot["agent_runtime"]["version"] == "0.17.8"
+        assert created.config_snapshot["agent_runtime"]["version"] == "0.24.0"
 
 
 async def test_sdk_budget_migration_round_trip_preserves_existing_rows(

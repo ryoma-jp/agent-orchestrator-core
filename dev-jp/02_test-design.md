@@ -2,9 +2,9 @@
 
 ## 1. 目的と対象
 
-本書は、現行のPythonテストが保証する入力契約・計画／サブタスク契約・品質チェックリスト判定・修正上限・準完了・会話再キュー・認証境界・秘密情報の取り扱い・モデル出力フォールバックを定義する。対象は `backend/tests/test_contracts.py` の34ケースと、テスト収集前の環境設定を行う `backend/tests/conftest.py` である。
+本書は、現行のPythonテストが保証する入力契約、計画／サブタスク契約、品質判定、認証境界、SDK実行、PostgreSQL上の状態遷移を説明する。対象は `backend/tests/conftest.py` と `test_contracts.py`、`test_agents_runtime.py`、`test_agents_postgres.py` である。UT一覧は `test_contracts.py` の主な契約を示し、全テストケースの網羅一覧ではない。
 
-現行テストはユニット/コンポーネントテストを中心とし、PostgreSQL、Vault、OpenAI APIへの実接続やUIのブラウザーE2Eは行わない。
+通常のユニット／SDKテストは外部サービスへ実接続しない。PostgreSQL統合テストは専用のテストDBを指定した場合に実行し、Vault・OpenAI APIへの実接続やUIのブラウザーE2Eは行わない。
 
 ## 2. 実行方法
 
@@ -15,9 +15,11 @@ python -m pip install -e ".[dev]"
 python -m pytest -q
 ```
 
-pytestの探索先は `backend/tests`、asyncテストは `pytest-asyncio` のauto modeで実行する。現行テストはDB接続を発生させないため、PostgreSQLやDockerの起動は不要。
+pytestの探索先は `backend/tests`、asyncテストは `pytest-asyncio` のauto modeで実行する。通常のテストにPostgreSQLは不要だが、`test_agents_postgres.py` は `TEST_DATABASE_URL` に専用のPostgreSQLデータベース名（末尾が `_test`）を指定すると実行される。各テストはランダムなスキーマを作成し、終了時に削除する。
 
 ## 3. テストケース
+
+以下の表は `test_contracts.py` にある主要な契約テストを整理したもの。Agents SDKの実行境界とPostgreSQL統合ケースは後続節を参照。
 
 | ID | テスト対象 | 設計意図・確認内容 |
 |---|---|---|
@@ -54,6 +56,9 @@ pytestの探索先は `backend/tests`、asyncテストは `pytest-asyncio` のau
 ## 4. テスト用依存の置き換え
 
 - `conftest.py` は `MANAGER_MODEL` と `WORKER_MODEL` に `setdefault` でテスト用既定値を設定する。アプリ設定の読み込みのみを補い、実モデルへ接続しない。
+- `test_agents_runtime.py` はモックHTTP transportを通じてAgents SDK RunnerとOpenAIクライアントを実行し、再試行、出力検証、Vaultキー取得失敗、リース失効、ツール境界、キャンセル、実行コンテキストを検証する。
+- `test_agents_postgres.py` は専用DB内の分離スキーマで、ツール予算の原子性、リース失効後の拒否、Workspaceの所有者境界、再計画、設定スナップショット、SDK実行フローを検証する。
+- PostgreSQLテスト内のマイグレーション確認は、対象を選んだ個別マイグレーションのupgrade/downgrade往復であり、空DBからAlembic履歴全体を適用する検証ではない。
 - Bearer認証は `FakeAccessKeySession` を使い、認証依存関数へ返すキーとユーザーを制御する。PostgreSQLのSQL実行や永続化は検証しない。
 - オーケストレーター／追加メッセージ／品質レビューのケースはDBセッションとリース確認を偽物へ置き換え、状態遷移、判定履歴、書き込み対象オブジェクトを検証する。
 - 入力エラー応答は `httpx.ASGITransport` でFastAPIアプリ内に送信する。外部HTTPサーバーやログイン済みセッションは必要としない。
@@ -61,12 +66,12 @@ pytestの探索先は `backend/tests`、asyncテストは `pytest-asyncio` のau
 
 ## 5. 現行の対象外
 
-以下は現行テストでは保証しない。実DBを用いる統合試験、Workerの並行／リース試験、Vault・OpenAI実接続試験、ブラウザーE2Eとして別途追加する。
+以下は現行テストでは未保証、または限定的な確認にとどまる。必要に応じて統合試験やブラウザーE2Eを追加する。
 
-- PostgreSQL上のトランザクション原子性、実SQLでの所有者境界、マイグレーションの適用
+- 全状態遷移・API操作を通したトランザクション原子性と所有者境界、空DBからのAlembic全履歴upgrade/downgrade
 - セッション発行/期限切れ/ログアウト、Cookie認証時のCSRF拒否、アクセスキーの発行・ローテーション・永続化
 - SSEのLast-Event-ID再送、Worker再起動・リース回収、複数Worker間排他、追加指示を受けた後の実際の再計画（再キュー動作の単体確認を除く）
-- 品質レビューを含むWorker全体のDBトランザクション原子性、実PostgreSQL上のマイグレーション適用・downgrade、Worker再起動後のレビュー再開、動的な依存サブタスク追加
+- 品質レビューを含むWorker全体のDBトランザクション原子性、Worker再起動後のレビュー再開、動的な依存サブタスク追加
 - キャンセルと完了の競合、終端タスク削除、管理者API権限、Vault秘密値の保存/非再表示
 - UIのログイン、フォーム操作、レスポンシブ表示、APIとの結合
 - Sandbox、承認/要確認、プライベートスキル、RAG、成果物、コンテキスト要約、利用量/コスト

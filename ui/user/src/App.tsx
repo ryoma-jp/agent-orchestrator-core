@@ -1,12 +1,12 @@
-import { Fragment, Suspense, lazy, useEffect, useRef, useState, type FormEvent } from 'react'
-import { Tree, type NodeRendererProps } from 'react-arborist'
+import { Fragment, useEffect, useState, type FormEvent } from 'react'
 import {
   Activity, ArrowUpRight, Ban, Check, ChevronDown, Command,
-  Copy, Download, FileText, Folder, FolderOpen, KeyRound, LoaderCircle,
-  LogOut, MessageSquareText, Pencil, Plus, Save, Send, Sparkles, Trash2, Upload, X,
+  Copy, FolderOpen, KeyRound, LoaderCircle, LogOut, MessageSquareText,
+  Pencil, Plus, Save, Send, Sparkles, Trash2, X,
 } from 'lucide-react'
 
-const CodeTextEditor = lazy(() => import('./CodeTextEditor'))
+import { api } from './api'
+import WorkspacePanel from './WorkspacePanel'
 
 type User = { id: string; email: string; role: string; must_change_password: boolean }
 type ToolBudgetApproval = {
@@ -21,36 +21,9 @@ type Task = {
 }
 type Message = { id: string; sequence: number; role: 'user' | 'assistant'; content: string; created_at: string }
 type ProgressItem = { id: string; conversationSequence: number; content: string }
-type WorkspaceFile = { kind: 'file'; id: string; path: string; role: string; source_kind: string; size_bytes: number; updated_at: string }
-type WorkspaceDirectory = { kind: 'directory'; path: string }
-type WorkspaceEntry = WorkspaceFile | WorkspaceDirectory
-type ExplorerNodeData = { id: string; name: string; path: string; kind: WorkspaceEntry['kind']; file?: WorkspaceFile; children?: ExplorerNodeData[]; empty?: boolean }
-
-async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
-  const headers = new Headers(init.headers)
-  if (init.body && !headers.has('Content-Type')) headers.set('Content-Type', 'application/json')
-  if (init.method && init.method !== 'GET') {
-    const csrf = document.cookie.match(/(?:^|; )agent_csrf=([^;]+)/)?.[1]
-    if (csrf) headers.set('X-CSRF-Token', decodeURIComponent(csrf))
-  }
-  const response = await fetch(`/api${path}`, { ...init, headers, credentials: 'include' })
-  if (!response.ok) {
-    const body = await response.json().catch(() => null)
-    throw new Error(body?.detail ?? `Request failed (${response.status})`)
-  }
-  if (response.status === 204) return undefined as T
-  return response.json() as Promise<T>
-}
-
 const statusLabel: Record<string, string> = {
   queued: '待機中', planning: '計画中', running: '実行中', waiting_approval: '承認待ち',
   needs_attention: '要確認', succeeded: '完了', partially_completed: '準完了', failed: '失敗', cancelled: '停止',
-}
-
-function formatModifiedAt(value: string) {
-  return new Date(value).toLocaleString('ja-JP', {
-    year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit',
-  })
 }
 
 function App() {
@@ -344,221 +317,6 @@ function App() {
     {showCreate && <div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) setShowCreate(false) }}><section className="compose-modal" aria-labelledby="compose-title"><div className="modal-head"><div><div className="eyebrow">NEW THREAD</div><h2 id="compose-title">What are we working on?</h2></div><button className="icon-btn" title="Close" onClick={() => setShowCreate(false)}><X size={18} /></button></div><form onSubmit={createTask}><textarea name="instruction" autoFocus rows={5} maxLength={20000} placeholder="Describe the outcome you need..." required /><div className="modal-footer"><span>Each task has its own conversation and history.</span><button className="primary-btn" disabled={busy}><Plus size={16} /> Create task</button></div></form></section></div>}
     {showAccount && <AccountModal user={user} onClose={() => setShowAccount(false)} />}
   </div>
-}
-
-function buildExplorerTree(entries: WorkspaceEntry[]): ExplorerNodeData[] {
-  const roots: ExplorerNodeData[] = []
-  const folders = new Map<string, ExplorerNodeData>()
-  for (const entry of entries) {
-    const parts = entry.path.split('/')
-    let parent = roots
-    let currentPath = ''
-    for (const [index, name] of parts.entries()) {
-      currentPath = currentPath ? `${currentPath}/${name}` : name
-      const isLastPart = index === parts.length - 1
-      if (isLastPart && entry.kind === 'file') {
-        parent.push({ id: `file:${entry.path}`, name, path: entry.path, kind: 'file', file: entry })
-        continue
-      }
-      let folder = folders.get(currentPath)
-      if (!folder) {
-        folder = { id: `folder:${currentPath}`, name, path: currentPath, kind: 'directory', children: [] }
-        folders.set(currentPath, folder)
-        parent.push(folder)
-      }
-      parent = folder.children ?? []
-    }
-  }
-  const markEmptyDirectories = (nodes: ExplorerNodeData[]) => {
-    for (const node of nodes) {
-      if (node.kind !== 'directory') continue
-      node.empty = node.children?.length === 0
-      markEmptyDirectories(node.children ?? [])
-    }
-  }
-  markEmptyDirectories(roots)
-  return roots
-}
-
-function ExplorerTreeRow({ node, style, dragHandle }: NodeRendererProps<ExplorerNodeData>) {
-  const file = node.data.file
-  const updatedAt = file ? new Date(file.updated_at) : null
-  return <div
-    ref={dragHandle}
-    style={style}
-    className={`explorer-node ${node.isSelected ? 'selected' : ''}`}
-    onClick={(event) => node.handleClick(event)}
-    onDoubleClick={() => { if (node.isInternal) node.toggle() }}
-    title={file && updatedAt ? `${file.path}\nUpdated ${updatedAt.toLocaleString('ja-JP')}` : `${node.data.path}${node.data.empty ? ' (empty directory)' : ''}`}
-  >
-    {node.data.kind === 'file' ? <FileText size={14} /> : node.isOpen ? <FolderOpen size={14} /> : <Folder size={14} />}
-    <span>{node.data.name}</span>{file && <small className="explorer-file-datetime">{formatModifiedAt(file.updated_at)}</small>}{node.data.empty && <small className="explorer-empty-label">empty</small>}
-  </div>
-}
-
-function WorkspacePanel({ taskId, refreshOnCompletion }: { taskId: string; refreshOnCompletion: boolean }) {
-  const [files, setFiles] = useState<WorkspaceEntry[]>([])
-  const [selected, setSelected] = useState<WorkspaceFile | null>(null)
-  const [content, setContent] = useState('')
-  const [loading, setLoading] = useState(true)
-  const [busy, setBusy] = useState(false)
-  const [error, setError] = useState('')
-  const fileTreeElement = useRef<HTMLDivElement>(null)
-  const [treeSize, setTreeSize] = useState({ width: 0, height: 0 })
-
-  const refresh = async () => {
-    const items = await api<WorkspaceEntry[]>(`/tasks/${taskId}/workspace/files`)
-    setFiles(items)
-    setSelected((current) => current ? items.find((entry): entry is WorkspaceFile => entry.kind === 'file' && entry.path === current.path) ?? null : null)
-  }
-
-  useEffect(() => {
-    let alive = true
-    setLoading(true)
-    api<WorkspaceEntry[]>(`/tasks/${taskId}/workspace/files`)
-      .then((items) => { if (alive) setFiles(items) })
-      .catch((reason) => { if (alive) setError((reason as Error).message) })
-      .finally(() => { if (alive) setLoading(false) })
-    setSelected(null)
-    setContent('')
-    return () => { alive = false }
-  }, [taskId])
-
-  useEffect(() => {
-    if (!refreshOnCompletion) return
-    let alive = true
-    api<WorkspaceEntry[]>(`/tasks/${taskId}/workspace/files`)
-      .then((items) => {
-        if (!alive) return
-        setFiles(items)
-        setSelected((current) => current ? items.find((entry): entry is WorkspaceFile => entry.kind === 'file' && entry.path === current.path) ?? null : null)
-      })
-      .catch((reason) => { if (alive) setError((reason as Error).message) })
-    return () => { alive = false }
-  }, [taskId, refreshOnCompletion])
-
-  useEffect(() => {
-    const element = fileTreeElement.current
-    if (!element) return
-    const bounds = element.getBoundingClientRect()
-    setTreeSize({ width: Math.floor(bounds.width), height: Math.floor(bounds.height) })
-    const observer = new ResizeObserver(([entry]) => {
-      setTreeSize({
-        width: Math.floor(entry.contentRect.width),
-        height: Math.floor(entry.contentRect.height),
-      })
-    })
-    observer.observe(element)
-    return () => observer.disconnect()
-  }, [files.length, loading])
-
-  const fileUrl = (path: string) => `/api/tasks/${taskId}/workspace/files/${path.split('/').map(encodeURIComponent).join('/')}`
-  const download = async (file: WorkspaceFile) => {
-    const response = await fetch(fileUrl(file.path), { credentials: 'include' })
-    if (!response.ok) throw new Error(`Download failed (${response.status})`)
-    const blob = await response.blob()
-    const link = document.createElement('a')
-    link.href = URL.createObjectURL(blob)
-    link.download = file.path.split('/').at(-1) ?? 'download'
-    link.click()
-    URL.revokeObjectURL(link.href)
-  }
-
-  const selectFile = async (file: WorkspaceFile) => {
-    setSelected(file)
-    setError('')
-    const extension = file.path.split('.').at(-1)?.toLowerCase() ?? ''
-    const editable = ['md', 'txt', 'json', 'py', 'ts', 'tsx', 'js', 'jsx', 'css', 'html', 'xml', 'yaml', 'yml', 'toml', 'sh', 'sql', 'csv', 'log'].includes(extension)
-    if (!editable || file.size_bytes > 1_000_000) { setContent(''); return }
-    try {
-      const response = await fetch(fileUrl(file.path), { credentials: 'include' })
-      if (!response.ok) throw new Error(`Read failed (${response.status})`)
-      setContent(await response.text())
-    } catch (reason) { setError((reason as Error).message) }
-  }
-
-  const upload = async (event: FormEvent<HTMLInputElement>) => {
-    const selectedFiles = Array.from(event.currentTarget.files ?? [])
-    event.currentTarget.value = ''
-    if (selectedFiles.length === 0) return
-    setBusy(true); setError('')
-    try {
-      let lastUploaded: WorkspaceFile | null = null
-      for (const file of selectedFiles) {
-        lastUploaded = await api<WorkspaceFile>(`/tasks/${taskId}/workspace/files?filename=${encodeURIComponent(file.name)}`, {
-          method: 'POST',
-          headers: { 'Content-Type': file.type || 'application/octet-stream' },
-          body: file,
-        })
-      }
-      await refresh()
-      if (lastUploaded) await selectFile(lastUploaded)
-    } catch (reason) { setError((reason as Error).message) }
-    finally { setBusy(false) }
-  }
-
-  const save = async () => {
-    if (!selected) return
-    setBusy(true); setError('')
-    try {
-      const updated = await api<WorkspaceFile>(`/tasks/${taskId}/workspace/files/${selected.path.split('/').map(encodeURIComponent).join('/')}?role=${selected.role}`, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'text/plain; charset=utf-8' },
-        body: content,
-      })
-      await refresh()
-      setSelected(updated)
-    } catch (reason) { setError((reason as Error).message) }
-    finally { setBusy(false) }
-  }
-
-  const remove = async (file: WorkspaceFile) => {
-    if (!window.confirm(`Delete ${file.path}?`)) return
-    setBusy(true); setError('')
-    try {
-      await api(`/tasks/${taskId}/workspace/files/${file.path.split('/').map(encodeURIComponent).join('/')}`, { method: 'DELETE' })
-      if (selected?.path === file.path) { setSelected(null); setContent('') }
-      await refresh()
-    } catch (reason) { setError((reason as Error).message) }
-    finally { setBusy(false) }
-  }
-
-  const textFile = selected && ['md', 'txt', 'json', 'py', 'ts', 'tsx', 'js', 'jsx', 'css', 'html', 'xml', 'yaml', 'yml', 'toml', 'sh', 'sql', 'csv', 'log'].includes(selected.path.split('.').at(-1)?.toLowerCase() ?? '') && selected.size_bytes <= 1_000_000
-  const fileCount = files.filter((entry) => entry.kind === 'file').length
-  const treeData = buildExplorerTree(files)
-
-  return <section className="workspace-panel" aria-label="Task files">
-    <div className="workspace-toolbar"><div><div className="eyebrow">TASK WORKSPACE</div><strong>{fileCount} files</strong></div><label className="icon-btn workspace-upload" title="Upload input files"><Upload size={16} /><input type="file" multiple onChange={upload} disabled={busy} /></label></div>
-    {error && <div className="workspace-error" role="alert">{error}</div>}
-    {loading ? <div className="workspace-empty">Loading files...</div> : files.length === 0 ? <div className="workspace-empty"><FolderOpen size={21} /><strong>No files yet</strong><span>Upload task inputs or save an artifact here.</span></div> : <div className="workspace-browser">
-      <div className="file-list" aria-label="Files" ref={fileTreeElement}>
-        {treeSize.width > 0 && treeSize.height > 0 && <Tree<ExplorerNodeData>
-          data={treeData}
-          width={treeSize.width}
-          height={treeSize.height}
-          rowHeight={27}
-          indent={12}
-          disableDrag
-          disableDrop
-          disableEdit
-          onSelect={(nodes) => {
-            const file = nodes[0]?.data.file
-            if (file) void selectFile(file)
-          }}
-        >{ExplorerTreeRow}</Tree>}
-      </div>
-      <div className="file-editor">
-        {selected ? <>
-          <div className="file-editor-head"><strong title={selected.path}>{selected.path}</strong><div><button className="icon-btn" title="Download file" onClick={() => void download(selected).catch((reason) => setError((reason as Error).message))}><Download size={15} /></button><button className="icon-btn file-delete" title="Delete file" disabled={busy} onClick={() => void remove(selected)}><Trash2 size={14} /></button></div></div>
-          {textFile ? <><Suspense fallback={<div className="code-editor-host workspace-empty">Loading editor...</div>}><div className="code-editor-host"><CodeTextEditor
-            filename={selected.path}
-            value={content}
-            onChange={(value: string) => setContent(value)}
-          /></div></Suspense><button className="primary-btn file-save" disabled={busy} onClick={save}><Save size={15} /> Save</button></> : <div className="workspace-empty">Preview is unavailable. Download to open this file.</div>}
-        </> : <div className="workspace-empty"><FolderOpen size={20} /><span>Select a file to inspect it.</span></div>}
-      </div>
-    </div>}
-  </section>
 }
 
 function Login({ onSubmit, busy, error }: { onSubmit: (email: string, password: string) => void; busy: boolean; error: string }) {

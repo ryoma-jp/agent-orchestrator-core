@@ -38,6 +38,12 @@ def task_workspace(task_id: uuid.UUID, *, create: bool = False) -> Path:
         workspace.mkdir(mode=0o700, exist_ok=True)
     if not workspace.resolve().is_relative_to(root):
         raise InvalidWorkspacePath("Invalid workspace root")
+    if create:
+        for directory_name in ("inputs", "artifacts"):
+            directory = workspace / directory_name
+            if directory.is_symlink():
+                raise InvalidWorkspacePath("Symbolic links are not allowed")
+            directory.mkdir(mode=0o700, exist_ok=True)
     return workspace
 
 

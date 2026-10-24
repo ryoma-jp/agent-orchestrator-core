@@ -41,9 +41,8 @@ from app.quality import (
 from app.routers.tasks import (
     add_message,
     edit_message,
-    list_task_files,
-    upload_task_file,
 )
+from app.routers.workspace import list_task_files, upload_task_file
 from app.schemas import (
     AdminSettingsUpdate,
     MessageCreate,
@@ -104,6 +103,16 @@ def test_workspace_paths_reject_absolute_and_parent_paths():
             workspaces.normalize_workspace_path(path)
 
 
+def test_workspace_routes_are_registered():
+    from app.main import app
+
+    paths = set(app.openapi()["paths"])
+    assert "/api/tasks/{task_id}/workspace/files" in paths
+    assert "/api/tasks/{task_id}/workspace/files/{relative_path}" in paths
+    assert "/api/tasks/{task_id}/workspace/internal/inputs" in paths
+    assert "/api/tasks/{task_id}/workspace/internal/{relative_path}" in paths
+
+
 @pytest.mark.asyncio
 async def test_workspace_file_view_uses_filesystem_modification_time(
     monkeypatch,
@@ -138,22 +147,25 @@ async def test_workspace_file_view_uses_filesystem_modification_time(
     async def owned_task(_db, _task_id, _owner_id):
         return None
 
-    monkeypatch.setattr("app.routers.tasks._owned_task", owned_task)
+    monkeypatch.setattr("app.routers.workspace._owned_task", owned_task)
     monkeypatch.setattr(
-        "app.routers.tasks.list_workspace_entries",
+        "app.routers.workspace.list_workspace_entries",
         lambda _task_id: [
             {
                 "kind": "file",
                 "path": "inputs/brief.txt",
                 "size_bytes": 5,
                 "updated_at": filesystem_time.timestamp(),
-            }
+            },
+            {"kind": "directory", "path": "inputs"},
         ],
     )
 
     result = await list_task_files(task_id, user, FakeSession())
 
     assert result[0].updated_at == filesystem_time
+    assert result[1].kind == "directory"
+    assert result[1].path == "inputs"
 
 
 def test_workspace_listing_includes_empty_directories(monkeypatch, tmp_path):
@@ -169,6 +181,8 @@ def test_workspace_listing_includes_empty_directories(monkeypatch, tmp_path):
     entries = workspaces.list_workspace_entries(task_id)
     entries_by_path = {entry["path"]: entry for entry in entries}
 
+    assert entries_by_path["inputs"]["kind"] == "directory"
+    assert entries_by_path["artifacts"]["kind"] == "directory"
     assert entries_by_path["empty"]["kind"] == "directory"
     assert entries_by_path["nested"]["kind"] == "directory"
     assert entries_by_path["nested/empty"]["kind"] == "directory"
@@ -339,6 +353,7 @@ async def test_tool_budget_request_pauses_task_and_persists_partial_result(
     monkeypatch,
 ):
     import app.orchestrator as orchestrator_module
+    import app.orchestration_state as state_module
 
     task_id = uuid.uuid4()
     job_id = uuid.uuid4()
@@ -395,12 +410,8 @@ async def test_tool_budget_request_pauses_task_and_persists_partial_result(
         return None
 
     session = FakeSession()
-    monkeypatch.setattr(
-        orchestrator_module, "SessionFactory", lambda: session
-    )
-    monkeypatch.setattr(
-        orchestrator_module, "_assert_lease_in_session", assert_lease
-    )
+    monkeypatch.setattr(state_module, "SessionFactory", lambda: session)
+    monkeypatch.setattr(state_module, "assert_lease_in_session", assert_lease)
     partial_result = {
         "status": "partial",
         "summary": "Collected evidence before the limit.",
@@ -952,7 +963,7 @@ async def test_subtask_quality_review_stops_at_revision_limit(monkeypatch):
 
 
 def test_stored_plan_restores_subtask_order_and_dependencies():
-    from app.orchestrator import _restore_plan_from_rows
+    from app.planning import restore_plan_from_rows as _restore_plan_from_rows
 
     first_id = uuid.uuid4()
     second_id = uuid.uuid4()
@@ -1013,6 +1024,7 @@ def test_stored_plan_restores_subtask_order_and_dependencies():
 @pytest.mark.asyncio
 async def test_first_plan_generates_and_persists_purpose_title(monkeypatch):
     import app.orchestrator as orchestrator_module
+    import app.planning as planning_module
 
     task = Task(
         id=uuid.uuid4(),
@@ -1090,23 +1102,19 @@ async def test_first_plan_generates_and_persists_purpose_title(monkeypatch):
         return False
 
     monkeypatch.setattr(
-        orchestrator_module, "SessionFactory", lambda: sessions.pop(0)
+        planning_module, "SessionFactory", lambda: sessions.pop(0)
     )
-    monkeypatch.setattr(orchestrator_module, "_assert_lease", assert_lease)
+    monkeypatch.setattr(planning_module, "assert_lease", assert_lease)
     monkeypatch.setattr(
-        orchestrator_module,
-        "_assert_lease_in_session",
+        planning_module,
+        "assert_lease_in_session",
         assert_lease_in_session,
     )
+    monkeypatch.setattr(planning_module, "format_task_input", format_input)
     monkeypatch.setattr(
-        orchestrator_module, "_format_task_input", format_input
+        planning_module, "requeue_if_new_messages", no_new_messages
     )
-    monkeypatch.setattr(
-        orchestrator_module, "_requeue_if_new_messages", no_new_messages
-    )
-    monkeypatch.setattr(
-        orchestrator_module.model_client, "generate", generate
-    )
+    monkeypatch.setattr(planning_module.model_client, "generate", generate)
 
     first_message = ConversationMessage(
         sequence=1,
@@ -1160,6 +1168,7 @@ async def test_restored_legacy_plan_generates_title_from_first_instruction(
     monkeypatch,
 ):
     import app.orchestrator as orchestrator_module
+    import app.planning as planning_module
 
     task = Task(
         id=uuid.uuid4(),
@@ -1231,22 +1240,20 @@ async def test_restored_legacy_plan_generates_title_from_first_instruction(
         return None
 
     monkeypatch.setattr(
-        orchestrator_module, "SessionFactory", lambda: sessions.pop(0)
+        planning_module, "SessionFactory", lambda: sessions.pop(0)
     )
-    monkeypatch.setattr(orchestrator_module, "_assert_lease", assert_lease)
+    monkeypatch.setattr(planning_module, "assert_lease", assert_lease)
     monkeypatch.setattr(
-        orchestrator_module,
-        "_assert_lease_in_session",
+        planning_module,
+        "assert_lease_in_session",
         assert_lease_in_session,
     )
     monkeypatch.setattr(
-        orchestrator_module,
-        "_restore_plan_from_rows",
+        planning_module,
+        "restore_plan_from_rows",
         lambda *_args: plan,
     )
-    monkeypatch.setattr(
-        orchestrator_module.model_client, "generate", generate
-    )
+    monkeypatch.setattr(planning_module.model_client, "generate", generate)
 
     conversation = [
         ConversationMessage(
@@ -1595,6 +1602,7 @@ async def test_user_questions_pause_task_and_are_saved_as_assistant_message(
     monkeypatch,
 ):
     import app.orchestrator as orchestrator_module
+    import app.orchestration_state as state_module
 
     task_id = uuid.uuid4()
     job_id = uuid.uuid4()
@@ -1646,10 +1654,8 @@ async def test_user_questions_pause_task_and_are_saved_as_assistant_message(
     async def assert_lease(_session, _job_id, _lease_owner):
         return None
 
-    monkeypatch.setattr(orchestrator_module, "SessionFactory", lambda: session)
-    monkeypatch.setattr(
-        orchestrator_module, "_assert_lease_in_session", assert_lease
-    )
+    monkeypatch.setattr(state_module, "SessionFactory", lambda: session)
+    monkeypatch.setattr(state_module, "assert_lease_in_session", assert_lease)
 
     await orchestrator_module._pause_for_user_input(
         task_id,
@@ -2415,11 +2421,11 @@ async def test_failed_task_file_upload_requeues_task(monkeypatch, tmp_path):
         return 3
 
     monkeypatch.setattr(
-        "app.routers.tasks.resolve_workspace_file",
+        "app.routers.workspace.resolve_workspace_file",
         lambda *_args, **_kwargs: tmp_path / "brief.txt",
     )
     monkeypatch.setattr(
-        "app.routers.tasks.write_workspace_stream", write_workspace_stream
+        "app.routers.workspace.write_workspace_stream", write_workspace_stream
     )
     request = Request(
         {"type": "http", "method": "POST", "path": "/", "headers": []}
