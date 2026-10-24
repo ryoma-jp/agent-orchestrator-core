@@ -38,7 +38,7 @@ from app.quality import (
     normalize_checklist_results,
     required_checklist_items_passed,
 )
-from app.routers.tasks import add_message, upload_task_file
+from app.routers.tasks import add_message, edit_message, upload_task_file
 from app.schemas import (
     AdminSettingsUpdate,
     MessageCreate,
@@ -2145,6 +2145,173 @@ async def test_partial_task_reply_clears_report_and_requeues():
         isinstance(item, Job) and item.status == "pending"
         for item in session.added
     )
+
+
+@pytest.mark.asyncio
+async def test_editing_user_message_rewinds_conversation_and_requeues_task():
+    task_id = uuid.uuid4()
+    user = User(
+        id=uuid.uuid4(),
+        email="person@example.com",
+        password_hash="hash",
+        role="user",
+        is_active=True,
+        must_change_password=False,
+    )
+    task = Task(
+        id=task_id,
+        owner_id=user.id,
+        instruction="Original request",
+        title="Original title",
+        title_generated=True,
+        status="succeeded",
+        result="stale result",
+        error={"code": "old_error"},
+        completion_report={"unmet_items": []},
+    )
+    message = ConversationMessage(
+        id=uuid.uuid4(),
+        task_id=task_id,
+        sequence=1,
+        role="user",
+        content="Original request",
+    )
+
+    class FakeSession:
+        def __init__(self):
+            self.scalar_values = [task, message, message.id, 5]
+            self.added = []
+            self.statements = []
+
+        async def scalar(self, _statement):
+            return self.scalar_values.pop(0)
+
+        async def execute(self, statement):
+            self.statements.append(statement)
+
+        def add(self, value):
+            self.added.append(value)
+
+        async def commit(self):
+            return None
+
+        async def refresh(self, _value):
+            return None
+
+    session = FakeSession()
+    updated = await edit_message(
+        task_id,
+        message.id,
+        MessageCreate(content="Revised request"),
+        user,
+        session,
+    )
+
+    assert updated is message
+    assert message.content == "Revised request"
+    assert message.sequence == 6
+    assert task.instruction == "Revised request"
+    assert task.title is None
+    assert not task.title_generated
+    assert task.status == "queued"
+    assert task.result is None
+    assert task.error is None
+    assert task.completion_report is None
+    assert len(session.statements) == 2
+    assert "UPDATE task_files SET role=" in str(session.statements[1])
+    assert session.statements[1].compile().params["role"] == "source"
+    assert any(
+        isinstance(item, Job) and item.status == "pending"
+        for item in session.added
+    )
+    rewound_event = next(
+        item
+        for item in session.added
+        if isinstance(item, Event) and item.type == "conversation.rewound"
+    )
+    assert rewound_event.payload_json["previous_sequence"] == 1
+    assert rewound_event.payload_json["conversation_sequence"] == 6
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "initial_status",
+    ["queued", "planning", "running", "waiting_approval", "cancelled"],
+)
+async def test_message_edit_rejects_active_or_cancelled_task(initial_status):
+    task = Task(
+        id=uuid.uuid4(),
+        owner_id=uuid.uuid4(),
+        instruction="Research options",
+        status=initial_status,
+    )
+    user = User(
+        id=task.owner_id,
+        email="person@example.com",
+        password_hash="hash",
+        role="user",
+        is_active=True,
+        must_change_password=False,
+    )
+
+    class FakeSession:
+        async def scalar(self, _statement):
+            return task
+
+    with pytest.raises(HTTPException) as error:
+        await edit_message(
+            task.id,
+            uuid.uuid4(),
+            MessageCreate(content="Revised request"),
+            user,
+            FakeSession(),
+        )
+
+    assert error.value.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_assistant_message_cannot_be_edited():
+    task_id = uuid.uuid4()
+    user = User(
+        id=uuid.uuid4(),
+        email="person@example.com",
+        password_hash="hash",
+        role="user",
+        is_active=True,
+        must_change_password=False,
+    )
+    task = Task(
+        id=task_id,
+        owner_id=user.id,
+        instruction="Research options",
+        status="succeeded",
+    )
+    message = ConversationMessage(
+        id=uuid.uuid4(),
+        task_id=task_id,
+        sequence=2,
+        role="assistant",
+        content="Previous answer",
+    )
+
+    class FakeSession:
+        def __init__(self):
+            self.scalar_values = [task, message]
+
+        async def scalar(self, _statement):
+            return self.scalar_values.pop(0)
+
+    with pytest.raises(HTTPException) as error:
+        await edit_message(
+            task_id,
+            message.id,
+            MessageCreate(content="Revised answer"),
+            user,
+            FakeSession(),
+        )
+
+    assert error.value.status_code == 409
 
 
 @pytest.mark.asyncio

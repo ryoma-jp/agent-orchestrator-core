@@ -493,6 +493,14 @@ stateDiagram-v2
 
 現行の`needs_attention`では、Workerが重複を除いた質問をassistantメッセージとして保存し、処理ジョブを完了する。ユーザーが通常のメッセージAPIで回答すると新しいジョブを登録する。ツール予算の`waiting_approval`は別状態であり、要求ID付き承認APIだけが再開できる。副作用操作のresolve API、承認期限管理、Sandbox保持・破棄は実装されていない。
 
+#### 過去のユーザー指示の編集と再実行
+
+確定済みのタスク（`succeeded`、`partially_completed`、`failed`、`needs_attention`）では、会話中の任意のユーザー指示を編集して、その時点からタスクをやり直せる。`queued`、`planning`、`running`、`waiting_approval`、`cancelled`では編集を拒否する。実行中のWorkerとの競合や承認状態の迂回を避けるためである。
+
+編集要求はメッセージIDと更新後の本文を指定する。APIは所有者と対象がユーザーメッセージであることを検証し、タスク行をロックした上で、対象より後の会話メッセージを削除する。編集したメッセージは本文を置き換え、現在の最大sequenceより大きい新しいsequenceへ移す。これにより、同じsequenceをキーにした過去の計画を誤って再利用せず、編集点より前の会話順序を保ったまま新しい計画を作成できる。メッセージ更新、後続会話の削除、タスク結果のクリア、`queued`への遷移、イベントと実行ジョブの登録は単一DBトランザクションで確定する。初回指示を編集した場合は`tasks.instruction`も更新し、目的タイトルを未生成状態に戻して再計画時に再生成する。
+
+編集成功後はタスクを再実行し、古い結果・エラー・準完了レポートを表示対象から外す。計画・品質判定・SSEイベントの過去記録とWorkspaceファイル／TaskFileは保持する。Workspaceのファイルは会話メッセージとは独立したタスク資産であり、会話の巻き戻しでは削除しない。ただし編集点より後のユーザー発言に紐付くアップロードは`source`へ変更し、Explorerには残すがWorkerの計画入力から除外する。添付との対応sequenceを`task_files.conversation_sequence`に保持する。マイグレーションでは従来の添付メッセージ本文とパスから対応sequenceを補完し、対応付けできない既存ファイルはNULLのまま従来どおり入力対象とする。編集通知イベントには編集本文を含めず、UIはメッセージ一覧とタスク状態を再取得する。
+
 ### 6.2 実行シーケンス
 
 以下は現行の品質判定、ツール予算承認、SDK実行を含むシーケンスである。副作用承認、Sandbox、途中実行状態の完全復元など、別途未実装と記載した機能は含まない。個々のエージェント実行には4.5節の共通実行アダプターを使用する。
@@ -623,6 +631,7 @@ UIの認証はサーバー側セッションで行い、管理者UIと一般ユ�
 | `DELETE` | `/api/tasks/{task_id}` | 終端タスクの削除を要求し、削除ジョブIDと受付状態を`202 Accepted`で返す。Workspace清掃後にDB関連レコードを削除 |
 | `GET` | `/api/tasks/{task_id}/messages` | タスク固有の会話履歴を時系列で取得 |
 | `POST` | `/api/tasks/{task_id}/messages` | タスク固有の会話へユーザー指示を追加し、必要に応じて実行を継続 |
+| `PUT` | `/api/tasks/{task_id}/messages/{message_id}` | 確定済みタスクのユーザーメッセージを編集し、それ以後の会話を削除して同じタスクを再実行 |
 | `POST` | `/api/tasks/{task_id}/cancel` | タスクをキャンセル |
 | `POST` | `/api/tasks/{task_id}/tool-budget-approval` | `waiting_approval`中の所有タスクについて、保留中の要求IDを指定してタスク初期設定と同数の追加ツール呼び出しを承認または拒否。チャット文面での暗黙承認は行わない |
 | `GET` | `/api/tasks/{task_id}/events` | `Last-Event-ID`対応のSSEイベントストリーム |
@@ -635,6 +644,8 @@ UIの認証はサーバー側セッションで行い、管理者UIと一般ユ�
 タスク作成要求は`instruction`（1〜20,000文字）を受け取る。追加メッセージは`content`（1〜20,000文字）を受け取る。タスクには認証ユーザーの`owner_id`を設定し、初期タスク、会話メッセージ、イベント、ジョブをDBへ保存してから応答する。タスクAPIはWebセッションまたはユーザー別Bearerアクセスキーを受け付け、ブラウザーセッションの更新要求にはCSRF検証を行う。タスク一覧は`limit`のみ受け付け、状態フィルターやoffset/cursorページングはない。
 
 追加指示と入力ファイル追加はタスク所有者を検証して連番付き会話へ保存する。`succeeded`、`partially_completed`、`failed`、`needs_attention`では新しいジョブを登録する。`failed`からの再開はAPIキー設定など失敗原因を修正した後のユーザー操作に限り、自動再試行は行わない。`queued`、`planning`、`running`ではWorkerのチェックポイントで新sequenceを検出して再キューする。`cancelled`では追加指示・ファイル追加を拒否する。`waiting_approval`中は通常メッセージ／ファイル追加で承認を代替できず、要求IDを指定する承認APIだけを受け付ける。承認時は追加分を同じSubtaskの永続上限に加算して同じ計画を再開し、拒否時は保存済み部分結果を部分受け入れとして続行する。計画時にUTF-8テキスト添付の内容を上限内で読み込む。会話向け回答は会話履歴とタスク結果に保存する。要求ファイルがある場合だけ、その本文を指定名またはエージェントが選んだ名前でTaskFileとしてWorkspaceへ保存する。要求ファイルがない応答はWorkspaceへ複製しない。準完了の完了レポートは未達項目とユーザー向け説明を返すが、隠れた思考過程や他タスクの情報は含めない。入力検証失敗は秘密値を含まない汎用422本文を返す。副作用操作の承認／resolve APIとTerminal WebSocketは未実装である。
+
+過去指示の編集APIはブラウザーセッションのCSRF検証とタスク所有者検証を行う。対象はユーザー発言に限り、編集可能なタスク状態は`succeeded`、`partially_completed`、`failed`、`needs_attention`とする。編集トランザクションは対象より後の会話行を削除し、対象メッセージのsequenceを現在の最大値より大きく更新してから、新しい会話sequenceとしてイベント・ジョブへ記録する。編集点より後の会話sequenceを持つ入力ファイルは`source`に再分類して計画入力から外すが、WorkspaceとExplorerには保持する。編集対象が初回指示ならタスクの初期指示と生成タイトル状態も同期する。新しいsequenceは計画の検索キーでもあるため、編集前の計画が再利用されない。編集イベントは本文を含まず、過去の計画・レビュー・イベント履歴とWorkspaceファイルは保持する。
 
 Worker内のモデル要求とジョブ処理は設定回数まで再試行される。タスク削除は応答確定済み状態（`succeeded`、`partially_completed`、`failed`、`cancelled`）で受け付ける。現行実装は受付時にタスクへの新規操作を拒否し、Taskの削除要求時刻と外部キーcascadeに依存しない永続削除ジョブを記録する。API起動時の削除ワーカーがWorkspaceを冪等に削除し、確認後にTaskと関連レコードをcascade削除する。失敗時は期限付きリースとバックオフで再試行し、タスクを一覧・詳細から隠したまま全消去を待つ。現在Terminalプロセスは存在せず、将来Sandboxを導入する際は同じ清掃ジョブでTerminal接続・PTY・シェルと子プロセス・コンテナも停止する。削除完了後はタスク本文・ファイル内容を含む関連データを保持しない。
 
@@ -680,7 +691,7 @@ SSEエンドポイントはタスク所有者を検証し、DBのイベントID�
 | `quality_reviews` | `id`, `task_id`, `plan_version`, `target_type`, `target_id`, `revision_round`, `checklist_results`, `verdict`, `reviewer_model_id`, `created_at` | サブタスク成果物および最終成果物の判定を追記専用で保存 |
 | `events` | `id`, `task_id`, `type`, `payload_json`, `created_at` | SSE再送と画面進捗。`subtask_id`列は持たず、必要な識別子はpayloadに含める |
 | `jobs` | `id`, `task_id`, `status`, `available_at`, `lease_owner`, `lease_expires_at`, `attempt`, `created_at` | Workerが取得するタスク実行用耐久ジョブキューと期限付きリース |
-| `task_files` | `id`, `task_id`, `workspace_rel_path`, `role`, `source_kind`, `source_ref`, `size_bytes`, `created_at`, `updated_at` | 入力、ソース、重要な途中成果物、最終成果物のパス・由来・サイズを管理する。ファイル内容はWorkspaceに保存 |
+| `task_files` | `id`, `task_id`, `workspace_rel_path`, `role`, `source_kind`, `source_ref`, `conversation_sequence`, `size_bytes`, `created_at`, `updated_at` | 入力、ソース、重要な途中成果物、最終成果物のパス・由来・サイズと、会話上の添付位置を管理する。ファイル内容はWorkspaceに保存 |
 | `task_deletion_jobs` | `task_id`, `status`, `attempt`, `available_at`, `lease_owner`, `lease_expires_at`, `created_at` | Workspace清掃後にTaskを削除する耐久ジョブ。Taskへのcascade FKを持たず、清掃完了時にTask削除と同一トランザクションで除去 |
 
 現行DBには`users`、`system_settings`、`api_access_keys`、`web_sessions`、`tasks`、`conversation_messages`、`subtasks`、`task_plans`、`quality_reviews`、`events`、`jobs`、`task_files`、`task_deletion_jobs`の13テーブルがある。`task_workspaces`はSandbox分離時の将来拡張である。`tasks.pending_tool_approval`は現在保留中の要求だけを保持し、決定後に消去する。承認履歴は専用テーブルを増やさず、要求・決定イベントへ記録する。`tasks.deletion_requested_at`は削除受付後のアクセス遮断に使う。TaskFileの内容は名前付きWorkspaceボリュームを正本とし、DBには入力／ソース／途中成果物／最終成果物の区分、相対パス、由来、サイズ等のメタデータを保存する。タスク削除ジョブはTaskへの外部キーを持たず、Workspace清掃の失敗時も残して再試行する。`subtasks`には成果物目標・チェックリスト・計画バージョン・品質修正回数・承認後の累積ツール上限を保存する。計画バージョンはタスク内で一意とし、品質判定は上書きせず履歴として残す。判定記録にはチェック項目ごとの結果、短い判断根拠、成果物中の証拠、判定モデルを含める。隠れた思考過程は保存しない。タスク所有者以外へタスク詳細を返さない。
@@ -765,6 +776,7 @@ SDK導入後の例外は共通実行アダプターで分類し、ターン上�
 - **タスク一覧／詳細**: タスク一覧はUser UIの左サイドバーに配置し、最上部の「New task」から新規作成する。一覧は更新日時の新しい順に並べ、各タスクの状態を併記する。タイトルは複数行で省略表示し、件数が表示領域を超えた場合は一覧内をスクロールする。専用のタスク一覧ペインは設けず、選択したタスクの会話・進捗・ファイルを残りの主領域に表示する。チェックリスト進捗と、最終回答が準完了の場合の未達項目・制約も表示する。ユーザー所有権はAPI側で検証する。
 - **Workspace／Explorer**: 全タスクにタスクごとの永続ファイル領域を用意し、入力アップロード、ファイルと空ディレクトリを含む一覧、テキストプレビュー／編集、ダウンロード、削除を提供する。ツリー表示はReact Arborist、コード編集はCodeMirror 6（`@uiw/react-codemirror`）を利用し、所有者認可、Workspaceパス検査、TaskFileメタデータ、削除ライフサイクルはアプリケーションが担う。Workerが読む添付は許可したUTF-8テキスト形式に限る。タスク終了後もタスク削除まで保持する。TerminalとGit cloneは未実装であり、隔離Sandboxを追加するまでホストコマンドを公開しない。
 - **タスクへの追加指示**: 実行中の追加指示は会話に保存し、処理中呼び出しの完了・保存後のチェックポイントで反映する。
+- **過去指示の編集**: 確定済みタスクのユーザー発言に編集操作を表示する。保存すると編集点以後の会話を除去し、その発言を新しいsequenceとして登録してタスクを再実行する。実行中・承認待ち・キャンセル済みのタスクでは編集できない。Workspaceファイルは削除せず保持する。
 - **要確認**: `needs_attention`で表示されたエージェントの質問に会話で返信して処理を継続する。承認・副作用結果の解決UIはない。
 - **追加ツール予算承認**: `waiting_approval`のタスク詳細に対象サブタスク、追加調査理由、追加回数を表示し、承認／拒否ボタンを提供する。要求IDを伴うAPI応答だけを承認として扱い、チャット返信や再接続で承認状態を推測しない。
 - **追加ツール予算の承認**: `waiting_approval`では対象サブタスク、追加調査が必要な理由、追加回数を表示する。要求IDに結び付いた承認／拒否ボタンのみで決定し、通常のチャット返信を承認として解釈しない。承認後は同じ計画・サブタスクを再開し、拒否後は保存済み部分結果を統合する。副作用操作の承認UIは未実装である。

@@ -121,8 +121,15 @@ button:disabled { cursor: wait; opacity: .6; }
 .message { display: grid; grid-template-columns: 27px minmax(0, 1fr); gap: 10px; margin: 0 0 22px; animation: rise-in .24s ease both; }
 .message-avatar { width: 27px; height: 27px; display: grid; place-items: center; border-radius: 50%; background: #e6e7df; color: #55584f; font-size: 10px; }
 .message-assistant .message-avatar { border-radius: 8px 8px 8px 2px; background: #dce9be; color: #4b622b; }
+.message-content { min-width: 0; }
+.message-heading { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
 .message-meta { display: flex; align-items: center; gap: 9px; font-size: 11px; font-weight: 700; }
 .message-meta time { color: #9a9b94; font: 10px var(--mono); }
+.message-edit-trigger { width: 26px; height: 26px; flex: 0 0 auto; color: #777a72; }
+.message-edit { display: grid; gap: 9px; margin-top: 8px; }
+.message-edit textarea { width: 100%; min-height: 92px; padding: 10px; border: 1px solid #cfd1c7; border-radius: 3px; background: #fff; color: var(--ink); font-size: 12px; line-height: 1.6; resize: vertical; }
+.message-edit-actions { display: flex; justify-content: flex-end; gap: 7px; }
+.message-edit-actions button { min-height: 32px; padding-inline: 10px; font-size: 10px; }
 .message p, .result-block p, .error-block p, .partial-block p { margin: 6px 0 0; white-space: pre-wrap; overflow-wrap: anywhere; color: #585a54; font-size: 12px; line-height: 1.65; }
 .progress-note { display: flex; align-items: center; gap: 8px; padding: 11px 12px; margin: 9px 0 18px; background: #f0f1e8; color: #666a5e; font-size: 11px; }
 .progress-note svg { color: #66853d; animation: rotate 2s linear infinite; }

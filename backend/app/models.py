@@ -175,6 +175,7 @@ class TaskFile(Base):
     role: Mapped[str] = mapped_column(String(16), default="input")
     source_kind: Mapped[str] = mapped_column(String(32), default="user_upload")
     source_ref: Mapped[str | None] = mapped_column(Text)
+    conversation_sequence: Mapped[int | None] = mapped_column(Integer)
     size_bytes: Mapped[int] = mapped_column(BigInteger, default=0)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()

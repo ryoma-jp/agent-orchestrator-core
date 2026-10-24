@@ -8,7 +8,7 @@ from pathlib import Path
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from fastapi.responses import FileResponse, StreamingResponse
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
@@ -418,6 +418,7 @@ async def upload_task_file(
         role="user",
         content=f"Attached input file: {relative_path}",
     )
+    task_file.conversation_sequence = message.sequence
     db.add(message)
     await db.flush()
     db.add(
@@ -778,6 +779,131 @@ async def add_message(
             )
         )
         db.add(Job(task_id=task_id, status="pending"))
+    await db.commit()
+    await db.refresh(message)
+    return message
+
+
+@router.put(
+    "/{task_id}/messages/{message_id}",
+    response_model=MessageView,
+    dependencies=[Depends(require_task_csrf)],
+)
+async def edit_message(
+    task_id: uuid.UUID,
+    message_id: uuid.UUID,
+    payload: MessageCreate,
+    user: User = Depends(require_ready_task_user),
+    db: AsyncSession = Depends(get_session),
+):
+    task = await db.scalar(
+        select(Task)
+        .where(
+            Task.id == task_id,
+            Task.owner_id == user.id,
+            Task.deletion_requested_at.is_(None),
+        )
+        .with_for_update()
+    )
+    if task is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+    if task.status not in {
+        "succeeded",
+        "partially_completed",
+        "failed",
+        "needs_attention",
+    }:
+        raise HTTPException(
+            status_code=409,
+            detail="This task is not available for message editing",
+        )
+
+    message = await db.scalar(
+        select(ConversationMessage)
+        .where(
+            ConversationMessage.id == message_id,
+            ConversationMessage.task_id == task_id,
+        )
+        .with_for_update()
+    )
+    if message is None:
+        raise HTTPException(status_code=404, detail="Message not found")
+    if message.role != "user":
+        raise HTTPException(
+            status_code=409, detail="Only user messages can be edited"
+        )
+
+    first_user_message_id = await db.scalar(
+        select(ConversationMessage.id)
+        .where(
+            ConversationMessage.task_id == task_id,
+            ConversationMessage.role == "user",
+        )
+        .order_by(ConversationMessage.sequence)
+        .limit(1)
+    )
+    current_max_sequence = await db.scalar(
+        select(func.max(ConversationMessage.sequence)).where(
+            ConversationMessage.task_id == task_id
+        )
+    ) or 0
+    if current_max_sequence >= 2_147_483_647:
+        raise HTTPException(status_code=409, detail="Message history is full")
+
+    previous_sequence = message.sequence
+    new_sequence = current_max_sequence + 1
+    await db.execute(
+        delete(ConversationMessage).where(
+            ConversationMessage.task_id == task_id,
+            ConversationMessage.sequence > previous_sequence,
+        )
+    )
+    await db.execute(
+        update(TaskFile)
+        .where(
+            TaskFile.task_id == task_id,
+            TaskFile.role == "input",
+            TaskFile.conversation_sequence > previous_sequence,
+        )
+        .values(role="source")
+    )
+    now = datetime.now(timezone.utc)
+    message.content = payload.content
+    message.sequence = new_sequence
+    message.created_at = now
+    if message.id == first_user_message_id:
+        task.instruction = payload.content
+        task.title = None
+        task.title_generated = False
+    task.status = "queued"
+    task.result = None
+    task.error = None
+    task.completion_report = None
+    task.pending_tool_approval = None
+    task.updated_at = now
+    db.add(
+        Event(
+            task_id=task_id,
+            type="conversation.rewound",
+            payload_json={
+                "message_id": str(message.id),
+                "previous_sequence": previous_sequence,
+                "sequence": new_sequence,
+                "conversation_sequence": new_sequence,
+            },
+        )
+    )
+    db.add(
+        Event(
+            task_id=task_id,
+            type="task.status_changed",
+            payload_json={
+                "status": "queued",
+                "conversation_sequence": new_sequence,
+            },
+        )
+    )
+    db.add(Job(task_id=task_id, status="pending"))
     await db.commit()
     await db.refresh(message)
     return message

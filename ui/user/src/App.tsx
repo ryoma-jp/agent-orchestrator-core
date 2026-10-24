@@ -3,7 +3,7 @@ import { Tree, type NodeRendererProps } from 'react-arborist'
 import {
   Activity, ArrowUpRight, Ban, Check, ChevronDown, Command,
   Copy, Download, FileText, Folder, FolderOpen, KeyRound, LoaderCircle,
-  LogOut, MessageSquareText, Plus, Save, Send, Sparkles, Trash2, Upload, X,
+  LogOut, MessageSquareText, Pencil, Plus, Save, Send, Sparkles, Trash2, Upload, X,
 } from 'lucide-react'
 
 const CodeTextEditor = lazy(() => import('./CodeTextEditor'))
@@ -54,6 +54,8 @@ function App() {
   const [active, setActive] = useState<Task | null>(null)
   const [detailTab, setDetailTab] = useState<'thread' | 'files'>('thread')
   const [messages, setMessages] = useState<Message[]>([])
+  const [editingMessageId, setEditingMessageId] = useState<string | null>(null)
+  const [editingContent, setEditingContent] = useState('')
   const [progress, setProgress] = useState<ProgressItem[]>([])
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
@@ -63,7 +65,11 @@ function App() {
   const refreshTasks = async () => setTasks(await api<Task[]>('/tasks'))
   const refreshMessages = async (taskId: string) => setMessages(await api<Message[]>(`/tasks/${taskId}/messages`))
 
-  useEffect(() => setDetailTab('thread'), [active?.id])
+  useEffect(() => {
+    setDetailTab('thread')
+    setEditingMessageId(null)
+    setEditingContent('')
+  }, [active?.id])
 
   useEffect(() => {
     api<{ status: string }>('/health')
@@ -128,7 +134,7 @@ function App() {
         ? current
         : [...current, { id: message.lastEventId, conversationSequence, content }])
     }
-    for (const name of ['task.status_changed', 'conversation.message_added', 'task.completed', 'task.partially_completed', 'task.failed']) {
+    for (const name of ['task.status_changed', 'conversation.message_added', 'conversation.rewound', 'task.completed', 'task.partially_completed', 'task.failed']) {
       stream.addEventListener(name, sync)
     }
     for (const name of ['plan.created', 'subtask.status_changed', 'agent.progress', 'quality.checklists_created', 'quality.review_completed', 'task.status_changed']) {
@@ -172,6 +178,27 @@ function App() {
     try {
       await api<Message>(`/tasks/${active.id}/messages`, { method: 'POST', body: JSON.stringify({ content }) })
       form.reset(); await refreshMessages(active.id); await refreshTasks()
+    } catch (reason) { setError((reason as Error).message) }
+    finally { setBusy(false) }
+  }
+
+  const saveEditedMessage = async (event: FormEvent<HTMLFormElement>, messageId: string) => {
+    event.preventDefault()
+    if (!active) return
+    const content = editingContent.trim()
+    if (!content) return
+    setBusy(true); setError('')
+    try {
+      await api<Message>(`/tasks/${active.id}/messages/${messageId}`, {
+        method: 'PUT', body: JSON.stringify({ content }),
+      })
+      setEditingMessageId(null); setEditingContent('')
+      const [task, history, updatedTasks] = await Promise.all([
+        api<Task>(`/tasks/${active.id}`),
+        api<Message[]>(`/tasks/${active.id}/messages`),
+        api<Task[]>('/tasks'),
+      ])
+      setActive(task); setMessages(history); setTasks(updatedTasks)
     } catch (reason) { setError((reason as Error).message) }
     finally { setBusy(false) }
   }
@@ -225,6 +252,7 @@ function App() {
   }} />
 
   const latestUserMessageSequence = messages.filter((message) => message.role === 'user').at(-1)?.sequence
+  const canEditMessages = ['succeeded', 'partially_completed', 'failed', 'needs_attention'].includes(active?.status ?? '')
   const renderProgress = (conversationSequence: number) => {
     const items = progress.filter((item) => item.conversationSequence === conversationSequence)
     if (items.length === 0) return null
@@ -275,7 +303,25 @@ function App() {
               </div>
             </article>}
             {detailTab === 'files' ? <WorkspacePanel taskId={active.id} refreshOnCompletion={['succeeded', 'partially_completed', 'failed'].includes(active.status)} /> : <>
-            <div className="thread" aria-live="polite">{messages.map((message) => <Fragment key={message.id}><article className={`message message-${message.role}`}><div className="message-avatar">{message.role === 'user' ? user.email[0].toUpperCase() : <Sparkles size={14} />}</div><div><div className="message-meta">{message.role === 'user' ? 'You' : 'Relay'} <time>{new Date(message.created_at).toLocaleTimeString('ja-JP', { hour: '2-digit', minute: '2-digit' })}</time></div><p>{message.content}</p></div></article>{message.role === 'user' && renderProgress(message.sequence)}</Fragment>)}
+            <div className="thread" aria-live="polite">{messages.map((message) => <Fragment key={message.id}>
+              <article className={`message message-${message.role}`}>
+                <div className="message-avatar">{message.role === 'user' ? user.email[0].toUpperCase() : <Sparkles size={14} />}</div>
+                <div className="message-content">
+                  <div className="message-heading">
+                    <div className="message-meta">{message.role === 'user' ? 'You' : 'Relay'} <time>{new Date(message.created_at).toLocaleTimeString('ja-JP', { hour: '2-digit', minute: '2-digit' })}</time></div>
+                    {canEditMessages && message.role === 'user' && editingMessageId !== message.id && <button className="message-edit-trigger icon-btn" type="button" title="Edit and rerun from this instruction" aria-label="Edit this instruction" disabled={busy} onClick={() => { setEditingMessageId(message.id); setEditingContent(message.content) }}><Pencil size={14} /></button>}
+                  </div>
+                  {editingMessageId === message.id ? <form className="message-edit" onSubmit={(event) => saveEditedMessage(event, message.id)}>
+                    <textarea value={editingContent} onChange={(event) => setEditingContent(event.target.value)} rows={4} maxLength={20000} required aria-label="Edit instruction" />
+                    <div className="message-edit-actions">
+                      <button className="outline-btn" type="button" disabled={busy} onClick={() => { setEditingMessageId(null); setEditingContent('') }}><X size={14} /> Cancel</button>
+                      <button className="primary-btn" type="submit" disabled={busy || !editingContent.trim()}><Save size={14} /> Save and rerun</button>
+                    </div>
+                  </form> : <p>{message.content}</p>}
+                </div>
+              </article>
+              {message.role === 'user' && renderProgress(message.sequence)}
+            </Fragment>)}
               {active.status === 'queued' && <div className="progress-note"><LoaderCircle size={15} /> Waiting for an available worker</div>}
               {active.status === 'needs_attention' && <div className="clarification-note" role="status"><MessageSquareText size={15} /> Reply below to continue this task.</div>}
               {active.status === 'partially_completed' && active.completion_report && <article className="partial-block"><strong>未達項目 · 計画 v{active.completion_report.plan_version}</strong><ul>{active.completion_report.unmet_items.map((item) => <li key={`${item.target_type}-${item.subtask_title}-${item.item_id}`}><b>{item.subtask_title ?? '最終回答'}: {item.description}</b>{item.deficiency && <span>{item.deficiency}</span>}{item.evidence && <small>確認内容: {item.evidence}</small>}</li>)}</ul></article>}
