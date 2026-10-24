@@ -32,11 +32,12 @@ from app.schemas import (
     TaskFileView,
     TaskView,
     ToolBudgetApprovalDecision,
+    WorkspaceDirectoryView,
 )
 from app.tool_budget_approval import resolve_tool_budget_approval
 from app.workspaces import (
     InvalidWorkspacePath,
-    list_workspace_files,
+    list_workspace_entries,
     normalize_workspace_path,
     resolve_workspace_file,
     task_workspace,
@@ -297,7 +298,8 @@ async def delete_task(
 
 
 @router.get(
-    "/{task_id}/workspace/files", response_model=list[TaskFileView]
+    "/{task_id}/workspace/files",
+    response_model=list[TaskFileView | WorkspaceDirectoryView],
 )
 async def list_task_files(
     task_id: uuid.UUID,
@@ -310,11 +312,14 @@ async def list_task_files(
     )
     metadata = {row.workspace_rel_path: row for row in metadata_rows}
     items = []
-    for file_info in list_workspace_files(task_id):
+    for file_info in list_workspace_entries(task_id):
         path = str(file_info["path"])
+        if file_info["kind"] == "directory":
+            items.append(WorkspaceDirectoryView(path=path))
+            continue
         row = metadata.get(path)
         if row is not None:
-            items.append(row)
+            items.append(TaskFileView.model_validate(row))
             continue
         updated_at = datetime.fromtimestamp(
             float(file_info["updated_at"]), tz=timezone.utc

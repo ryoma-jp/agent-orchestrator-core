@@ -191,12 +191,19 @@ async def test_task_workspace_files_are_owner_scoped_and_deleted_with_task(
             state.user,
             session,
         )
+        workspace = workspaces.task_workspace(state.task.id)
+        (workspace / "empty").mkdir()
+        (workspace / "nested" / "empty").mkdir(parents=True)
         files = await task_router.list_task_files(
             state.task.id, state.user, session
         )
-        assert [(file.path, file.role) for file in files] == [
-            ("inputs/brief.txt", "input")
-        ]
+        entries_by_path = {entry.path: entry for entry in files}
+        assert entries_by_path["inputs/brief.txt"].kind == "file"
+        assert entries_by_path["inputs/brief.txt"].role == "input"
+        assert entries_by_path["inputs"].kind == "directory"
+        assert entries_by_path["empty"].kind == "directory"
+        assert entries_by_path["nested"].kind == "directory"
+        assert entries_by_path["nested/empty"].kind == "directory"
         with pytest.raises(HTTPException) as error:
             await task_router.list_task_files(
                 state.task.id,

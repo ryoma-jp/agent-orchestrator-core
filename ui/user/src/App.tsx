@@ -21,8 +21,10 @@ type Task = {
 }
 type Message = { id: string; sequence: number; role: 'user' | 'assistant'; content: string; created_at: string }
 type ProgressItem = { id: string; conversationSequence: number; content: string }
-type WorkspaceFile = { id: string; path: string; role: string; source_kind: string; size_bytes: number; updated_at: string }
-type ExplorerNodeData = { id: string; name: string; file?: WorkspaceFile; children?: ExplorerNodeData[] }
+type WorkspaceFile = { kind: 'file'; id: string; path: string; role: string; source_kind: string; size_bytes: number; updated_at: string }
+type WorkspaceDirectory = { kind: 'directory'; path: string }
+type WorkspaceEntry = WorkspaceFile | WorkspaceDirectory
+type ExplorerNodeData = { id: string; name: string; path: string; kind: WorkspaceEntry['kind']; file?: WorkspaceFile; children?: ExplorerNodeData[]; empty?: boolean }
 
 async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
   const headers = new Headers(init.headers)
@@ -292,28 +294,37 @@ function App() {
   </div>
 }
 
-function buildExplorerTree(files: WorkspaceFile[]): ExplorerNodeData[] {
+function buildExplorerTree(entries: WorkspaceEntry[]): ExplorerNodeData[] {
   const roots: ExplorerNodeData[] = []
   const folders = new Map<string, ExplorerNodeData>()
-  for (const file of files) {
-    const parts = file.path.split('/')
+  for (const entry of entries) {
+    const parts = entry.path.split('/')
     let parent = roots
     let currentPath = ''
     for (const [index, name] of parts.entries()) {
       currentPath = currentPath ? `${currentPath}/${name}` : name
-      if (index === parts.length - 1) {
-        parent.push({ id: `file:${file.path}`, name, file })
+      const isLastPart = index === parts.length - 1
+      if (isLastPart && entry.kind === 'file') {
+        parent.push({ id: `file:${entry.path}`, name, path: entry.path, kind: 'file', file: entry })
         continue
       }
       let folder = folders.get(currentPath)
       if (!folder) {
-        folder = { id: `folder:${currentPath}`, name, children: [] }
+        folder = { id: `folder:${currentPath}`, name, path: currentPath, kind: 'directory', children: [] }
         folders.set(currentPath, folder)
         parent.push(folder)
       }
       parent = folder.children ?? []
     }
   }
+  const markEmptyDirectories = (nodes: ExplorerNodeData[]) => {
+    for (const node of nodes) {
+      if (node.kind !== 'directory') continue
+      node.empty = node.children?.length === 0
+      markEmptyDirectories(node.children ?? [])
+    }
+  }
+  markEmptyDirectories(roots)
   return roots
 }
 
@@ -324,15 +335,15 @@ function ExplorerTreeRow({ node, style, dragHandle }: NodeRendererProps<Explorer
     className={`explorer-node ${node.isSelected ? 'selected' : ''}`}
     onClick={(event) => node.handleClick(event)}
     onDoubleClick={() => { if (node.isInternal) node.toggle() }}
-    title={node.data.file?.path ?? node.data.name}
+    title={node.data.file?.path ?? `${node.data.path}${node.data.empty ? ' (empty directory)' : ''}`}
   >
-    {node.isLeaf ? <FileText size={14} /> : node.isOpen ? <FolderOpen size={14} /> : <Folder size={14} />}
-    <span>{node.data.name}</span>
+    {node.data.kind === 'file' ? <FileText size={14} /> : node.isOpen ? <FolderOpen size={14} /> : <Folder size={14} />}
+    <span>{node.data.name}</span>{node.data.empty && <small className="explorer-empty-label">empty</small>}
   </div>
 }
 
 function WorkspacePanel({ taskId, refreshOnCompletion }: { taskId: string; refreshOnCompletion: boolean }) {
-  const [files, setFiles] = useState<WorkspaceFile[]>([])
+  const [files, setFiles] = useState<WorkspaceEntry[]>([])
   const [selected, setSelected] = useState<WorkspaceFile | null>(null)
   const [content, setContent] = useState('')
   const [loading, setLoading] = useState(true)
@@ -342,15 +353,15 @@ function WorkspacePanel({ taskId, refreshOnCompletion }: { taskId: string; refre
   const [treeSize, setTreeSize] = useState({ width: 0, height: 0 })
 
   const refresh = async () => {
-    const items = await api<WorkspaceFile[]>(`/tasks/${taskId}/workspace/files`)
+    const items = await api<WorkspaceEntry[]>(`/tasks/${taskId}/workspace/files`)
     setFiles(items)
-    setSelected((current) => current ? items.find((file) => file.path === current.path) ?? null : null)
+    setSelected((current) => current ? items.find((entry): entry is WorkspaceFile => entry.kind === 'file' && entry.path === current.path) ?? null : null)
   }
 
   useEffect(() => {
     let alive = true
     setLoading(true)
-    api<WorkspaceFile[]>(`/tasks/${taskId}/workspace/files`)
+    api<WorkspaceEntry[]>(`/tasks/${taskId}/workspace/files`)
       .then((items) => { if (alive) setFiles(items) })
       .catch((reason) => { if (alive) setError((reason as Error).message) })
       .finally(() => { if (alive) setLoading(false) })
@@ -362,11 +373,11 @@ function WorkspacePanel({ taskId, refreshOnCompletion }: { taskId: string; refre
   useEffect(() => {
     if (!refreshOnCompletion) return
     let alive = true
-    api<WorkspaceFile[]>(`/tasks/${taskId}/workspace/files`)
+    api<WorkspaceEntry[]>(`/tasks/${taskId}/workspace/files`)
       .then((items) => {
         if (!alive) return
         setFiles(items)
-        setSelected((current) => current ? items.find((file) => file.path === current.path) ?? null : null)
+        setSelected((current) => current ? items.find((entry): entry is WorkspaceFile => entry.kind === 'file' && entry.path === current.path) ?? null : null)
       })
       .catch((reason) => { if (alive) setError((reason as Error).message) })
     return () => { alive = false }
@@ -459,10 +470,11 @@ function WorkspacePanel({ taskId, refreshOnCompletion }: { taskId: string; refre
   }
 
   const textFile = selected && ['md', 'txt', 'json', 'py', 'ts', 'tsx', 'js', 'jsx', 'css', 'html', 'xml', 'yaml', 'yml', 'toml', 'sh', 'sql', 'csv', 'log'].includes(selected.path.split('.').at(-1)?.toLowerCase() ?? '') && selected.size_bytes <= 1_000_000
+  const fileCount = files.filter((entry) => entry.kind === 'file').length
   const treeData = buildExplorerTree(files)
 
   return <section className="workspace-panel" aria-label="Task files">
-    <div className="workspace-toolbar"><div><div className="eyebrow">TASK WORKSPACE</div><strong>{files.length} files</strong></div><label className="icon-btn workspace-upload" title="Upload input files"><Upload size={16} /><input type="file" multiple onChange={upload} disabled={busy} /></label></div>
+    <div className="workspace-toolbar"><div><div className="eyebrow">TASK WORKSPACE</div><strong>{fileCount} files</strong></div><label className="icon-btn workspace-upload" title="Upload input files"><Upload size={16} /><input type="file" multiple onChange={upload} disabled={busy} /></label></div>
     {error && <div className="workspace-error" role="alert">{error}</div>}
     {loading ? <div className="workspace-empty">Loading files...</div> : files.length === 0 ? <div className="workspace-empty"><FolderOpen size={21} /><strong>No files yet</strong><span>Upload task inputs or save an artifact here.</span></div> : <div className="workspace-browser">
       <div className="file-list" aria-label="Files" ref={fileTreeElement}>

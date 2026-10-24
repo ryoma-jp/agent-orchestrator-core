@@ -86,7 +86,7 @@ async def write_workspace_stream(
     return size
 
 
-def list_workspace_files(task_id: uuid.UUID) -> list[dict[str, object]]:
+def list_workspace_entries(task_id: uuid.UUID) -> list[dict[str, object]]:
     workspace = task_workspace(task_id, create=True)
     items: list[dict[str, object]] = []
     for directory, directories, filenames in os.walk(
@@ -98,6 +98,14 @@ def list_workspace_files(task_id: uuid.UUID) -> list[dict[str, object]]:
             for name in directories
             if name != ".git" and not (base / name).is_symlink()
         ]
+        for name in directories:
+            path = base / name
+            items.append(
+                {
+                    "kind": "directory",
+                    "path": path.relative_to(workspace).as_posix(),
+                }
+            )
         for filename in filenames:
             path = base / filename
             if path.is_symlink() or not path.is_file():
@@ -105,12 +113,16 @@ def list_workspace_files(task_id: uuid.UUID) -> list[dict[str, object]]:
             stat = path.stat()
             items.append(
                 {
+                    "kind": "file",
                     "path": path.relative_to(workspace).as_posix(),
                     "size_bytes": stat.st_size,
                     "updated_at": stat.st_mtime,
                 }
             )
-    return sorted(items, key=lambda item: str(item["path"]).casefold())
+    return sorted(
+        items,
+        key=lambda item: (str(item["path"]).casefold(), str(item["kind"])),
+    )
 
 
 def delete_task_workspace(task_id: uuid.UUID) -> None:

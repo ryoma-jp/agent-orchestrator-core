@@ -29,6 +29,7 @@ from app.models import (
     QualityReview,
     Subtask,
     Task,
+    TaskFile,
     User,
 )
 from app.openai_client import AgentExecutionError, StructuredModelClient
@@ -98,9 +99,30 @@ def test_workspace_paths_reject_absolute_and_parent_paths():
             workspaces.normalize_workspace_path(path)
 
 
+def test_workspace_listing_includes_empty_directories(monkeypatch, tmp_path):
+    task_id = uuid.uuid4()
+    settings = SimpleNamespace(workspace_root=str(tmp_path / "workspaces"))
+    monkeypatch.setattr(workspaces, "get_settings", lambda: settings)
+    workspace = workspaces.task_workspace(task_id, create=True)
+    (workspace / "empty").mkdir()
+    (workspace / "nested" / "empty").mkdir(parents=True)
+    (workspace / "with-file" / "note.txt").parent.mkdir()
+    (workspace / "with-file" / "note.txt").write_text("contents")
+
+    entries = workspaces.list_workspace_entries(task_id)
+    entries_by_path = {entry["path"]: entry for entry in entries}
+
+    assert entries_by_path["empty"]["kind"] == "directory"
+    assert entries_by_path["nested"]["kind"] == "directory"
+    assert entries_by_path["nested/empty"]["kind"] == "directory"
+    assert entries_by_path["with-file"]["kind"] == "directory"
+    assert entries_by_path["with-file/note.txt"]["kind"] == "file"
+
+
 def test_task_file_view_serializes_workspace_path_as_path():
-    file_view = TaskFileView(
+    task_file = TaskFile(
         id=uuid.uuid4(),
+        task_id=uuid.uuid4(),
         workspace_rel_path="artifacts/final-answer.md",
         role="final",
         source_kind="agent",
@@ -109,8 +131,10 @@ def test_task_file_view_serializes_workspace_path_as_path():
         created_at=datetime.now(timezone.utc),
         updated_at=datetime.now(timezone.utc),
     )
+    file_view = TaskFileView.model_validate(task_file)
 
     assert file_view.model_dump()["path"] == "artifacts/final-answer.md"
+    assert file_view.model_dump()["kind"] == "file"
 
 
 def test_tool_budget_approval_state_and_decision_are_serializable():

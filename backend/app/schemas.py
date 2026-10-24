@@ -115,6 +115,7 @@ class TaskView(BaseModel):
 
 class TaskFileView(BaseModel):
     id: uuid.UUID
+    kind: Literal["file"] = "file"
     path: str = Field(validation_alias="workspace_rel_path")
     role: Literal["input", "source", "intermediate", "final"]
     source_kind: str
@@ -124,6 +125,11 @@ class TaskFileView(BaseModel):
     updated_at: datetime
 
     model_config = ConfigDict(from_attributes=True, populate_by_name=True)
+
+
+class WorkspaceDirectoryView(BaseModel):
+    kind: Literal["directory"] = "directory"
+    path: str
 
 
 class TaskDeletionView(BaseModel):
