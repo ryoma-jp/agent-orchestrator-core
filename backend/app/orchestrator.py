@@ -15,6 +15,7 @@ from app.agent_schemas import (
     SourceReference,
     SubtaskResult,
     TaskPlan,
+    TaskTitle,
     ToolExecutionRecord,
 )
 from app.config import get_settings
@@ -167,16 +168,50 @@ async def _load_or_create_plan(
                 )
             )
             version = plan_record.version
-            plan = _restore_plan_from_rows(plan_record, subtask_rows)
+            task = await session.get(Task, task_id)
+            plan = _restore_plan_from_rows(
+                plan_record, subtask_rows, task.title if task else None
+            )
+            needs_title = task is not None and not task.title_generated
         else:
             subtask_rows = []
             plan = None
             version = 0
+            needs_title = False
 
     if plan_record is not None:
+        if needs_title:
+            await _assert_lease(job_id, lease_owner)
+            first_instruction = next(
+                (
+                    message.content
+                    for message in conversation
+                    if message.role == "user"
+                ),
+                None,
+            )
+            if first_instruction is None:
+                raise RuntimeError("initial_task_instruction_missing")
+            generated_title = await model_client.generate(
+                model=config["manager_model"],
+                schema_name="task_title",
+                schema=TaskTitle,
+                system_prompt=(
+                    "Extract the user's purpose from the initial instruction "
+                    "and create a concise task title in the same language. "
+                    "Express the goal, do not copy the instruction verbatim. "
+                    "Return no explanation or hidden reasoning."
+                ),
+                input_text=first_instruction,
+                max_attempts=config["max_agent_attempts"],
+                **_agent_options(task_id, job_id, lease_owner, config),
+            )
         async with SessionFactory() as session:
             await _assert_lease_in_session(session, job_id, lease_owner)
             task = await session.get(Task, task_id)
+            if needs_title:
+                task.title = generated_title.title
+                task.title_generated = True
             task.status = "running"
             task.updated_at = datetime.now(timezone.utc)
             session.add(
@@ -200,6 +235,10 @@ async def _load_or_create_plan(
         system_prompt=(
             "You are a task-planning manager. Make a concise plan of "
             "independently useful, read-only research and reasoning subtasks. "
+            "Set title to a concise, purpose-oriented title in the language "
+            "of the user's first instruction. Derive it only from that first "
+            "user instruction, not later follow-ups, and do not copy the "
+            "instruction verbatim. "
             "Do not request shell, file, network-write, or other side-effect "
             "tools. Include dependencies by zero-based subtask index. Define "
             "an artifact_goal and a concrete acceptance_checklist for every "
@@ -315,6 +354,9 @@ async def _load_or_create_plan(
             )
         )
         task = await session.get(Task, task_id)
+        if not task.title_generated:
+            task.title = plan.title
+            task.title_generated = True
         task.status = "running"
         task.updated_at = datetime.now(timezone.utc)
         session.add(
@@ -742,7 +784,9 @@ async def _format_task_input(
     return content + "\n\n" + "\n".join(sections)
 
 
-def _restore_plan_from_rows(plan_record, rows: list[Subtask]) -> TaskPlan:
+def _restore_plan_from_rows(
+    plan_record, rows: list[Subtask], task_title: str | None = None
+) -> TaskPlan:
     indexes = {str(row.id): index for index, row in enumerate(rows)}
     planned_subtasks = []
     for row in rows:
@@ -761,6 +805,7 @@ def _restore_plan_from_rows(plan_record, rows: list[Subtask]) -> TaskPlan:
             )
         )
     return TaskPlan(
+        title=task_title or plan_record.summary,
         summary=plan_record.summary,
         final_checklist=plan_record.final_checklist,
         subtasks=planned_subtasks,

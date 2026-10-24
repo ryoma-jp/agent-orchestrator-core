@@ -14,7 +14,7 @@ type ToolBudgetApproval = {
   additional_calls: number; reason: string; plan_version: number
 }
 type Task = {
-  id: string; instruction: string; status: string; created_at: string; updated_at: string;
+  id: string; instruction: string; title: string | null; status: string; created_at: string; updated_at: string;
   result: string | null; error: { code?: string; message?: string } | null;
   completion_report: { plan_version: number; unmet_items: { target_type: string; subtask_title: string | null; item_id: string; description: string; evidence: string; deficiency: string }[] } | null;
   pending_tool_approval: ToolBudgetApproval | null
@@ -241,8 +241,8 @@ function App() {
       <div className="rail-label">WORKSPACE</div>
       <button className="rail-new-task" onClick={() => setShowCreate(true)}><Plus size={17} /> New task</button>
       <nav className="rail-task-list" aria-label="Tasks">
-        {tasks.length === 0 ? <p className="rail-empty">No tasks yet</p> : tasks.map((task) => <button key={task.id} className={`rail-task-row ${active?.id === task.id ? 'selected' : ''}`} title={task.instruction} onClick={() => setActive(task)}>
-          <span className={`status-dot status-${task.status}`} /><span className="rail-task-copy"><strong>{task.instruction}</strong><span className="rail-task-meta"><small>{new Date(task.updated_at).toLocaleString('ja-JP', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}</small><span className={`status-pill pill-${task.status}`}>{statusLabel[task.status] ?? task.status}</span></span></span>
+        {tasks.length === 0 ? <p className="rail-empty">No tasks yet</p> : tasks.map((task) => <button key={task.id} className={`rail-task-row ${active?.id === task.id ? 'selected' : ''}`} title={task.title ?? task.instruction} onClick={() => setActive(task)}>
+          <span className={`status-dot status-${task.status}`} /><span className="rail-task-copy"><strong>{task.title ?? task.instruction}</strong><span className="rail-task-meta"><small>{new Date(task.updated_at).toLocaleString('ja-JP', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}</small><span className={`status-pill pill-${task.status}`}>{statusLabel[task.status] ?? task.status}</span></span></span>
         </button>)}
       </nav>
       <div className="rail-bottom">
@@ -258,7 +258,7 @@ function App() {
         <aside className="detail-pane">
           {active ? <>
             <div className="detail-top"><div><div className="eyebrow">TASK THREAD</div><div className={`status-pill pill-${active.status}`}>{statusLabel[active.status] ?? active.status}</div></div><div className="detail-actions">{['queued', 'planning', 'running', 'waiting_approval', 'needs_attention'].includes(active.status) ? <button className="icon-btn" title="Cancel task" disabled={busy} onClick={cancelTask}><Ban size={16} /></button> : ['succeeded', 'partially_completed', 'failed', 'cancelled'].includes(active.status) ? <button className="icon-btn" title="Delete task" disabled={busy} onClick={deleteTask}><Trash2 size={16} /></button> : null}<button className="icon-btn" title="Close task" onClick={() => setActive(null)}><X size={17} /></button></div></div>
-            <h2 className="detail-title">{active.instruction}</h2>
+            <h2 className="detail-title">{active.title ?? active.instruction}</h2>
             <div className="detail-tabs" role="tablist" aria-label="Task views">
               <button role="tab" aria-selected={detailTab === 'thread'} className={detailTab === 'thread' ? 'selected' : ''} onClick={() => setDetailTab('thread')}><MessageSquareText size={14} /> Conversation</button>
               <button role="tab" aria-selected={detailTab === 'files'} className={detailTab === 'files' ? 'selected' : ''} onClick={() => setDetailTab('files')}><FolderOpen size={14} /> Files</button>

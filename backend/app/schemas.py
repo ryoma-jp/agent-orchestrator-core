@@ -101,6 +101,7 @@ class MessageView(BaseModel):
 class TaskView(BaseModel):
     id: uuid.UUID
     instruction: str
+    title: str | None
     status: str
     created_at: datetime
     updated_at: datetime

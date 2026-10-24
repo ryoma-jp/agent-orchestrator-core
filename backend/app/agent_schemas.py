@@ -30,11 +30,20 @@ class PlannedSubtask(BaseModel):
 class TaskPlan(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    title: str = Field(min_length=1, max_length=100)
     summary: str = Field(min_length=1, max_length=2_000)
     final_checklist: list["ChecklistItem"] = Field(
         min_length=1, max_length=20
     )
     subtasks: list[PlannedSubtask] = Field(min_length=1, max_length=30)
+
+    @field_validator("title")
+    @classmethod
+    def validate_title(cls, value: str) -> str:
+        title = value.strip()
+        if not title:
+            raise ValueError("title must not be blank")
+        return title
 
     @model_validator(mode="after")
     def validate_dependencies(self):
@@ -66,6 +75,20 @@ class TaskPlan(BaseModel):
         for index in range(count):
             visit(index)
         return self
+
+
+class TaskTitle(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    title: str = Field(min_length=1, max_length=100)
+
+    @field_validator("title")
+    @classmethod
+    def validate_title(cls, value: str) -> str:
+        title = value.strip()
+        if not title:
+            raise ValueError("title must not be blank")
+        return title
 
 
 class ChecklistItem(BaseModel):

@@ -128,6 +128,8 @@ class Task(Base):
         ForeignKey("users.id", ondelete="CASCADE"), index=True
     )
     instruction: Mapped[str] = mapped_column(Text)
+    title: Mapped[str | None] = mapped_column(Text)
+    title_generated: Mapped[bool] = mapped_column(Boolean, default=False)
     status: Mapped[str] = mapped_column(
         String(32), default="queued", index=True
     )

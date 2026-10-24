@@ -18,6 +18,7 @@ from app.agent_schemas import (
     PlannedSubtask,
     SubtaskResult,
     TaskPlan,
+    TaskTitle,
 )
 from app.dependencies import get_task_user, require_task_csrf
 from app.models import (
@@ -41,6 +42,7 @@ from app.schemas import (
     AdminSettingsUpdate,
     MessageCreate,
     TaskCreate,
+    TaskView,
     ToolBudgetApprovalDecision,
     TaskFileView,
     TavilyKeyRequest,
@@ -59,6 +61,26 @@ from app import workspaces
 def test_task_instruction_is_bounded_and_nonempty():
     assert (
         TaskCreate(instruction="research this").instruction == "research this"
+    )
+
+
+def test_task_view_includes_generated_title():
+    now = datetime.now(timezone.utc)
+    task = Task(
+        id=uuid.uuid4(),
+        owner_id=uuid.uuid4(),
+        instruction="Create a concise guide to accessible color palettes",
+        title="Accessible color palette guide",
+        title_generated=True,
+        status="running",
+        created_at=now,
+        updated_at=now,
+        result=None,
+        error=None,
+    )
+
+    assert TaskView.model_validate(task).model_dump()["title"] == (
+        "Accessible color palette guide"
     )
 
 
@@ -451,6 +473,7 @@ def test_message_content_is_bounded_and_nonempty():
 
 def test_task_plan_accepts_a_valid_dependency_graph():
     plan = TaskPlan(
+        title="Research project requirements",
         summary="Research and synthesize",
         final_checklist=[
             ChecklistItem(
@@ -494,6 +517,7 @@ def test_task_plan_accepts_a_valid_dependency_graph():
 def test_task_plan_rejects_dependency_cycles():
     with pytest.raises(ValidationError, match="contains a cycle"):
         TaskPlan(
+            title="Invalid plan",
             summary="Invalid plan",
             final_checklist=[
                 ChecklistItem(id="complete", description="Complete")
@@ -528,7 +552,8 @@ def test_task_plan_rejects_duplicate_checklist_ids():
         ValidationError, match="checklist item ids must be unique"
     ):
         TaskPlan(
-            summary="Plan",
+        title="Task purpose",
+        summary="Plan",
             final_checklist=[
                 ChecklistItem(id="answer", description="First"),
                 ChecklistItem(id="answer", description="Duplicate"),
@@ -904,6 +929,276 @@ def test_stored_plan_restores_subtask_order_and_dependencies():
     assert restored.subtasks[0].artifact_goal == "Find source-backed facts"
 
 
+@pytest.mark.asyncio
+async def test_first_plan_generates_and_persists_purpose_title(monkeypatch):
+    import app.orchestrator as orchestrator_module
+
+    task = Task(
+        id=uuid.uuid4(),
+        owner_id=uuid.uuid4(),
+        instruction="Build an accessible project dashboard",
+        status="planning",
+        config_snapshot={},
+    )
+    generated_plan = TaskPlan(
+        title="Accessible project dashboard",
+        summary="Build and verify the project dashboard.",
+        final_checklist=[
+            ChecklistItem(id="dashboard", description="Answer the request")
+        ],
+        subtasks=[
+            PlannedSubtask(
+                title="Review requirements",
+                instruction="Identify dashboard requirements",
+                artifact_goal="Summarize dashboard needs",
+                acceptance_checklist=[
+                    ChecklistItem(id="requirements", description="Summarize")
+                ],
+                dependencies=[],
+                skill_names=[],
+            )
+        ],
+    )
+
+    class FakeSession:
+        def __init__(self, plan_version=None):
+            self.scalar_values = [plan_version]
+            self.added = []
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def scalar(self, _statement):
+            return self.scalar_values.pop(0)
+
+        async def scalars(self, _statement):
+            return []
+
+        async def get(self, model, _identity):
+            return task if model is Task else None
+
+        def add(self, value):
+            self.added.append(value)
+
+        def add_all(self, values):
+            self.added.extend(values)
+
+        async def commit(self):
+            return None
+
+    sessions = [FakeSession(), FakeSession(plan_version=0)]
+    generated_options = {}
+
+    async def generate(**options):
+        generated_options.update(options)
+        return generated_plan
+
+    async def assert_lease(*_args):
+        return None
+
+    async def assert_lease_in_session(*_args):
+        return None
+
+    async def format_input(*_args):
+        return "user: Build an accessible project dashboard"
+
+    async def no_new_messages(*_args):
+        return False
+
+    monkeypatch.setattr(
+        orchestrator_module, "SessionFactory", lambda: sessions.pop(0)
+    )
+    monkeypatch.setattr(orchestrator_module, "_assert_lease", assert_lease)
+    monkeypatch.setattr(
+        orchestrator_module, "_assert_lease_in_session", assert_lease_in_session
+    )
+    monkeypatch.setattr(
+        orchestrator_module, "_format_task_input", format_input
+    )
+    monkeypatch.setattr(
+        orchestrator_module, "_requeue_if_new_messages", no_new_messages
+    )
+    monkeypatch.setattr(
+        orchestrator_module.model_client, "generate", generate
+    )
+
+    first_message = ConversationMessage(
+        sequence=1,
+        role="user",
+        content="Build an accessible project dashboard",
+    )
+    result = await orchestrator_module._load_or_create_plan(
+        task.id,
+        uuid.uuid4(),
+        "worker-test",
+        [first_message],
+        {
+            "manager_model": "test-manager",
+            "worker_model": "test-worker",
+            "max_agent_attempts": 2,
+            "max_agent_turns": 10,
+        },
+    )
+
+    assert result is not None
+    assert task.title == "Accessible project dashboard"
+    assert task.title_generated is True
+    assert "first instruction" in generated_options["system_prompt"]
+
+    sessions.extend([FakeSession(), FakeSession(plan_version=1)])
+    generated_plan.title = "Different follow-up title"
+    followup = ConversationMessage(
+        sequence=2,
+        role="user",
+        content="Also include deployment notes",
+    )
+    result = await orchestrator_module._load_or_create_plan(
+        task.id,
+        uuid.uuid4(),
+        "worker-test",
+        [first_message, followup],
+        {
+            "manager_model": "test-manager",
+            "worker_model": "test-worker",
+            "max_agent_attempts": 2,
+            "max_agent_turns": 10,
+        },
+    )
+
+    assert result is not None
+    assert task.title == "Accessible project dashboard"
+
+
+@pytest.mark.asyncio
+async def test_restored_legacy_plan_generates_title_from_first_instruction(
+    monkeypatch,
+):
+    import app.orchestrator as orchestrator_module
+
+    task = Task(
+        id=uuid.uuid4(),
+        owner_id=uuid.uuid4(),
+        instruction="Create a concise guide to accessible color palettes",
+        title="Create a concise guide to accessible color palettes",
+        title_generated=False,
+        status="planning",
+        config_snapshot={},
+    )
+    record = SimpleNamespace(version=1)
+    plan = TaskPlan(
+        title="Accessible color palette guide",
+        summary="Create a practical guide.",
+        final_checklist=[
+            ChecklistItem(id="guide", description="Provide the guide")
+        ],
+        subtasks=[
+            PlannedSubtask(
+                title="Review contrast needs",
+                instruction="Review color contrast needs",
+                artifact_goal="Summarize contrast needs",
+                acceptance_checklist=[
+                    ChecklistItem(id="contrast", description="Cover contrast")
+                ],
+                dependencies=[],
+                skill_names=[],
+            )
+        ],
+    )
+
+    class FakeSession:
+        def __init__(self, plan_record=None):
+            self.plan_record = plan_record
+            self.added = []
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def scalar(self, _statement):
+            return self.plan_record
+
+        async def scalars(self, _statement):
+            return []
+
+        async def get(self, model, _identity):
+            return task if model is Task else None
+
+        def add(self, value):
+            self.added.append(value)
+
+        async def commit(self):
+            return None
+
+    sessions = [FakeSession(record), FakeSession()]
+    generated_options = {}
+
+    async def generate(**options):
+        generated_options.update(options)
+        return SimpleNamespace(title="Accessible color palette guide")
+
+    async def assert_lease(*_args):
+        return None
+
+    async def assert_lease_in_session(*_args):
+        return None
+
+    monkeypatch.setattr(
+        orchestrator_module, "SessionFactory", lambda: sessions.pop(0)
+    )
+    monkeypatch.setattr(orchestrator_module, "_assert_lease", assert_lease)
+    monkeypatch.setattr(
+        orchestrator_module, "_assert_lease_in_session", assert_lease_in_session
+    )
+    monkeypatch.setattr(
+        orchestrator_module,
+        "_restore_plan_from_rows",
+        lambda *_args: plan,
+    )
+    monkeypatch.setattr(
+        orchestrator_module.model_client, "generate", generate
+    )
+
+    conversation = [
+        ConversationMessage(
+            sequence=1,
+            role="user",
+            content="Create a concise guide to accessible color palettes",
+        ),
+        ConversationMessage(
+            sequence=2,
+            role="assistant",
+            content="I am preparing a plan.",
+        ),
+        ConversationMessage(
+            sequence=3,
+            role="user",
+            content="Include a section on charts.",
+        ),
+    ]
+    result = await orchestrator_module._load_or_create_plan(
+        task.id,
+        uuid.uuid4(),
+        "worker-test",
+        conversation,
+        {
+            "manager_model": "test-manager",
+            "max_agent_attempts": 2,
+            "max_agent_turns": 10,
+        },
+    )
+
+    assert result is not None
+    assert generated_options["schema"] is TaskTitle
+    assert generated_options["input_text"] == conversation[0].content
+    assert task.title == "Accessible color palette guide"
+    assert task.title_generated is True
+
+
 def test_deterministic_checklist_modes_override_model_review():
     checklist = [
         ChecklistItem(
@@ -1146,6 +1441,29 @@ async def test_partial_review_requests_approval_for_more_research(monkeypatch):
     assert questions == []
     assert result["quality_review"][0]["requires_additional_tool_calls"]
     assert requested[0]["additional_calls"] == 40
+
+
+def test_task_plan_requires_nonblank_title():
+    with pytest.raises(ValidationError, match="title must not be blank"):
+        TaskPlan(
+            title="  ",
+            summary="Plan",
+            final_checklist=[
+                ChecklistItem(id="final", description="Answer the user")
+            ],
+            subtasks=[
+                PlannedSubtask(
+                    title="Research",
+                    instruction="Find relevant information",
+                    artifact_goal="Provide evidence",
+                    acceptance_checklist=[
+                        ChecklistItem(id="evidence", description="Use evidence")
+                    ],
+                    dependencies=[],
+                    skill_names=[],
+                )
+            ],
+        )
 
 
 def test_subtask_result_requires_questions_for_user_input():
