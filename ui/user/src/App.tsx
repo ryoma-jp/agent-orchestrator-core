@@ -47,6 +47,12 @@ const statusLabel: Record<string, string> = {
   needs_attention: '要確認', succeeded: '完了', partially_completed: '準完了', failed: '失敗', cancelled: '停止',
 }
 
+function formatModifiedAt(value: string) {
+  return new Date(value).toLocaleString('ja-JP', {
+    year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit',
+  })
+}
+
 function App() {
   const [user, setUser] = useState<User | null>(null)
   const [apiConnected, setApiConnected] = useState<boolean | null>(null)
@@ -375,16 +381,18 @@ function buildExplorerTree(entries: WorkspaceEntry[]): ExplorerNodeData[] {
 }
 
 function ExplorerTreeRow({ node, style, dragHandle }: NodeRendererProps<ExplorerNodeData>) {
+  const file = node.data.file
+  const updatedAt = file ? new Date(file.updated_at) : null
   return <div
     ref={dragHandle}
     style={style}
     className={`explorer-node ${node.isSelected ? 'selected' : ''}`}
     onClick={(event) => node.handleClick(event)}
     onDoubleClick={() => { if (node.isInternal) node.toggle() }}
-    title={node.data.file?.path ?? `${node.data.path}${node.data.empty ? ' (empty directory)' : ''}`}
+    title={file && updatedAt ? `${file.path}\nUpdated ${updatedAt.toLocaleString('ja-JP')}` : `${node.data.path}${node.data.empty ? ' (empty directory)' : ''}`}
   >
     {node.data.kind === 'file' ? <FileText size={14} /> : node.isOpen ? <FolderOpen size={14} /> : <Folder size={14} />}
-    <span>{node.data.name}</span>{node.data.empty && <small className="explorer-empty-label">empty</small>}
+    <span>{node.data.name}</span>{file && <small className="explorer-file-datetime">{formatModifiedAt(file.updated_at)}</small>}{node.data.empty && <small className="explorer-empty-label">empty</small>}
   </div>
 }
 

@@ -317,13 +317,15 @@ async def list_task_files(
         if file_info["kind"] == "directory":
             items.append(WorkspaceDirectoryView(path=path))
             continue
-        row = metadata.get(path)
-        if row is not None:
-            items.append(TaskFileView.model_validate(row))
-            continue
         updated_at = datetime.fromtimestamp(
             float(file_info["updated_at"]), tz=timezone.utc
         )
+        row = metadata.get(path)
+        if row is not None:
+            file_view = TaskFileView.model_validate(row)
+            file_view.updated_at = updated_at
+            items.append(file_view)
+            continue
         items.append(
             TaskFileView(
                 id=uuid.uuid5(task_id, path),

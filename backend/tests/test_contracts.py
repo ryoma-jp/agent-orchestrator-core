@@ -38,7 +38,12 @@ from app.quality import (
     normalize_checklist_results,
     required_checklist_items_passed,
 )
-from app.routers.tasks import add_message, edit_message, upload_task_file
+from app.routers.tasks import (
+    add_message,
+    edit_message,
+    list_task_files,
+    upload_task_file,
+)
 from app.schemas import (
     AdminSettingsUpdate,
     MessageCreate,
@@ -97,6 +102,58 @@ def test_workspace_paths_reject_absolute_and_parent_paths():
     for path in ("/etc/passwd", "../secret", "inputs/../../secret", "a\\b"):
         with pytest.raises(workspaces.InvalidWorkspacePath):
             workspaces.normalize_workspace_path(path)
+
+
+@pytest.mark.asyncio
+async def test_workspace_file_view_uses_filesystem_modification_time(
+    monkeypatch,
+):
+    task_id = uuid.uuid4()
+    user = User(
+        id=uuid.uuid4(),
+        email="person@example.com",
+        password_hash="hash",
+        role="user",
+        is_active=True,
+        must_change_password=False,
+    )
+    metadata_time = datetime(2020, 1, 1, tzinfo=timezone.utc)
+    filesystem_time = datetime(2025, 6, 7, 8, 9, tzinfo=timezone.utc)
+    task_file = TaskFile(
+        id=uuid.uuid4(),
+        task_id=task_id,
+        workspace_rel_path="inputs/brief.txt",
+        role="input",
+        source_kind="user_upload",
+        source_ref="brief.txt",
+        size_bytes=5,
+        created_at=metadata_time,
+        updated_at=metadata_time,
+    )
+
+    class FakeSession:
+        async def scalars(self, _statement):
+            return [task_file]
+
+    async def owned_task(_db, _task_id, _owner_id):
+        return None
+
+    monkeypatch.setattr("app.routers.tasks._owned_task", owned_task)
+    monkeypatch.setattr(
+        "app.routers.tasks.list_workspace_entries",
+        lambda _task_id: [
+            {
+                "kind": "file",
+                "path": "inputs/brief.txt",
+                "size_bytes": 5,
+                "updated_at": filesystem_time.timestamp(),
+            }
+        ],
+    )
+
+    result = await list_task_files(task_id, user, FakeSession())
+
+    assert result[0].updated_at == filesystem_time
 
 
 def test_workspace_listing_includes_empty_directories(monkeypatch, tmp_path):
