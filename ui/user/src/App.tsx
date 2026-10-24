@@ -339,7 +339,7 @@ function WorkspacePanel({ taskId, refreshOnCompletion }: { taskId: string; refre
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
   const fileTreeElement = useRef<HTMLDivElement>(null)
-  const [treeSize, setTreeSize] = useState({ width: 180, height: 320 })
+  const [treeSize, setTreeSize] = useState({ width: 0, height: 0 })
 
   const refresh = async () => {
     const items = await api<WorkspaceFile[]>(`/tasks/${taskId}/workspace/files`)
@@ -375,6 +375,8 @@ function WorkspacePanel({ taskId, refreshOnCompletion }: { taskId: string; refre
   useEffect(() => {
     const element = fileTreeElement.current
     if (!element) return
+    const bounds = element.getBoundingClientRect()
+    setTreeSize({ width: Math.floor(bounds.width), height: Math.floor(bounds.height) })
     const observer = new ResizeObserver(([entry]) => {
       setTreeSize({
         width: Math.floor(entry.contentRect.width),
@@ -383,7 +385,7 @@ function WorkspacePanel({ taskId, refreshOnCompletion }: { taskId: string; refre
     })
     observer.observe(element)
     return () => observer.disconnect()
-  }, [])
+  }, [files.length, loading])
 
   const fileUrl = (path: string) => `/api/tasks/${taskId}/workspace/files/${path.split('/').map(encodeURIComponent).join('/')}`
   const download = async (file: WorkspaceFile) => {
