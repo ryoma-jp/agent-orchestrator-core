@@ -29,6 +29,7 @@ class Settings(BaseSettings):
     tavily_search_skill_path: str = (
         "/opt/agent-skills/tavily-search/SKILL.md"
     )
+    private_skills_path: str = "/opt/private-agent-skills"
     openai_base_url: str | None = None
     vault_addr: str | None = None
     vault_kv_mount: str = "secret"

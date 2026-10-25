@@ -1,3 +1,4 @@
+import re
 from typing import Literal
 
 from pydantic import (
@@ -20,6 +21,18 @@ class PlannedSubtask(BaseModel):
     )
     dependencies: list[int] = Field(max_length=30)
     skill_names: list[str] = Field(max_length=2)
+
+    @field_validator("skill_names")
+    @classmethod
+    def validate_skill_names(cls, value: list[str]) -> list[str]:
+        if len(set(value)) != len(value):
+            raise ValueError("skill_names must be unique")
+        if any(
+            re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", name) is None
+            for name in value
+        ):
+            raise ValueError("skill name is invalid")
+        return value
 
     @model_validator(mode="after")
     def validate_checklist_ids(self):

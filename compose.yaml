@@ -83,6 +83,7 @@ services:
       MAX_TOOL_CALLS_PER_SUBTASK: ${MAX_TOOL_CALLS_PER_SUBTASK:-20}
       TAVILY_TIMEOUT_SECONDS: ${TAVILY_TIMEOUT_SECONDS:-20}
       TAVILY_SEARCH_SKILL_PATH: /opt/agent-skills/tavily-search/SKILL.md
+      PRIVATE_SKILLS_PATH: /opt/private-agent-skills
       OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
       VAULT_ADDR: ${VAULT_ADDR:-http://vault:8200}
       VAULT_KV_MOUNT: ${VAULT_KV_MOUNT:-secret}
@@ -97,6 +98,7 @@ services:
     volumes:
       - ${VAULT_WORKER_ROLE_ID_SOURCE:-./secrets/vault-worker-role-id}:/run/secrets/vault-worker-role-id:ro
       - ${VAULT_WORKER_SECRET_ID_SOURCE:-./secrets/vault-worker-secret-id}:/run/secrets/vault-worker-secret-id:ro
+      - ${PRIVATE_SKILLS_SOURCE:-./.ai_agent_base/private_skills}:/opt/private-agent-skills:ro
     depends_on:
       db:
         condition: service_healthy

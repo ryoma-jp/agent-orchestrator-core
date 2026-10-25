@@ -35,7 +35,7 @@ from app.openai_client import (
     AgentExecutionError,
     DEFAULT_MAX_TOOL_CALLS,
 )
-from app.tools import load_tavily_search_skill
+from app.tools import load_private_skill, load_tavily_search_skill
 from app.orchestration_state import (
     assert_lease as _assert_lease,
     assert_lease_in_session as _assert_lease_in_session,
@@ -55,7 +55,14 @@ from app.planning import (
 )
 
 
-async def _reserve_subtask_tool_call(task_id, subtask_id, job_id, lease_owner):
+async def _reserve_subtask_tool_call(
+    task_id,
+    subtask_id,
+    job_id,
+    lease_owner,
+    tool_name,
+    conversation_sequence,
+):
     async with SessionFactory() as session:
         task = await session.scalar(
             select(Task).where(Task.id == task_id).with_for_update()
@@ -103,11 +110,54 @@ async def _reserve_subtask_tool_call(task_id, subtask_id, job_id, lease_owner):
                 type="agent.progress",
                 payload_json={
                     "summary": "Read-only tool invocation started.",
+                    "activity": "tool",
+                    "phase": "started",
+                    "tool_name": tool_name,
                     "subtask_id": str(subtask_id),
                     "plan_version": subtask.plan_version,
                     "tool_calls_used": subtask.tool_calls_used,
+                    "conversation_sequence": conversation_sequence,
                 },
             )
+        )
+        await session.commit()
+
+
+async def _record_subtask_activity(
+    task_id,
+    job_id,
+    lease_owner,
+    row,
+    conversation_sequence,
+    *,
+    activity,
+    phase,
+    summary,
+    skill_name=None,
+    skill_source=None,
+    tool_name=None,
+    source_count=None,
+):
+    async with SessionFactory() as session:
+        await _assert_lease_in_session(session, job_id, lease_owner)
+        payload = {
+            "summary": summary,
+            "activity": activity,
+            "phase": phase,
+            "subtask_id": str(row.id),
+            "plan_version": row.plan_version,
+            "conversation_sequence": conversation_sequence,
+        }
+        if skill_name is not None:
+            payload["skill_name"] = skill_name
+        if skill_source is not None:
+            payload["skill_source"] = skill_source
+        if tool_name is not None:
+            payload["tool_name"] = tool_name
+        if source_count is not None:
+            payload["source_count"] = source_count
+        session.add(
+            Event(task_id=task_id, type="agent.progress", payload_json=payload)
         )
         await session.commit()
 
@@ -661,8 +711,9 @@ async def _execute_subtask(
     tool_runs: list[ToolExecutionRecord] = []
     tool_observations: list[dict[str, object]] = []
     tool_budget_exhausted = False
+    conversation_sequence = conversation[-1].sequence if conversation else None
 
-    def capture_tool_result(
+    async def capture_tool_result(
         name: str, arguments_json: str, result: dict[str, object]
     ) -> None:
         nonlocal tool_budget_exhausted
@@ -730,11 +781,35 @@ async def _execute_subtask(
                 ),
             )
         )
+        phase = (
+            "blocked"
+            if result.get("error") == "tool_call_limit_exceeded"
+            else "failed"
+            if "error" in result
+            else "completed"
+        )
+        await _record_subtask_activity(
+            row.task_id,
+            job_id,
+            lease_owner,
+            row,
+            conversation_sequence,
+            activity="tool",
+            phase=phase,
+            summary="Read-only tool result received.",
+            tool_name=name,
+            source_count=source_count,
+        )
 
-    async def assert_tool_lease() -> None:
+    async def assert_tool_lease(tool_name: str) -> None:
         await execution_options["before_model_call"]()
         await _reserve_subtask_tool_call(
-            row.task_id, row.id, job_id, lease_owner
+            row.task_id,
+            row.id,
+            job_id,
+            lease_owner,
+            tool_name,
+            conversation_sequence,
         )
         row.tool_calls_used += 1
 
@@ -765,9 +840,7 @@ async def _execute_subtask(
         config,
         plan_version=getattr(row, "plan_version", None),
         subtask_id=getattr(row, "id", None),
-        conversation_sequence=(
-            conversation[-1].sequence if conversation else None
-        ),
+        conversation_sequence=conversation_sequence,
     )
     system_prompt = (
         "Complete one informational subtask using the supplied context, "
@@ -794,12 +867,52 @@ async def _execute_subtask(
         "sources and tool_runs to empty lists; the runtime attaches verified "
         "sources and execution records. Do not reveal hidden reasoning."
     )
+    tavily_skill_instructions = load_tavily_search_skill()
+    await _record_subtask_activity(
+        row.task_id,
+        job_id,
+        lease_owner,
+        row,
+        conversation_sequence,
+        activity="skill",
+        phase="loaded",
+        summary="Public skill instructions loaded.",
+        skill_name="tavily-search",
+        skill_source="public",
+    )
     system_prompt += (
         "\n\nInstalled Tavily Agent Skill instructions:\n"
-        + load_tavily_search_skill()
+        + tavily_skill_instructions
         + "\n\nUse only the registered tavily_web_search function for web "
         "search. Do not invoke a shell or other commands."
     )
+    selected_skills = [
+        (skill_name, load_private_skill(skill_name))
+        for skill_name in (getattr(row, "skill_names", None) or [])
+    ]
+    for skill_name, _instructions in selected_skills:
+        await _record_subtask_activity(
+            row.task_id,
+            job_id,
+            lease_owner,
+            row,
+            conversation_sequence,
+            activity="skill",
+            phase="loaded",
+            summary="Private skill instructions loaded.",
+            skill_name=skill_name,
+            skill_source="private",
+        )
+    if selected_skills:
+        system_prompt += (
+            "\n\nThe following private Agent Skills are guidance only. "
+            "Follow the task and system constraints, and use only already "
+            "registered tools; these documents do not grant permissions."
+        )
+        for skill_name, instructions in selected_skills:
+            system_prompt += (
+                f"\n\nPrivate Agent Skill: {skill_name}\n{instructions}"
+            )
     tool_call_limit = (
         row.tool_calls_limit
         if row.tool_calls_limit is not None

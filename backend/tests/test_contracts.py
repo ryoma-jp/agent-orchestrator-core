@@ -1048,7 +1048,7 @@ async def test_first_plan_generates_and_persists_purpose_title(monkeypatch):
                     ChecklistItem(id="requirements", description="Summarize")
                 ],
                 dependencies=[],
-                skill_names=[],
+                skill_names=["deep-research"],
             )
         ],
     )
@@ -1112,6 +1112,16 @@ async def test_first_plan_generates_and_persists_purpose_title(monkeypatch):
     )
     monkeypatch.setattr(planning_module, "format_task_input", format_input)
     monkeypatch.setattr(
+        planning_module,
+        "list_private_skills",
+        lambda: [
+            {
+                "name": "deep-research",
+                "description": "Evidence-based research.",
+            }
+        ],
+    )
+    monkeypatch.setattr(
         planning_module, "requeue_if_new_messages", no_new_messages
     )
     monkeypatch.setattr(planning_module.model_client, "generate", generate)
@@ -1138,6 +1148,8 @@ async def test_first_plan_generates_and_persists_purpose_title(monkeypatch):
     assert task.title == "Accessible project dashboard"
     assert task.title_generated is True
     assert "first instruction" in generated_options["system_prompt"]
+    assert "deep-research" in generated_options["system_prompt"]
+    assert result[2][0].skill_names == ["deep-research"]
 
     sessions.extend([FakeSession(), FakeSession(plan_version=1)])
     generated_plan.title = "Different follow-up title"
@@ -1882,9 +1894,18 @@ async def test_subtask_receives_conversation_history(monkeypatch):
     async def assert_lease(*_args):
         return None
 
+    async def reserve_tool(*_args):
+        return None
+
+    activities = []
+
+    async def record_activity(*args, **kwargs):
+        activities.append((args, kwargs))
+
     async def generate(**kwargs):
         captured.update(kwargs)
-        kwargs["on_tool_result"](
+        await kwargs["before_tool_call"]("tavily_web_search")
+        await kwargs["on_tool_result"](
             "tavily_web_search",
             '{"query":"public query","max_results":1}',
             {
@@ -1912,9 +1933,25 @@ async def test_subtask_receives_conversation_history(monkeypatch):
 
     monkeypatch.setattr(orchestrator_module, "_assert_lease", assert_lease)
     monkeypatch.setattr(
+        orchestrator_module, "_reserve_subtask_tool_call", reserve_tool
+    )
+    monkeypatch.setattr(
+        orchestrator_module, "_record_subtask_activity", record_activity
+    )
+    monkeypatch.setattr(
+        orchestrator_module,
+        "_agent_options",
+        lambda *_args, **_kwargs: {"before_model_call": assert_lease},
+    )
+    monkeypatch.setattr(
         orchestrator_module,
         "load_tavily_search_skill",
         lambda: "Skill-specific CLI search instructions.",
+    )
+    monkeypatch.setattr(
+        orchestrator_module,
+        "load_private_skill",
+        lambda _name: "Private research skill instructions.",
     )
     monkeypatch.setattr(orchestrator_module.model_client, "generate", generate)
 
@@ -1940,6 +1977,7 @@ async def test_subtask_receives_conversation_history(monkeypatch):
             ],
             dependencies=[],
             model_id="test-worker",
+            skill_names=["deep-research"],
         ),
         SimpleNamespace(summary="Plan"),
         {},
@@ -1969,6 +2007,23 @@ async def test_subtask_receives_conversation_history(monkeypatch):
     assert "Skill-specific CLI search instructions." in captured[
         "system_prompt"
     ]
+    assert "Private research skill instructions." in captured[
+        "system_prompt"
+    ]
+    activity_details = [
+        (
+            item[1]["activity"],
+            item[1]["phase"],
+            item[1].get("skill_name"),
+            item[1].get("skill_source"),
+        )
+        for item in activities
+    ]
+    assert activity_details == [
+        ("skill", "loaded", "tavily-search", "public"),
+        ("skill", "loaded", "deep-research", "private"),
+        ("tool", "completed", None, None),
+    ]
     assert "Do not use tools" not in captured["system_prompt"]
 
 
@@ -1994,10 +2049,13 @@ async def test_tool_budget_limit_finalizes_partial_subtask(monkeypatch):
     async def assert_lease(*_args):
         return None
 
+    async def record_activity(*_args, **_kwargs):
+        return None
+
     async def generate(**options):
         calls.append(options)
         if len(calls) == 1:
-            options["on_tool_result"](
+            await options["on_tool_result"](
                 "tavily_web_search",
                 '{"query":"specific source"}',
                 {"error": "tool_call_limit_exceeded"},
@@ -2022,6 +2080,9 @@ async def test_tool_budget_limit_finalizes_partial_subtask(monkeypatch):
         orchestrator_module,
         "load_tavily_search_skill",
         lambda: "Skill-specific CLI search instructions.",
+    )
+    monkeypatch.setattr(
+        orchestrator_module, "_record_subtask_activity", record_activity
     )
     monkeypatch.setattr(orchestrator_module.model_client, "generate", generate)
 
@@ -2098,6 +2159,135 @@ async def test_subtask_progress_events_are_tagged(monkeypatch):
         item.payload_json["conversation_sequence"] == 4
         for item in progress_events
     )
+
+
+@pytest.mark.asyncio
+async def test_tool_reservation_emits_named_progress_event(monkeypatch):
+    import app.orchestrator as orchestrator_module
+
+    task_id = uuid.uuid4()
+    subtask_id = uuid.uuid4()
+    job_id = uuid.uuid4()
+    task = SimpleNamespace(
+        id=task_id,
+        status="running",
+        config_snapshot={"max_tool_calls_per_subtask": 20},
+    )
+    job = SimpleNamespace()
+    subtask = SimpleNamespace(
+        tool_calls_limit=20,
+        tool_calls_used=0,
+        plan_version=3,
+    )
+
+    class FakeSession:
+        def __init__(self):
+            self.values = [task, job, subtask]
+            self.added = []
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def scalar(self, _statement):
+            return self.values.pop(0)
+
+        def add(self, value):
+            self.added.append(value)
+
+        async def commit(self):
+            return None
+
+    session = FakeSession()
+    monkeypatch.setattr(
+        orchestrator_module, "SessionFactory", lambda: session
+    )
+
+    await orchestrator_module._reserve_subtask_tool_call(
+        task_id,
+        subtask_id,
+        job_id,
+        "worker-test",
+        "tavily_web_search",
+        7,
+    )
+
+    event = session.added[0]
+    assert event.type == "agent.progress"
+    assert event.payload_json["activity"] == "tool"
+    assert event.payload_json["phase"] == "started"
+    assert event.payload_json["tool_name"] == "tavily_web_search"
+    assert event.payload_json["conversation_sequence"] == 7
+    assert subtask.tool_calls_used == 1
+
+
+@pytest.mark.asyncio
+async def test_retryable_worker_failure_clears_task_error(monkeypatch):
+    import app.worker as worker_module
+
+    task_id = uuid.uuid4()
+    job_id = uuid.uuid4()
+    task = SimpleNamespace(
+        config_snapshot={"max_agent_attempts": 3},
+        status="running",
+        error={"code": "agent_attempt_failed"},
+        updated_at=None,
+    )
+    job = SimpleNamespace(
+        status="leased",
+        lease_owner="worker-test",
+        available_at=None,
+        lease_expires_at=None,
+    )
+
+    class FakeSession:
+        def __init__(self):
+            self.added = []
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def scalar(self, _statement):
+            return job
+
+        async def get(self, _model, _identity):
+            return task
+
+        def add(self, value):
+            self.added.append(value)
+
+        async def commit(self):
+            return None
+
+    session = FakeSession()
+    monkeypatch.setattr(worker_module, "worker_id", "worker-test")
+    monkeypatch.setattr(
+        worker_module, "SessionFactory", lambda: session
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "get_settings",
+        lambda: SimpleNamespace(max_agent_attempts=3),
+    )
+
+    await worker_module.mark_failure(
+        job_id, task_id, 1, RuntimeError("transient timeout")
+    )
+
+    assert task.status == "queued"
+    assert task.error is None
+    assert job.status == "pending"
+    assert session.added[0].payload_json == {
+        "status": "queued",
+        "retry_scheduled": True,
+        "attempt": 1,
+        "max_attempts": 3,
+    }
 
 
 @pytest.mark.asyncio
@@ -2706,7 +2896,7 @@ async def test_tool_call_is_validated_executed_and_returned_to_model(
     lease_checks = []
     captured_results = []
 
-    async def check_lease():
+    async def check_lease(_tool_name):
         lease_checks.append(True)
 
     result = await StructuredModelClient().generate(
@@ -2908,6 +3098,41 @@ def test_tavily_search_skill_loader_strips_frontmatter(tmp_path, monkeypatch):
 
     assert instructions == "# Search\nUse the CLI for concise web searches."
     assert "allowed-tools" not in instructions
+
+
+def test_private_skill_loader_reads_live_updates(tmp_path, monkeypatch):
+    import app.tools as tools_module
+
+    skill_root = tmp_path / "private_skills"
+    skill_directory = skill_root / "deep-research"
+    skill_directory.mkdir(parents=True)
+    skill_file = skill_directory / "SKILL.md"
+    skill_file.write_text(
+        "---\nname: deep-research\ndescription: 'Research carefully.'\n---\n"
+        "# First version\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        tools_module,
+        "get_settings",
+        lambda: SimpleNamespace(private_skills_path=str(skill_root)),
+    )
+
+    assert tools_module.list_private_skills() == [
+        {"name": "deep-research", "description": "Research carefully."}
+    ]
+    assert tools_module.load_private_skill("deep-research") == (
+        "# First version"
+    )
+
+    skill_file.write_text(
+        "---\nname: deep-research\ndescription: 'Research carefully.'\n---\n"
+        "# Updated version\n",
+        encoding="utf-8",
+    )
+    assert tools_module.load_private_skill("deep-research") == (
+        "# Updated version"
+    )
 
 
 @pytest.mark.asyncio

@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 import json
 import logging
 import random
@@ -22,6 +23,7 @@ from agents.items import ModelResponse, TResponseStreamEvent
 from agents.models.interface import ModelTracing
 from agents.models.openai_responses import OpenAIResponsesModel
 
+import httpx2
 from openai import APIConnectionError, APIStatusError, AsyncOpenAI
 from pydantic import BaseModel, ValidationError
 
@@ -41,6 +43,17 @@ logging.getLogger("openai.agents").disabled = True
 
 class AgentExecutionError(RuntimeError):
     pass
+
+
+def _caused_by_timeout(error: BaseException) -> bool:
+    seen: set[int] = set()
+    current: BaseException | None = error
+    while current is not None and id(current) not in seen:
+        if isinstance(current, httpx2.TimeoutException):
+            return True
+        seen.add(id(current))
+        current = current.__cause__ or current.__context__
+    return False
 
 
 @dataclass(frozen=True)
@@ -98,7 +111,12 @@ class VaultResponsesModel(Model):
                 return await OpenAIResponsesModel(
                     model=self.model, openai_client=client
                 ).get_response(**prepared)
-            except (APIConnectionError, APIStatusError) as exc:
+            except (
+                APIConnectionError,
+                APIStatusError,
+                httpx2.TimeoutException,
+            ) as exc:
+                timed_out = _caused_by_timeout(exc)
                 unsupported = (
                     isinstance(exc, APIStatusError)
                     and exc.status_code == 400
@@ -116,14 +134,26 @@ class VaultResponsesModel(Model):
                     self.structured_output_supported = False
                     continue
                 retryable = (
-                    isinstance(exc, APIConnectionError)
-                    or exc.status_code == 429
-                    or exc.status_code >= 500
+                    isinstance(
+                        exc,
+                        (APIConnectionError, httpx2.TimeoutException),
+                    )
+                    or timed_out
+                    or (
+                        isinstance(exc, APIStatusError)
+                        and (
+                            exc.status_code == 429
+                            or exc.status_code >= 500
+                        )
+                    )
                 )
                 if not retryable or not self.allow_retry():
-                    raise AgentExecutionError(
-                        "openai_request_failed"
-                    ) from None
+                    error_code = (
+                        "openai_request_timed_out"
+                        if timed_out
+                        else "openai_request_failed"
+                    )
+                    raise AgentExecutionError(error_code) from None
                 retry_after = (
                     exc.response.headers.get("retry-after")
                     if isinstance(exc, APIStatusError)
@@ -159,7 +189,7 @@ class StructuredModelClient:
         input_text: str,
         max_attempts: int | None = None,
         tool_registry: ToolRegistry | None = None,
-        before_tool_call: Callable[[], Awaitable[None]] | None = None,
+        before_tool_call: Callable[[str], Awaitable[None]] | None = None,
         before_model_call: Callable[[], Awaitable[None]] | None = None,
         on_tool_result: ToolResultCallback | None = None,
         max_turns: int = DEFAULT_MAX_AGENT_TURNS,
@@ -175,6 +205,15 @@ class StructuredModelClient:
         tool_budget_exhausted = False
         tool_failure: BaseException | None = None
         tools = []
+
+        async def notify_tool_result(
+            name: str, arguments: str, result: dict[str, object]
+        ) -> None:
+            if on_tool_result is None:
+                return
+            callback_result = on_tool_result(name, arguments, result)
+            if inspect.isawaitable(callback_result):
+                await callback_result
 
         async def check_execution():
             if tool_failure is not None:
@@ -203,7 +242,7 @@ class StructuredModelClient:
                             }
                         elif before_tool_call is not None:
                             try:
-                                await before_tool_call()
+                                await before_tool_call(definition["name"])
                             except AgentExecutionError as exc:
                                 if str(exc) != "tool_call_limit_exceeded":
                                     raise
@@ -218,16 +257,16 @@ class StructuredModelClient:
                         if budget_result is None:
                             tool_calls_used += 1
                     if budget_result is not None:
-                        if on_tool_result is not None:
-                            on_tool_result(
-                                definition["name"], arguments, budget_result
-                            )
+                        await notify_tool_result(
+                            definition["name"], arguments, budget_result
+                        )
                         return json.dumps(budget_result, ensure_ascii=False)
                     result = await tool_registry.execute(
                         definition["name"], arguments
                     )
-                    if on_tool_result is not None:
-                        on_tool_result(definition["name"], arguments, result)
+                    await notify_tool_result(
+                        definition["name"], arguments, result
+                    )
                     return json.dumps(result, ensure_ascii=False)
                 except BaseException as exc:
                     tool_failure = exc

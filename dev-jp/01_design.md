@@ -14,6 +14,8 @@
 | エージェント実行方式 | OpenAI Agents SDKのAgent／Runnerを共通実行アダプター経由で利用。タスク制御・永続化は独自オーケストレーターに維持 | Handoffs、動的なAgent.as_tool()委譲、Session自動保存、承認用RunStateの永続化 |
 | エージェント | 初回指示の目的を表すタスクタイトルを含む構造化計画、成果物目標・チェックリストによる個別受け入れと最終成果物判定、設定上限付き品質修正、準完了状態、依存関係に沿った読み取り専用サブタスクの並行実行、Tavily公式Agent Skillを指示へ組み込んだTavily CLI検索、入力テキスト添付の計画入力、要求ファイルの構造化出力・Workspace保存、ツール予算超過時の部分成果レビューと追加予算承認、最大3回の設定可能な試行 | ファイル／シェル操作ツール、任意形式添付の解析、副作用操作の承認、タスクSandbox内でのエージェント実行 |
 | 拡張 | TaskFileメタデータ、タスクUUID別永続Workspace、所有者スコープのファイルAPI、削除アウトボックスと再試行ワーカー | Workerから分離したタスクSandbox、ターミナル、Git cloneと認証ブローカー、動的プライベートスキル、RAGアダプター、コンテキスト要約 |
+| エージェント | 初回指示の目的を表すタスクタイトルを含む構造化計画、成果物目標・チェックリストによる個別受け入れと最終成果物判定、設定上限付き品質修正、準完了状態、依存関係に沿った読み取り専用サブタスクの並行実行、管理エージェントによるプライベートSkill選択とWorkerでの実行時読込、Tavily公式Agent Skillを指示へ組み込んだTavily CLI検索、入力テキスト添付の計画入力、要求ファイルの構造化出力・Workspace保存、ツール予算超過時の部分成果レビューと追加予算承認、最大3回の設定可能な試行 | ファイル／シェル操作ツール、任意形式添付の解析、副作用操作の承認、タスクSandbox内でのエージェント実行 |
+| 拡張 | TaskFileメタデータ、タスクUUID別永続Workspace、所有者スコープのファイルAPI、削除アウトボックスと再試行ワーカー | Workerから分離したタスクSandbox、ターミナル、Git cloneと認証ブローカー、RAGアダプター、コンテキスト要約 |
 | 認証・管理 | WebセッションとCSRF、ユーザー別Bearerアクセスキー、管理者によるアカウント・モデル・品質修正上限・Vaultキー管理 | より細かな権限・監査、利用量／コスト集計 |
 | UI・イベント | User UIの目的表現タスクタイトル表示、タスク別Explorer（空ディレクトリを含む一覧、空状態の表示、アップロード、テキスト編集、ダウンロード、削除）、追加ツール予算の承認／拒否、Admin UI、品質判定の進捗・準完了表示、DBイベントのSSE配信とLast-Event-ID以降の再送 | タスクごとの隔離Terminal、Git認証UI、副作用操作の承認／解決UI |
 
@@ -48,7 +50,7 @@
 - ネットワークから切断中に新たなモデル応答を生成することはできない。現行実装はジョブリース失効後の再取得を行うが、途中計画からの復元ではなく、会話を再読込してタスク処理を再試行する。
 
 ## 3. システム構成
-以下の図は将来の目標構成を含む。現行コードにはAPI、Worker、PostgreSQL、Vault、User/Admin UI、nginxと、Worker内のAgents SDK実行アダプター・Tavily CLI・公式`tavily-search` Agent Skill・品質判定がある。Agent SkillsはSDKに自動認識されないため、WorkerがSkill本文をサブエージェントの指示へ読み込み、専用Function ToolからCLIを限定実行する。APIは名前付きボリューム上にタスクUUID別Workspaceを作成し、所有者スコープのExplorerファイルAPIを提供する。Workerは内部API経由でテキスト添付を計画入力として読み、ユーザーが要求したファイルだけをWorkspaceへ保存する。会話向け回答は会話履歴とタスク結果に保存する。削除要求は永続ジョブでWorkspace清掃後にDB cascadeする。Workerから分離されたタスク別Sandbox、Terminal、Git clone／認証、追加のツール登録、プライベートSkillの動的ロード、RAG、Worker間共有レート制御は未実装である。
+以下の図は将来の目標構成を含む。現行コードにはAPI、Worker、PostgreSQL、Vault、User/Admin UI、nginxと、Worker内のAgents SDK実行アダプター・Tavily CLI・公式`tavily-search` Agent Skill・品質判定がある。Agent SkillsはSDKに自動認識されないため、WorkerがSkill本文をサブエージェントの指示へ読み込み、専用Function ToolからCLIを限定実行する。WorkerはホストのプライベートSkillディレクトリを読み取り専用bind mountし、管理エージェントが選んだSkill本文を各サブエージェント実行時に読み込む。APIは名前付きボリューム上にタスクUUID別Workspaceを作成し、所有者スコープのExplorerファイルAPIを提供する。Workerは内部API経由でテキスト添付を計画入力として読み、ユーザーが要求したファイルだけをWorkspaceへ保存する。会話向け回答は会話履歴とタスク結果に保存する。削除要求は永続ジョブでWorkspace清掃後にDB cascadeする。Workerから分離されたタスク別Sandbox、Terminal、Git clone／認証、追加のツール登録、RAG、Worker間共有レート制御は未実装である。
 
 ```mermaid
 flowchart TB
@@ -146,7 +148,7 @@ flowchart TB
 | エージェント実行器 | 共通実行アダプターがプロンプト・入力・Pydantic出力型をSDKのAgentへ設定し、Runnerによるモデル／ツールループを実行する。タスク状態は直接確定しない |
 | OpenAIクライアント | Agents SDKからモデル接続アダプターを通じて公式OpenAI Python SDKを呼び出す。各要求直前のVaultキー取得、タイムアウト、限定再試行、必要なJSONフォールバックを維持する。共有RPM／TPM制御・利用量の永続集計は未実装 |
 | Worker | PostgreSQLの実行ジョブを `FOR UPDATE SKIP LOCKED` で取得し、期限付きリースを更新しながら計画・サブタスク実行・品質レビュー／修正・結果統合を行う。内部API経由で許可されたテキスト添付を読み、会話向け回答と要求ファイルを保存する。WorkerイメージにTavily CLIと公式Skill群を導入する |
-| ツール／スキル／Workspace | Workerは公式`tavily-search` Skill本文をサブエージェントの指示へ組み込み、専用Function ToolからTavily CLIの検索コマンドだけを実行する。APIはTaskFile APIと永続Workspaceを提供する。タスク別実行Sandbox、Terminal、Git操作、プライベートSkillの動的ロード、RAGは未実装 |
+| ツール／スキル／Workspace | Workerは公式`tavily-search` Skillと読み取り専用bind mount上のプライベートSkill本文をサブエージェントの指示へ組み込み、登録済みの読み取り専用ツールだけを実行する。APIはTaskFile APIと永続Workspaceを提供する。タスク別実行Sandbox、Terminal、Git操作、RAGは未実装 |
 | 永続化 | PostgreSQLにタスク状態、保留中のツール予算承認、TaskFileメタデータ、削除ジョブを保存し、ファイル内容はタスクUUID別Workspaceボリュームに保存する。副作用承認・要約・タスク実行リースは未実装 |
 | SSE配信 | PostgreSQLに保存済みのイベントを取得して順序付きでクライアントに配信し、Last-Event-IDによる再接続を支援 |
 
@@ -214,7 +216,7 @@ flowchart TB
 1. ユーザー指示と会話コンテキストから目的・制約・完了条件を抽出する。
 2. 初回の計画生成時に最初のユーザー指示から目的を抽出し、その指示の言語で簡潔な目的表現のタスクタイトルを生成する。後続メッセージによる再計画では既存タイトルを変更しない。
 3. 必要に応じて、依存関係を持つサブタスク計画を構造化出力で生成する。
-4. 各サブタスクに指示と依存関係を割り当てる。スキル選択・実行パラメーターの割当は行わない。
+4. 各サブタスクに指示と依存関係を割り当て、必要な場合はマウント済みSkill一覧から最大2件を選択する。Skillは指示として利用し、登録済みツールや実行権限を増やさない。
 5. 収集されたサブタスク成果を評価し、必要な修正内容を提示する。依存関係の検証、並行起動、結果と失敗の収集はオーケストレーターが行う。
 6. サブタスク結果を統合し、回答と注意事項を含むユーザー向け応答を生成する。完了可否は最終チェックリストの必須項目で判定する。
 
@@ -240,7 +242,7 @@ flowchart TB
 
 ### 4.3 サブエージェント
 
-現行実装ではサブタスクごとに設定済みWorkerモデルを用い、同一タスク内の独立した依存関係レベルを最大32件まで並行実行する。必要に応じてTavily公式`tavily-search` Skillの手順に基づく読み取り専用Web検索を呼び出せる。出力は `SubtaskResult`（`succeeded`／`partial`／`needs_input`／`failed`、summary、findings、sources、tool_runs、questions、error）で検証する。サブタスク個別の再開、任意Skillの動的実行、Worker間の共有レート制限はない。OpenAI Agents SDKにAgent Skillsの自動ローダーやシェル実行器はないため、WorkerがSkill本文を指示へ明示的に組み込み、検索専用Function Toolが固定されたCLIコマンドを実行する。モデルには任意シェルを公開しない。
+現行実装ではサブタスクごとに設定済みWorkerモデルを用い、同一タスク内の独立した依存関係レベルを最大32件まで並行実行する。必要に応じてTavily公式`tavily-search` Skillの手順に基づく読み取り専用Web検索や、計画で選択されたプライベートSkillを利用できる。プライベートSkillはWorkerに読み取り専用bind mountされたディレクトリから実行ごとに読み込む。出力は `SubtaskResult`（`succeeded`／`partial`／`needs_input`／`failed`、summary、findings、sources、tool_runs、questions、error）で検証する。サブタスク個別の再開、Worker間の共有レート制限はない。OpenAI Agents SDKにAgent Skillsの自動ローダーやシェル実行器はないため、WorkerがSkill本文を指示へ明示的に組み込み、検索専用Function Toolが固定されたCLIコマンドを実行する。モデルには任意シェルを公開しない。
 
 サブタスクの構造化出力は`SubtaskResult`（`succeeded`／`partial`／`needs_input`／`failed`、summary、findings、sources、tool_runs、questions、error）で検証する。ツール予算到達時は`partial`を返し、実行済みの検索結果・記録とともに管理エージェントの受け入れ判定へ進める。成果物はこの結果を指し、独立した中間成果物ファイルやストレージはない。受け入れ可否はサブエージェントの自己申告ではなく管理エージェントのチェックリスト判定で決め、修正時は未達項目と不足内容を渡す。
 
@@ -416,7 +418,7 @@ flowchart TB
 | Admin UI | 管理者ダッシュボードの静的資産を配信 | 独立したステートレスコンテナ。一般ユーザー用UIの資産と混在させず、秘密情報を含めない |
 | User UI | 一般ユーザー用タスクUIの静的資産を配信 | 独立したステートレスコンテナ。管理者専用画面・権限情報を含めない |
 | API | REST、SSE、認証、入力検証、会話・アカウント・管理操作、DBへの受付記録 | 現行Composeでは1サービス。API自体にプロセス内タスク状態を保持しない |
-| Worker | DBジョブの取得、ジョブリース更新、タスク計画・読み取り専用サブタスク実行・統合。サブエージェント用Tavily CLIと公式Agent Skillsを含む | `agent`プロファイルで起動。初期運用は1レプリカ。APIイメージとは別にビルドし、Docker制御権限やGit認証情報を与えない。Tavilyキーは呼び出しごとにVaultから読み、CLI子プロセスにのみ環境変数で渡す |
+| Worker | DBジョブの取得、ジョブリース更新、タスク計画・読み取り専用サブタスク実行・統合。Tavily CLI、公式Agent Skill、プライベートSkillの動的読込を含む | `agent`プロファイルで起動。初期運用は1レプリカ。APIイメージとは別にビルドし、Docker制御権限やGit認証情報を与えない。ホストの`PRIVATE_SKILLS_SOURCE`を`/opt/private-agent-skills:ro`へbind mountする。Tavilyキーは呼び出しごとにVaultから読み、CLI子プロセスにのみ環境変数で渡す |
 | PostgreSQL | ユーザー、セッション、設定、タスク、会話、サブタスク、イベント、ジョブを保存 | Composeの名前付きボリュームを使用。マイグレーションはセットアップ用サービスで適用 |
 | Workspace／Sandbox | APIコンテナがタスクUUID別の永続ボリューム上にファイルを保存し、TaskFileメタデータと所有者スコープAPIを提供。削除ジョブがWorkspace清掃後にTaskをcascade削除 | Workerから分離したタスク別Sandbox／Terminal、Sandbox内Git cloneと認証ブローカー。現行ファイル領域はOSプロセス単位のSandboxではない |
 | HashiCorp Vault | KV v2でシステム共通OpenAI APIキーを保存 | 管理APIは書込専用の限定AppRole、Workerは読取専用AppRoleを使用 |
@@ -544,7 +546,7 @@ Runnerターン上限は既定24・許容範囲1〜64、サブタスクの初期
 要約・履歴プルーニング・要約イベントは未実装である。現行Workerは計画と最終統合の入力に会話全件を使用するため、会話の長さに応じてモデルのコンテキスト上限へ達する可能性がある。
 
 ## 7. ツール・スキル・RAG
-この節には現行実装と将来拡張の設計を記載する。現行Workerには共通のツール登録・Function Calling実行境界、Tavily CLIを固定実行する検索ツール、公式`tavily-search` Agent Skillの指示組込みがある。OpenAI Agents SDKには汎用Agent Skillsローダーがないため、このSkillをAgentの実行入力へ明示的に読み込む。プライベートSkillの動的ロードとRAGアダプターは未実装であり、現行の計画スキーマでも`skill_names`は受け付けるが、Workerは非空のプライベートSkill指定をエラーとして拒否する。
+この節には現行実装と将来拡張の設計を記載する。現行Workerには共通のツール登録・Function Calling実行境界、Tavily CLIを固定実行する検索ツール、公式`tavily-search` Agent SkillとプライベートSkillの指示組込みがある。OpenAI Agents SDKには汎用Agent Skillsローダーがないため、Workerが各SkillをAgentの実行入力へ明示的に読み込む。RAGアダプターは未実装である。
 
 ### 7.1 スキルインターフェース
 
@@ -557,6 +559,12 @@ Runnerターン上限は既定24・許容範囲1〜64、サブタスクの初期
 - 構造化された成功結果またはエラー
 
 登録時に重複名、破損したSchema、未許可パスを検査する。ロードできないスキルが設定されている場合、起動・タスク開始時に診断可能なエラーとして通知する。起動時ロードを基本とし、タスク実行中の無検証なコード再ロードは行わない。
+
+#### 現行実装: プライベートSkillの選択と読込
+
+プライベートSkillは`.ai_agent_base/private_skills/<skill-name>/SKILL.md`に配置し、ComposeのWorkerだけがホストディレクトリを`/opt/private-agent-skills`へ読み取り専用bind mountする。既定のホストパスは`./.ai_agent_base/private_skills`で、`PRIVATE_SKILLS_SOURCE`により変更できる。Skill本文をWorkerイメージへコピーせず、ホスト上の更新は次回の計画カタログ取得またはサブエージェント実行時の読込に反映する。Workerは計画時にディレクトリ直下の有効なSkill名と説明を列挙し、管理エージェントに候補として渡す。計画の`skill_names`は候補内の名前を最大2件まで指定し、PostgreSQLのSubtaskへ保存する。サブエージェント実行ごとに指定された`SKILL.md`を再読込するため、保存済み計画の再試行でも最新の内容を使う。
+
+Skill名は小文字英数字とハイフンからなるディレクトリ名とfront matterの`name`が一致するものに限り、シンボリックリンク、ルート外パス、壊れた／過大なファイルは候補から除外する。計画保存時に選択名を現在の候補と照合し、実行時にSkillが削除・破損していれば明示的に失敗させる。Skill本文は信頼された管理対象の指示として扱うが、既存の読み取り専用Tool Registryの権限を越えず、シェル・ファイル変更・副作用Toolを追加しない。モデル出力が選んだSkill名だけで認可や実行可能範囲を拡張しない。
 
 ### 7.2 プライベート資産の配置
 
@@ -583,6 +591,8 @@ flowchart TB
 ```
 
 実パスは設定で変更できる。プライベートパス、DBファイル、ログ、元文書、認証情報は公開リポジトリに追加しない。`.gitignore`と配布設定でローカルデータの誤コミットを防ぎ、起動時に設定済みパスが公開リポジトリ内を指していないか警告・検査する。
+
+現行Workerは`.ai_agent_base/private_skills`を実行時bind mountで読み取り、イメージビルド時にSkill本文を複製しない。APIやUser/Admin UIにはこのディレクトリをマウントせず、Worker内でも読み取り専用とする。
 
 ### 7.3 検索インターフェース
 
@@ -673,7 +683,7 @@ WorkspaceファイルAPIは実装済みで、所有者・削除状態を確認�
 - `task.completed` / `task.failed`
 - `task.tool_budget_approval_requested` / `task.tool_budget_approval_resolved`
 
-現行イベントには`task.partially_completed`、`quality.checklists_created`、`quality.review_completed`、`task.tool_budget_approval_requested`、`task.tool_budget_approval_resolved`が含まれる。承認要求イベントは要求ID、対象サブタスク、追加回数、理由を含み、秘密情報や隠れた思考過程は含めない。決定イベントは承認／拒否と結果状態を記録する。品質イベントは計画バージョン、対象、判定結果や項目数をpayloadに記録する。チェックリストと項目別根拠の正本はDBの計画・判定記録とし、SSEイベントは再取得可能な進捗通知として扱う。タスク完了イベントには保存済み成果物の相対パスを含め、UIがExplorer一覧を更新できるようにする。
+現行イベントには`task.partially_completed`、`quality.checklists_created`、`quality.review_completed`、`task.tool_budget_approval_requested`、`task.tool_budget_approval_resolved`が含まれる。承認要求イベントは要求ID、対象サブタスク、追加回数、理由を含み、秘密情報や隠れた思考過程は含めない。決定イベントは承認／拒否と結果状態を記録する。品質イベントは計画バージョン、対象、判定結果や項目数をpayloadに記録する。`agent.progress`はツール活動の`activity`・`phase`・`tool_name`、Skill読込の`skill_name`・`skill_source`（`public`／`private`）、サブタスク／会話sequenceを記録し、ツール完了時は出典件数を含める。検索query、ツール引数、取得本文は進捗イベントに含めない。チェックリストと項目別根拠の正本はDBの計画・判定記録とし、SSEイベントは再取得可能な進捗通知として扱う。タスク完了イベントには保存済み成果物の相対パスを含め、UIがExplorer一覧を更新できるようにする。
 
 SSEエンドポイントはタスク所有者を検証し、DBのイベントID順に最大200件ずつ読み取る。`Last-Event-ID`以降を再送し、新規イベントがない間は設定間隔（既定1秒）でkeep-aliveを送る。独立した成果物イベントは設けず、完了イベントに保存済みファイルの相対パスを含める。UIは会話本文をイベントへ重複記録せず、必要に応じてメッセージAPIから再取得する。
 
@@ -746,7 +756,7 @@ SDK導入のために既存のTask／Subtask／JobをSDKのSessionやRunStateへ
 - タスク状態が終端になってもWorkspace、アップロード、成果物をタスク削除まで保持する。現行削除ワーカーは削除要求後にタスク操作を拒否し、Workspace清掃後にDB関連データを削除する。失敗時は削除ジョブを再試行する。Terminal／Sandbox導入後はPTY、シェル・子プロセス、コンテナ、Terminal接続も同じ削除フローに追加する。
 - タスク別CPU・メモリ・ストレージ上限は初期設計では保留する。問題が確認された場合に使用状況を観測し、上限、同時実行数、保持方針等を追加する。Terminal／Sandbox導入時のネットワークとプロセス権限は別の隔離要件として制御する。
 - サンドボックスを利用できない場合、コマンドやファイル操作をWorker／ホスト上で代替実行してはならない。該当操作を失敗として報告する。
-- スキルコードは任意コード実行能力を持つ信頼境界として扱う。許可されたプライベートソースのみをロードし、ロード元とバージョンを記録する。
+- スキルコードは任意コード実行能力を持つ信頼境界として扱う。現行のMarkdown Skillは指示本文としてのみ読み込み、登録済みの読み取り専用ツール以外を実行させない。許可されたプライベートソースのみを読み取り専用でマウントする。
 
 ### 10.4 UI・ログの安全性
 
@@ -814,6 +824,7 @@ Runnerターン上限とサブタスクのツール総数上限はサーバー�
 | `VAULT_KV_MOUNT` | Vault KV v2のmount名 |
 | `VAULT_OPENAI_KEY_PATH` | システム共通OpenAIキーを保存するKV v2内のパス |
 | `VAULT_TAVILY_KEY_PATH` | Tavily APIキーを保存するKV v2内のパス。Worker AppRoleのみ読取可能 |
+| `PRIVATE_SKILLS_SOURCE` / `PRIVATE_SKILLS_PATH` | ホスト上のSkillディレクトリ（既定`./.ai_agent_base/private_skills`）とWorker内の読込先（`/opt/private-agent-skills`）。Workerだけに読み取り専用bind mountし、イメージへコピーしない |
 | `TAVILY_TIMEOUT_SECONDS` | Tavily CLI検索プロセスのタイムアウト。Worker側で1〜60秒に制限 |
 | `VAULT_API_ROLE_ID_FILE` / `VAULT_API_SECRET_ID_FILE` | 管理API用AppRole資格情報を読み込む制限付きファイル |
 | `VAULT_WORKER_ROLE_ID_FILE` / `VAULT_WORKER_SECRET_ID_FILE` | Worker用読取専用AppRole資格情報を読み込む制限付きファイル |

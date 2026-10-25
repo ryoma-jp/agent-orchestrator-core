@@ -56,6 +56,7 @@ async def claim_job():
         )
         job.attempt += 1
         task.status = "planning"
+        task.error = None
         task.updated_at = now
         session.add(
             Event(
@@ -130,10 +131,7 @@ async def mark_failure(
             job.lease_owner = None
             job.lease_expires_at = None
             task.status = "queued"
-            task.error = {
-                "code": "agent_attempt_failed",
-                "message": "Task execution failed; retry scheduled.",
-            }
+            task.error = None
             task.updated_at = datetime.now(timezone.utc)
             session.add(
                 Event(
@@ -141,7 +139,18 @@ async def mark_failure(
                     type="task.status_changed",
                     payload_json={
                         "status": "queued",
-                        "error": "agent_attempt_failed",
+                        "retry_scheduled": True,
+                        "attempt": attempt,
+                        "max_attempts": min(
+                            max(
+                                task.config_snapshot.get(
+                                    "max_agent_attempts",
+                                    settings.max_agent_attempts,
+                                ),
+                                1,
+                            ),
+                            3,
+                        ),
                     },
                 )
             )

@@ -97,7 +97,23 @@ function App() {
         const action = status === 'running' ? 'に取り組んでいます' : status === 'reviewing' ? 'の成果物を検証しています' : status === 'revising' ? 'の不足部分を修正しています' : status === 'accepted' ? 'の成果物を受け入れました' : status === 'partially_accepted' ? 'は一部未達です' : status === 'succeeded' ? 'が完了しました' : status === 'blocked' ? 'は追加情報待ちです' : status === 'failed' ? 'で問題が発生しました' : ''
         content = action ? `${title}${action}` : ''
       } else if (message.type === 'agent.progress') {
-        content = typeof payload.summary === 'string' ? payload.summary : ''
+        const activity = payload.activity
+        if (activity === 'skill') {
+          const skillName = typeof payload.skill_name === 'string' ? payload.skill_name : 'private skill'
+          const source = payload.skill_source === 'public' ? '公開Skill' : 'プライベートSkill'
+          content = `${source}「${skillName}」を読み込みました。`
+        } else if (activity === 'tool') {
+          const toolName = payload.tool_name === 'tavily_web_search' ? 'Tavily Web検索' : typeof payload.tool_name === 'string' ? payload.tool_name : 'ツール'
+          const phase = payload.phase
+          const sourceCount = typeof payload.source_count === 'number' ? payload.source_count : 0
+          content = phase === 'started' ? `${toolName}を実行しています。`
+            : phase === 'completed' ? `${toolName}を利用しました。${sourceCount > 0 ? `（出典${sourceCount}件）` : ''}`
+              : phase === 'blocked' ? `${toolName}はツール予算上限のため実行されませんでした。`
+                : phase === 'failed' ? `${toolName}の実行に失敗しました。`
+                  : ''
+        } else {
+          content = typeof payload.summary === 'string' ? payload.summary : ''
+        }
       } else if (message.type === 'quality.checklists_created') {
         const count = typeof payload.subtask_item_count === 'number' ? payload.subtask_item_count : 0
         content = `成果物チェックリストを作成しました（${count}項目）。`
@@ -305,7 +321,7 @@ function App() {
               {active.status === 'needs_attention' && <div className="clarification-note" role="status"><MessageSquareText size={15} /> Reply below to continue this task.</div>}
               {active.status === 'partially_completed' && active.completion_report && <article className="partial-block"><strong>未達項目 · 計画 v{active.completion_report.plan_version}</strong><ul>{active.completion_report.unmet_items.map((item) => <li key={`${item.target_type}-${item.subtask_title}-${item.item_id}`}><b>{item.subtask_title ?? '最終回答'}: {item.description}</b>{item.deficiency && <span>{item.deficiency}</span>}{item.evidence && <small>確認内容: {item.evidence}</small>}</li>)}</ul></article>}
               {active.result && !messages.some((message) => message.role === 'assistant' && message.content === active.result) && <article className="result-block"><div className="result-label"><Check size={14} /> RESULT</div><p>{active.result}</p></article>}
-              {active.error && <article className="error-block"><strong>{active.error.code ?? 'Task error'}</strong><p>{active.error.message ?? 'The task could not be completed.'}</p></article>}
+              {active.error && active.status === 'failed' && <article className="error-block"><strong>{active.error.code ?? 'Task error'}</strong><p>{active.error.message ?? 'The task could not be completed.'}</p></article>}
             </div>
             {active.status !== 'waiting_approval' && <form className="reply-box" onSubmit={sendMessage}><textarea name="content" placeholder={active.status === 'needs_attention' ? 'Answer the questions above to continue...' : 'Add context or a follow-up...'} rows={3} maxLength={20000} required /><div className="reply-actions"><span><MessageSquareText size={14} /> Messages stay in this task</span><button className="send-btn" title="Send message" disabled={busy}><Send size={16} /></button></div></form>}
             </>}

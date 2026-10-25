@@ -5,10 +5,16 @@ PostgreSQL-backed task coordination service with separate API, worker, user UI, 
 ## Initial setup
 
 1. Copy `.env.example` to `.env`. Replace the database password with a long random value in both `POSTGRES_PASSWORD` and `DATABASE_URL`, set real model IDs available to your OpenAI project, choose a unique administrator password of at least 12 characters, and set `WORKSPACE_INTERNAL_TOKEN` to a separate long random value. Set `VAULT_CREDENTIAL_GID` to the host's `id -g` value so the non-root API and Worker can read the group-restricted credential files. Keep `.env` and Vault credentials out of version control.
-2. Start PostgreSQL and the development Vault: `docker compose up -d db` and `docker compose --profile local-vault up -d --wait vault`.
-3. Provision the local KV v2 path and API/Worker AppRoles: `sh scripts/provision-local-vault.sh`.
-4. Apply the initial schema: `docker compose --profile setup run --rm migrate`.
-5. Create the first administrator: `docker compose --profile setup run --rm bootstrap`.
+2. If you have a private skills repository, check it out locally. Replace `<PRIVATE_SKILL_GIT_REPOSITORY_URL>` with its Git URL:
+  ```sh
+  mkdir -p ./.ai_agent_base
+  git clone <PRIVATE_SKILL_GIT_REPOSITORY_URL> ./.ai_agent_base/private_skills
+  ```
+  Compose mounts this directory read-only into the Worker. Host-side skill edits are loaded on the next planning or subagent execution without rebuilding the image.
+3. Start PostgreSQL and the development Vault: `docker compose up -d db` and `docker compose --profile local-vault up -d --wait vault`.
+4. Provision the local KV v2 path and API/Worker AppRoles: `sh scripts/provision-local-vault.sh`.
+5. Apply the initial schema: `docker compose --profile setup run --rm migrate`.
+6. Create the first administrator: `docker compose --profile setup run --rm bootstrap`.
 
 ## Start services
 
@@ -102,7 +108,7 @@ The user UI supports login, task creation, conversation continuation, cancellati
 
 ## Remaining scope
 
-Additional tool providers and side-effecting tools, human approval and `needs_attention` resolution flows, the isolated Sandbox service, dynamic private-skill loading, the RAG adapter, artifact storage/download, context summarization, usage/cost records, and database-shared RPM/TPM/concurrency slots are not implemented yet. The Worker image installs the Tavily CLI and only the official `tavily-search` skill; searches remain read-only and use a per-Worker rate limit. Run a single Worker replica for this initial implementation.
+Additional tool providers and side-effecting tools, human approval and `needs_attention` resolution flows, the isolated Sandbox service, the RAG adapter, artifact storage/download, context summarization, usage/cost records, and database-shared RPM/TPM/concurrency slots are not implemented yet. The Worker image installs the Tavily CLI and official `tavily-search` skill. Private skills under `.ai_agent_base/private_skills` are mounted read-only into the Worker at runtime, selected by the manager during planning, and read again for each subagent execution so host-side updates take effect without rebuilding the image. Skills do not expand the registered read-only tool permissions. Searches remain read-only and use a per-Worker rate limit. Run a single Worker replica for this initial implementation.
 
 ## Development checks
 

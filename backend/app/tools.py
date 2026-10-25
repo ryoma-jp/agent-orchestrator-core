@@ -22,6 +22,10 @@ from app.config import get_settings
 from app.vault import read_tavily_api_key
 
 
+_PRIVATE_SKILL_NAME = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*\Z")
+_MAX_PRIVATE_SKILL_BYTES = 100_000
+
+
 class TavilySearchArguments(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -49,9 +53,9 @@ class TavilySearchArguments(BaseModel):
 
 
 ToolHandler = Callable[[BaseModel], Awaitable[dict[str, object]]]
-BeforeToolCall = Callable[[], Awaitable[None]]
+BeforeToolCall = Callable[[str], Awaitable[None]]
 ToolResultCallback = Callable[
-    [str, str, dict[str, object]], None
+    [str, str, dict[str, object]], None | Awaitable[None]
 ]
 
 
@@ -340,3 +344,105 @@ def load_tavily_search_skill() -> str:
         if len(sections) == 3:
             content = sections[2]
     return content.strip()
+
+
+def _private_skill_root() -> Path | None:
+    configured_path = get_settings().private_skills_path
+    try:
+        root = Path(configured_path).expanduser().resolve(strict=True)
+    except OSError:
+        return None
+    return root if root.is_dir() else None
+
+
+def _read_private_skill(skill_name: str) -> tuple[str, str]:
+    if _PRIVATE_SKILL_NAME.fullmatch(skill_name) is None:
+        raise RuntimeError("private_skill_unavailable")
+    root = _private_skill_root()
+    if root is None:
+        raise RuntimeError("private_skill_unavailable")
+
+    skill_directory = root / skill_name
+    skill_file = skill_directory / "SKILL.md"
+    if (
+        skill_directory.is_symlink()
+        or not skill_directory.is_dir()
+        or skill_file.is_symlink()
+        or not skill_file.is_file()
+    ):
+        raise RuntimeError("private_skill_unavailable")
+    try:
+        resolved_file = skill_file.resolve(strict=True)
+        if not resolved_file.is_relative_to(root):
+            raise RuntimeError("private_skill_unavailable")
+        if resolved_file.stat().st_size > _MAX_PRIVATE_SKILL_BYTES:
+            raise RuntimeError("private_skill_invalid")
+        content = resolved_file.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        raise RuntimeError("private_skill_unavailable") from exc
+    if len(content.encode("utf-8")) > _MAX_PRIVATE_SKILL_BYTES:
+        raise RuntimeError("private_skill_invalid")
+
+    frontmatter = re.match(
+        r"\A---\r?\n(?P<metadata>.*?)\r?\n---\r?\n(?P<body>.*)\Z",
+        content,
+        flags=re.DOTALL,
+    )
+    if frontmatter is None:
+        raise RuntimeError("private_skill_invalid")
+    metadata: dict[str, str] = {}
+    for line in frontmatter.group("metadata").splitlines():
+        match = re.fullmatch(r"(name|description):\s*(.*?)\s*", line)
+        if match is None:
+            continue
+        key, value = match.groups()
+        if len(value) >= 2 and value[0] == value[-1] == "'":
+            value = value[1:-1].replace("''", "'")
+        elif len(value) >= 2 and value[0] == value[-1] == '"':
+            try:
+                value = json.loads(value)
+            except json.JSONDecodeError as exc:
+                raise RuntimeError("private_skill_invalid") from exc
+        metadata[key] = value.strip()
+
+    description = metadata.get("description", "")
+    body = frontmatter.group("body").strip()
+    if (
+        metadata.get("name") != skill_name
+        or not description
+        or len(description) > 1_000
+        or not body
+    ):
+        raise RuntimeError("private_skill_invalid")
+    return description, body
+
+
+def list_private_skills() -> list[dict[str, str]]:
+    root = _private_skill_root()
+    if root is None:
+        return []
+    skills: list[dict[str, str]] = []
+    try:
+        directories = sorted(root.iterdir(), key=lambda path: path.name)
+    except OSError:
+        return []
+    for directory in directories:
+        if (
+            _PRIVATE_SKILL_NAME.fullmatch(directory.name) is None
+            or directory.is_symlink()
+            or not directory.is_dir()
+        ):
+            continue
+        try:
+            description, _ = _read_private_skill(directory.name)
+        except RuntimeError:
+            continue
+        skills.append(
+            {"name": directory.name, "description": description}
+        )
+    return skills
+
+
+def load_private_skill(skill_name: str) -> str:
+    _, instructions = _read_private_skill(skill_name)
+    return instructions

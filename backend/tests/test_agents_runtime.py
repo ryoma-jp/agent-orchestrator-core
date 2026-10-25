@@ -104,6 +104,47 @@ async def test_api_and_format_retries_share_one_budget(
 
 
 @pytest.mark.asyncio
+async def test_read_timeout_retries_within_model_attempt_budget(
+    sdk_transport, monkeypatch
+):
+    async def no_wait(_delay):
+        return None
+
+    monkeypatch.setattr("app.openai_client.asyncio.sleep", no_wait)
+    transport = sdk_transport(
+        [httpx.ReadTimeout("response timed out"), '{"answer":"recovered"}']
+    )
+
+    result = await generate(max_attempts=2)
+
+    assert result.answer == "recovered"
+    assert len(transport.requests) == 2
+    assert len(transport.key_reads) == 2
+    assert all(client.is_closed() for client in transport.clients)
+
+
+@pytest.mark.asyncio
+async def test_read_timeout_exhaustion_is_classified_and_bounded(
+    sdk_transport, monkeypatch
+):
+    async def no_wait(_delay):
+        return None
+
+    monkeypatch.setattr("app.openai_client.asyncio.sleep", no_wait)
+    transport = sdk_transport(
+        [httpx.ReadTimeout("response timed out")] * 2
+    )
+
+    with pytest.raises(
+        AgentExecutionError, match="^openai_request_timed_out$"
+    ):
+        await generate(max_attempts=2)
+
+    assert len(transport.requests) == 2
+    assert all(client.is_closed() for client in transport.clients)
+
+
+@pytest.mark.asyncio
 async def test_provider_error_is_sanitized_and_client_closed(sdk_transport):
     transport = sdk_transport(
         [
@@ -151,7 +192,7 @@ async def test_lease_loss_at_tool_boundary_stops_runner(sdk_transport):
     transport = sdk_transport([tool_call()])
     calls = []
 
-    async def lost():
+    async def lost(_tool_name):
         raise RuntimeError("job_lease_lost")
 
     with pytest.raises(RuntimeError, match="^job_lease_lost$"):
@@ -165,7 +206,7 @@ async def test_cancellation_propagates_from_tool_boundary(sdk_transport):
     sdk_transport([tool_call()])
     calls = []
 
-    async def cancelled():
+    async def cancelled(_tool_name):
         raise asyncio.CancelledError()
 
     with pytest.raises(asyncio.CancelledError):
@@ -191,7 +232,7 @@ async def test_tool_budget_exhaustion_returns_control_result(
     observations = []
     reservations = 0
 
-    async def reserve():
+    async def reserve(_tool_name):
         nonlocal reservations
         reservations += 1
         if reservations > 1:
