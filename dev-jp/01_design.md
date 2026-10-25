@@ -665,7 +665,7 @@ Worker内のモデル要求とジョブ処理は設定回数まで再試行さ�
 
 副作用操作の承認／resolve APIとGit認証連携の要求形式・認可方式は各機能の実装時に別途定義する。ツール予算承認APIは所有者セッションとCSRFを検証し、`waiting_approval`中の未解決要求IDだけを受け付ける。WorkspaceファイルAPIの認可と保存方式は本節および10.3節に定める。
 
-WorkspaceファイルAPIは実装済みで、所有者・削除状態を確認し、相対パスの遡りとシンボリックリンクを拒否する。ファイル内容の正本はAPIコンテナだけがマウントする永続ボリュームであり、ブラウザーにはAPI経由で提供する。Terminal WebSocketと独立Sandboxは未実装である。将来Terminalを追加する場合も同じ所有者境界を適用し、ホストパスや他タスクのWorkspaceを公開しない。Git認証ブローカーも未実装であり、資格情報をWorker等へ残さない仕組みを別途導入する。
+WorkspaceファイルAPIは実装済みで、所有者・削除状態を確認し、相対パスの遡りとシンボリックリンクを拒否する。ファイル内容の正本はAPIコンテナだけがマウントする永続ボリュームであり、ブラウザーにはAPI経由で提供する。最終成果物PUTでは同一TaskFile pathの並行登録に備え、`uq_task_files_path`に対するPostgreSQL atomic upsertを使う。Workerは設定されたtimeoutと回数上限内で同一path・同一contentのPUTを再送し、保存完了後にタスク結果を確定する。Terminal WebSocketと独立Sandboxは未実装である。将来Terminalを追加する場合も同じ所有者境界を適用し、ホストパスや他タスクのWorkspaceを公開しない。Git認証ブローカーも未実装であり、資格情報をWorker等へ残さない仕組みを別途導入する。
 
 アクセスキーは外部RESTクライアント専用のBearer認証資格情報とし、ログインUIのセッション認証とは分ける。各ユーザーにつき有効なキーは最大1本とする。発行・再発行時に十分なエントロピーを持つキーを生成し、平文は発行応答で一度だけ返し、DBにはハッシュのみを保存する。再発行は旧キーを同一トランザクションで失効させ、自動期限は設けない。一般ユーザーは自身のキーのみを発行・再発行できる。
 
@@ -820,6 +820,7 @@ Runnerターン上限とサブタスクのツール総数上限はサーバー�
 | `MAX_CONCURRENT_AGENTS` / `MAX_AGENT_ATTEMPTS` | 初期値。最大試行数は1〜3に制限 |
 | `MAX_AGENT_TURNS` / `MAX_TOOL_CALLS_PER_SUBTASK` | SDK Runner単体のターン上限（既定24、1〜64）とサブタスクの初期ツール上限（既定20、0〜100）。APIが新規タスクへ保存する。追加承認1回の加算数は当該タスクの初期上限と同数で、累積上限は設けない。再試行・品質修正・Worker再取得で消費数をリセットしない |
 | `MAX_QUALITY_REVISIONS_PER_SUBTASK` / `MAX_QUALITY_REVISIONS_PER_TASK` | 品質修正上限の環境初期値。品質修正の有限上限であり、モデル/API再試行やWorkerジョブ再試行とは別に設定 |
+| `WORKSPACE_ARTIFACT_TIMEOUT_SECONDS` / `WORKSPACE_ARTIFACT_MAX_ATTEMPTS` | WorkerからAPIへの最終成果物PUT timeout（既定60秒）と、同一パスへのtransport／5xx再試行回数（既定3回）。同じ内容のPUTを再送し、上限後は`workspace_artifact_timeout`または`workspace_artifact_write_failed`としてWorker試行へ返す |
 | `VAULT_ADDR` | HashiCorp Vaultの接続先 |
 | `VAULT_KV_MOUNT` | Vault KV v2のmount名 |
 | `VAULT_OPENAI_KEY_PATH` | システム共通OpenAIキーを保存するKV v2内のパス |

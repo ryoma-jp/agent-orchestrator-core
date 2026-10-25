@@ -25,6 +25,10 @@ class Settings(BaseSettings):
     max_quality_revisions_per_task: int = 10
     job_lease_seconds: int = 60
     agent_timeout_seconds: int = 180
+    workspace_artifact_timeout_seconds: int = Field(
+        default=60, ge=1, le=300
+    )
+    workspace_artifact_max_attempts: int = Field(default=3, ge=1, le=5)
     tavily_timeout_seconds: int = 20
     tavily_search_skill_path: str = (
         "/opt/agent-skills/tavily-search/SKILL.md"

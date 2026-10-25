@@ -1216,6 +1216,39 @@ async def _review_subtask_result(
     return failed_result, current_result.status, current_result.questions
 
 
+async def _put_workspace_artifact(
+    client: httpx.AsyncClient,
+    url: str,
+    headers: dict[str, str],
+    content: bytes,
+    max_attempts: int,
+) -> None:
+    attempt_limit = max(1, min(max_attempts, 5))
+    for attempt in range(attempt_limit):
+        try:
+            response = await client.put(
+                url, headers=headers, content=content
+            )
+            response.raise_for_status()
+            return
+        except httpx.TimeoutException:
+            if attempt + 1 >= attempt_limit:
+                raise AgentExecutionError(
+                    "workspace_artifact_timeout"
+                ) from None
+        except httpx.TransportError:
+            if attempt + 1 >= attempt_limit:
+                raise AgentExecutionError(
+                    "workspace_artifact_write_failed"
+                ) from None
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code < 500 or attempt + 1 >= attempt_limit:
+                raise AgentExecutionError(
+                    "workspace_artifact_write_failed"
+                ) from None
+        await asyncio.sleep(min(0.5 * (2**attempt), 2.0))
+
+
 async def _finish_task(
     task_id,
     job_id,
@@ -1258,18 +1291,25 @@ async def _finish_task(
             workspace_token = (
                 settings.workspace_internal_token.get_secret_value()
             )
-            async with httpx.AsyncClient(timeout=10.0) as client:
+            artifact_timeout = getattr(
+                settings, "workspace_artifact_timeout_seconds", 60
+            )
+            artifact_attempts = getattr(
+                settings, "workspace_artifact_max_attempts", 3
+            )
+            async with httpx.AsyncClient(timeout=artifact_timeout) as client:
                 for artifact, relative_path in zip(
                     answer.artifacts, artifact_paths, strict=True
                 ):
                     encoded_path = quote(relative_path, safe="/")
-                    response = await client.put(
+                    await _put_workspace_artifact(
+                        client,
                         f"{settings.api_internal_base_url}/api/tasks/{task_id}"
                         f"/workspace/internal/{encoded_path}",
-                        headers={"X-Workspace-Token": workspace_token},
-                        content=artifact.content.encode("utf-8"),
+                        {"X-Workspace-Token": workspace_token},
+                        artifact.content.encode("utf-8"),
+                        artifact_attempts,
                     )
-                    response.raise_for_status()
         task.status = "succeeded" if fully_completed else "partially_completed"
         task.result = user_answer
         task.error = None

@@ -1771,7 +1771,7 @@ async def test_finish_task_persists_requested_artifact(
             return FakeResponse()
 
     session = FakeSession()
-    client = FakeClient(timeout=10.0)
+    client = FakeClient(timeout=60.0)
 
     async def assert_lease(*_args):
         return None
@@ -1792,6 +1792,8 @@ async def test_finish_task_persists_requested_artifact(
                 else None
             ),
             api_internal_base_url="http://api:8000",
+            workspace_artifact_timeout_seconds=60,
+            workspace_artifact_max_attempts=3,
         ),
     )
     monkeypatch.setattr(
@@ -1865,6 +1867,7 @@ async def test_finish_task_persists_requested_artifact(
     assert completion_event.payload_json["artifact_paths"] == expected_paths
     assert len(client.requests) == len(expected_paths)
     if artifact_requested:
+        assert client.timeout == 60
         assert client.requests[0][0].endswith(
             "/workspace/internal/artifacts/research.md"
         )
@@ -1877,6 +1880,140 @@ async def test_finish_task_persists_requested_artifact(
         isinstance(item, Event) and item.type == "task.failed"
         for item in session.added
     )
+
+
+@pytest.mark.asyncio
+async def test_internal_workspace_write_uses_atomic_taskfile_upsert(
+    monkeypatch,
+):
+    import app.routers.workspace as workspace_module
+    from sqlalchemy.dialects import postgresql
+    from starlette.requests import Request
+
+    task_id = uuid.uuid4()
+    task = SimpleNamespace(deletion_requested_at=None)
+    stored_file = SimpleNamespace(path="artifacts/report.md", size_bytes=24)
+
+    class FakeSession:
+        def __init__(self):
+            self.statements = []
+            self.values = [task, stored_file]
+            self.committed = False
+
+        async def scalar(self, statement):
+            self.statements.append(statement)
+            return self.values.pop(0)
+
+        async def commit(self):
+            self.committed = True
+
+    async def write_workspace_stream(_task_id, relative_path, _chunks):
+        assert relative_path == "artifacts/report.md"
+        return 24
+
+    session = FakeSession()
+    monkeypatch.setattr(
+        workspace_module,
+        "get_settings",
+        lambda: SimpleNamespace(
+            workspace_internal_token=SimpleNamespace(
+                get_secret_value=lambda: "workspace-token"
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        workspace_module, "write_workspace_stream", write_workspace_stream
+    )
+    request = Request(
+        {"type": "http", "method": "PUT", "path": "/", "headers": []}
+    )
+
+    result = await workspace_module.write_internal_task_file(
+        task_id,
+        "artifacts/report.md",
+        request,
+        x_workspace_token="workspace-token",
+        db=session,
+    )
+
+    sql = str(session.statements[1].compile(dialect=postgresql.dialect()))
+    assert result is stored_file
+    assert session.committed
+    assert "ON CONFLICT ON CONSTRAINT uq_task_files_path DO UPDATE" in sql
+
+
+@pytest.mark.asyncio
+async def test_workspace_artifact_put_retries_read_timeout(monkeypatch):
+    import httpx
+
+    import app.orchestrator as orchestrator_module
+
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+
+    class FakeClient:
+        def __init__(self):
+            self.requests = []
+
+        async def put(self, url, **kwargs):
+            self.requests.append((url, kwargs))
+            if len(self.requests) == 1:
+                raise httpx.ReadTimeout("response timed out")
+            return FakeResponse()
+
+    async def no_wait(_delay):
+        return None
+
+    client = FakeClient()
+    monkeypatch.setattr(orchestrator_module.asyncio, "sleep", no_wait)
+
+    await orchestrator_module._put_workspace_artifact(
+        client,
+        "http://api/internal/artifacts/report.md",
+        {"X-Workspace-Token": "test-token"},
+        b"complete report",
+        3,
+    )
+
+    assert len(client.requests) == 2
+    assert client.requests[0] == client.requests[1]
+
+
+@pytest.mark.asyncio
+async def test_workspace_artifact_put_timeout_exhaustion_is_sanitized(
+    monkeypatch,
+):
+    import httpx
+
+    import app.orchestrator as orchestrator_module
+
+    class FakeClient:
+        def __init__(self):
+            self.request_count = 0
+
+        async def put(self, _url, **_kwargs):
+            self.request_count += 1
+            raise httpx.ReadTimeout("secret transport detail")
+
+    async def no_wait(_delay):
+        return None
+
+    client = FakeClient()
+    monkeypatch.setattr(orchestrator_module.asyncio, "sleep", no_wait)
+
+    with pytest.raises(
+        AgentExecutionError, match="^workspace_artifact_timeout$"
+    ):
+        await orchestrator_module._put_workspace_artifact(
+            client,
+            "http://api/internal/artifacts/report.md",
+            {"X-Workspace-Token": "test-token"},
+            b"complete report",
+            3,
+        )
+
+    assert client.request_count == 3
 
 
 @pytest.mark.asyncio

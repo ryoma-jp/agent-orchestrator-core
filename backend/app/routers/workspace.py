@@ -8,6 +8,7 @@ from pathlib import Path
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from fastapi.responses import FileResponse
 from sqlalchemy import func, select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
@@ -334,14 +335,9 @@ async def write_internal_task_file(
         raise HTTPException(
             status_code=400, detail="Invalid workspace path"
         ) from exc
-    task_file = await db.scalar(
-        select(TaskFile).where(
-            TaskFile.task_id == task_id,
-            TaskFile.workspace_rel_path == normalized_path,
-        )
-    )
-    if task_file is None:
-        task_file = TaskFile(
+    statement = (
+        pg_insert(TaskFile)
+        .values(
             task_id=task_id,
             workspace_rel_path=normalized_path,
             role=role,
@@ -349,14 +345,20 @@ async def write_internal_task_file(
             source_ref="task_result",
             size_bytes=size_bytes,
         )
-        db.add(task_file)
-    else:
-        task_file.role = role
-        task_file.source_kind = "agent"
-        task_file.source_ref = "task_result"
-        task_file.size_bytes = size_bytes
+        .on_conflict_do_update(
+            constraint="uq_task_files_path",
+            set_={
+                "role": role,
+                "source_kind": "agent",
+                "source_ref": "task_result",
+                "size_bytes": size_bytes,
+                "updated_at": func.now(),
+            },
+        )
+        .returning(TaskFile)
+    )
+    task_file = await db.scalar(statement)
     await db.commit()
-    await db.refresh(task_file)
     return task_file
 
 
