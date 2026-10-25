@@ -21,13 +21,14 @@ from agents import (
 )
 from agents.items import ModelResponse, TResponseStreamEvent
 from agents.models.interface import ModelTracing
+from agents.models.openai_chatcompletions import OpenAIChatCompletionsModel
 from agents.models.openai_responses import OpenAIResponsesModel
 
 import httpx2
 from openai import APIConnectionError, APIStatusError, AsyncOpenAI
 from pydantic import BaseModel, ValidationError
 
-from app.config import get_settings
+from app.config import OLLAMA_BASE_URL, get_settings
 from app.tools import ToolRegistry, ToolResultCallback
 from app.vault import read_openai_api_key
 
@@ -66,9 +67,10 @@ class AgentExecutionContext:
     definition_version: str = AGENT_DEFINITION_VERSION
 
 
-class VaultResponsesModel(Model):
-    def __init__(self, model, attempts, before_model_call):
+class ConfiguredProviderModel(Model):
+    def __init__(self, model, provider, attempts, before_model_call):
         self.model = model
+        self.provider = provider
         self.attempts = attempts
         self.retries_remaining = attempts - 1
         self.before_model_call = before_model_call
@@ -85,17 +87,33 @@ class VaultResponsesModel(Model):
         for attempt in range(self.attempts):
             if self.before_model_call is not None:
                 await self.before_model_call()
-            try:
-                api_key = await asyncio.to_thread(read_openai_api_key)
-            except Exception:
-                raise AgentExecutionError("vault_key_unavailable") from None
-            client = AsyncOpenAI(
-                api_key=api_key,
-                base_url=settings.openai_base_url
-                or "https://api.openai.com/v1",
-                max_retries=0,
-                timeout=settings.agent_timeout_seconds,
-            )
+            if self.provider == "openai":
+                try:
+                    api_key = await asyncio.to_thread(read_openai_api_key)
+                except Exception:
+                    raise AgentExecutionError(
+                        "vault_key_unavailable"
+                    ) from None
+                client = AsyncOpenAI(
+                    api_key=api_key,
+                    base_url=settings.openai_base_url
+                    or "https://api.openai.com/v1",
+                    max_retries=0,
+                    timeout=settings.agent_timeout_seconds,
+                )
+                model_adapter = OpenAIResponsesModel(
+                    model=self.model, openai_client=client
+                )
+            else:
+                client = AsyncOpenAI(
+                    api_key="ollama",
+                    base_url=f"{OLLAMA_BASE_URL}/v1",
+                    max_retries=0,
+                    timeout=settings.agent_timeout_seconds,
+                )
+                model_adapter = OpenAIChatCompletionsModel(
+                    model=self.model, openai_client=client
+                )
             try:
                 prepared = dict(request)
                 prepared["tracing"] = ModelTracing.DISABLED
@@ -108,9 +126,7 @@ class VaultResponsesModel(Model):
                             + json.dumps(output_schema.json_schema())
                         )
                     prepared["output_schema"] = None
-                return await OpenAIResponsesModel(
-                    model=self.model, openai_client=client
-                ).get_response(**prepared)
+                return await model_adapter.get_response(**prepared)
             except (
                 APIConnectionError,
                 APIStatusError,
@@ -149,9 +165,9 @@ class VaultResponsesModel(Model):
                 )
                 if not retryable or not self.allow_retry():
                     error_code = (
-                        "openai_request_timed_out"
+                        f"{self.provider}_request_timed_out"
                         if timed_out
-                        else "openai_request_failed"
+                        else f"{self.provider}_request_failed"
                     )
                     raise AgentExecutionError(error_code) from None
                 retry_after = (
@@ -195,10 +211,15 @@ class StructuredModelClient:
         max_turns: int = DEFAULT_MAX_AGENT_TURNS,
         max_tool_calls: int = DEFAULT_MAX_TOOL_CALLS,
         execution_context: AgentExecutionContext | None = None,
+        provider: str = "openai",
     ) -> ModelOutput:
         settings = get_settings()
         attempts = min(max(max_attempts or settings.max_agent_attempts, 1), 3)
-        if not 1 <= max_turns <= 64 or not 0 <= max_tool_calls <= 100:
+        if (
+            provider not in {"openai", "ollama"}
+            or not 1 <= max_turns <= 64
+            or not 0 <= max_tool_calls <= 100
+        ):
             raise AgentExecutionError("invalid_agent_limits")
         tool_calls_used = 0
         tool_budget_lock = asyncio.Lock()
@@ -283,12 +304,14 @@ class StructuredModelClient:
             tools = [
                 make_tool(item) for item in tool_registry.openai_definitions()
             ]
-        provider = VaultResponsesModel(model, attempts, check_execution)
+        provider_model = ConfiguredProviderModel(
+            model, provider, attempts, check_execution
+        )
         for attempt in range(attempts):
             agent = Agent(
                 name=schema_name,
                 instructions=system_prompt,
-                model=provider,
+                model=provider_model,
                 tools=tools,
                 output_type=schema,
                 model_settings=ModelSettings(
@@ -320,7 +343,7 @@ class StructuredModelClient:
                     "agent_turn_limit_exceeded"
                 ) from None
             except (ModelBehaviorError, ValidationError):
-                if not provider.allow_retry():
+                if not provider_model.allow_retry():
                     raise AgentExecutionError("invalid_model_output") from None
                 input_text += (
                     "\nThe previous response did not match the required "
@@ -329,4 +352,4 @@ class StructuredModelClient:
                 )
             except AgentsException:
                 raise AgentExecutionError("agent_execution_failed") from None
-        raise AgentExecutionError("openai_attempts_exhausted")
+        raise AgentExecutionError(f"{provider}_attempts_exhausted")

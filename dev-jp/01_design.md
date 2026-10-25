@@ -16,8 +16,8 @@
 | 拡張 | TaskFileメタデータ、タスクUUID別永続Workspace、所有者スコープのファイルAPI、削除アウトボックスと再試行ワーカー | Workerから分離したタスクSandbox、ターミナル、Git cloneと認証ブローカー、動的プライベートスキル、RAGアダプター、コンテキスト要約 |
 | エージェント | 初回指示の目的を表すタスクタイトルを含む構造化計画、成果物目標・チェックリストによる個別受け入れと最終成果物判定、設定上限付き品質修正、準完了状態、依存関係に沿った読み取り専用サブタスクの並行実行、管理エージェントによるプライベートSkill選択とWorkerでの実行時読込、Tavily公式Agent Skillを指示へ組み込んだTavily CLI検索、入力テキスト添付の計画入力、要求ファイルの構造化出力・Workspace保存、ツール予算超過時の部分成果レビューと追加予算承認、最大3回の設定可能な試行 | ファイル／シェル操作ツール、任意形式添付の解析、副作用操作の承認、タスクSandbox内でのエージェント実行 |
 | 拡張 | TaskFileメタデータ、タスクUUID別永続Workspace、所有者スコープのファイルAPI、削除アウトボックスと再試行ワーカー | Workerから分離したタスクSandbox、ターミナル、Git cloneと認証ブローカー、RAGアダプター、コンテキスト要約 |
-| 認証・管理 | WebセッションとCSRF、ユーザー別Bearerアクセスキー、管理者によるアカウント・モデル・品質修正上限・Vaultキー管理 | より細かな権限・監査、利用量／コスト集計 |
-| UI・イベント | User UIの目的表現タスクタイトル表示、タスク別Explorer（空ディレクトリを含む一覧、空状態の表示、アップロード、テキスト編集、ダウンロード、削除）、追加ツール予算の承認／拒否、Admin UI、品質判定の進捗・準完了表示、DBイベントのSSE配信とLast-Event-ID以降の再送 | タスクごとの隔離Terminal、Git認証UI、副作用操作の承認／解決UI |
+| 認証・管理 | WebセッションとCSRF、ユーザー別Bearerアクセスキー、管理者によるアカウント・OpenAI／OllamaエンドポイントとモデルID・品質修正上限・Vaultキー管理 | より細かな権限・監査、利用量／コスト集計 |
+| UI・イベント | User UIの目的表現タスクタイトル表示、タスク別Explorer（空ディレクトリを含む一覧、空状態の表示、アップロード、テキスト編集、ダウンロード、削除）、追加ツール予算の承認／拒否、Admin UIのOpenAI／Ollamaと検索可能なモデルID選択、Workerの会話／画像モデル個別設定、品質判定の進捗・準完了表示、DBイベントのSSE配信とLast-Event-ID以降の再送 | タスクごとの隔離Terminal、Git認証UI、副作用操作の承認／解決UI |
 
 この表は機能の有無を示す。後続節では現行実装と将来設計を区別して記載する。
 
@@ -301,6 +301,8 @@ SDK導入だけで実行途中からの完全復旧や副作用の一度限り�
 
 #### 4.5.4 ツール・モデル接続・安全境界
 
+Manager／Workerの会話モデルはタスク設定スナップショットに保存したプロバイダーを使う。OpenAIでは既存のResponses APIとVaultの最新キーを使用し、OllamaではCompose内の`ollama`サービス（`http://ollama:11434`）が提供するOpenAI互換Chat Completions APIへ接続してVaultキーを読み取らない。ホスト上や外部のOllama接続先は扱わない。Ollama側にResponses API、画像生成などの機能があるとは仮定しない。
+
 既存のTool RegistryをSDKのFunction Toolsへ接続し、サブエージェント実行時に公式`tavily-search` Skill本文を指示へ組み込む。SDK自体はSkillを認識・実行しないため、SkillのCLI利用手順をモデルへ伝え、アプリケーション側の専用Function Toolが固定された`tvly search`コマンドを実行する。任意コマンドやシェル構文は受け付けない。SDKの引数検証に加え、登録済みツールの許可リスト、`read_only`制約、クエリ検査、プロセスのタイムアウト、標準出力サイズ、出典・実行記録の取得を維持する。モデルからのツール要求は実行許可ではなく、アプリケーション側の検査に通過したものだけを実行する。SDKのGuardrailsや承認機能は補助機構であり、所有者認可、Sandbox、外向き通信制御の代替にはしない。
 
 モデル接続アダプターはSDKのモデル呼び出し経路に組み込み、Runner開始時だけでなくツール後の継続要求と再試行を含む各OpenAI API要求の直前にVaultから最新キーを取得する。キーをAgentの指示・ツール引数・シリアライズ対象コンテキストへ含めず、環境変数や古いキーへフォールバックしない。Structured Outputs非対応時のJSONフォールバックとPydantic検証を維持し、SDKが同じ動作を自動提供すると仮定しない。
@@ -323,11 +325,11 @@ SDK採用は汎用ループの保守削減と実行機構の共通化を目的�
 
 PostgreSQLをアプリケーション状態のストアとジョブキューに使用する。タスク、会話、イベント、ジョブの受付登録は同じDBセッションでコミットする。Workerは`FOR UPDATE SKIP LOCKED`でジョブを取得し、期限付きリースを更新する。リース切れジョブは再取得され、Worker処理失敗は設定回数まで再試行される。現行実装は副作用ツールを持たないため、冪等性キーや外部副作用の実行記録はない。
 
-ComposeにはPostgreSQL、API、Worker、User UI、Admin UI、nginxがある。WorkerはAPIと別のDockerビルドターゲットを使用し、Tavily CLIと公式`tavily-search` Agent Skillだけを追加する。CLIは公式のPythonパッケージ導入方法で専用venvへ入れ、SkillはNode.js 22.20以降を使う公式Skills CLIで`tavily-ai/skills`から検索Skillのみを共有Skill領域へコピーする。Skillの取得処理はビルド時に行い、実行時コンテナにNode.jsやnpmを残さない。Vaultはローカル開発用プロファイル、マイグレーションと初期管理者作成はセットアップ用プロファイルで起動する。Sandbox、制限付きDocker API、成果物ボリューム、RAGサービスはComposeに含まれない。
+ComposeにはPostgreSQL、API、Worker、User UI、Admin UI、nginxがある。Ollamaは`local-llm`プロファイルで任意起動し、モデルデータを名前付きボリュームへ永続化する。OllamaサービスはComposeのNVIDIA GPUデバイス予約で全GPUへアクセスし、ホストにはNVIDIAドライバーとDocker対応NVIDIA Container Toolkitを要求する。WorkerはAPIと別のDockerビルドターゲットを使用し、Tavily CLIと公式`tavily-search` Agent Skillだけを追加する。CLIは公式のPythonパッケージ導入方法で専用venvへ入れ、SkillはNode.js 22.20以降を使う公式Skills CLIで`tavily-ai/skills`から検索Skillのみを共有Skill領域へコピーする。Skillの取得処理はビルド時に行い、実行時コンテナにNode.jsやnpmを残さない。Vaultはローカル開発用プロファイル、マイグレーションと初期管理者作成はセットアップ用プロファイルで起動する。Sandbox、制限付きDocker API、成果物ボリューム、RAGサービスはComposeに含まれない。
 
 ### 5.2 コンテナ構成図
 
-以下の図は将来の目標構成を含み、タスク別OS Sandbox／Terminal、Git認証、プライベートスキル、RAG部分は未実装である。タスクUUID別の永続Workspace、所有者スコープのExplorerファイルAPI、削除ジョブは実装済みである。Agents SDKによる実行はWorker内に導入済みであり、現行ComposeはAPI、Worker、2つのUI、nginx、PostgreSQLと任意の開発用Vaultで構成する。管理者ダッシュボードと一般ユーザー用タスクUIは独立したコンテナに分離する。
+以下の図は将来の目標構成を含み、タスク別OS Sandbox／Terminal、Git認証、プライベートスキル、RAG部分は未実装である。タスクUUID別の永続Workspace、所有者スコープのExplorerファイルAPI、削除ジョブは実装済みである。Agents SDKによる実行はWorker内に導入済みであり、現行ComposeはAPI、Worker、2つのUI、nginx、PostgreSQLと任意の開発用Vault／Ollamaで構成する。Ollamaは`local-llm`プロファイルで起動し、NVIDIA GPUを予約してモデルデータを名前付きボリュームに保持する。利用にはホストのNVIDIA Container Toolkitが必要である。管理者ダッシュボードと一般ユーザー用タスクUIは独立したコンテナに分離する。
 
 リバースプロキシにはnginxを推奨する。初期デプロイは単一ホスト上のコンテナ構成であり、nginxはTLS終端とUI/APIへの経路振り分けを担う。SSE向けにプロキシバッファリングを無効化し、長時間接続を許容するタイムアウトを設定する。実行環境の標準基盤などに別のリバースプロキシ要件がある場合は差し替え可能とする。
 
@@ -633,6 +635,7 @@ UIの認証はサーバー側セッションで行い、管理者UIと一般ユ�
 | `POST` | `/api/admin/users/{user_id}/password-reset` | 管理者が初期パスワードを再設定し、次回ログイン時の変更を必須化 |
 | `GET` | `/api/admin/operations/tasks` | タスクID、所有者メール、状態、時刻、エラー情報を取得。指示文・会話本文は返さない |
 | `GET` | `/api/admin/settings` | アプリ運用設定とVaultキー設定状態を取得。キーそのものは返さない |
+| `GET` | `/api/admin/models?provider=openai|ollama` | 管理者が選択したプロバイダーのモデルID一覧をサーバー側で取得。APIキーやOllama認証情報は返さない |
 | `PUT` | `/api/admin/settings` | アプリ運用設定をPostgreSQLへ保存し、新規タスクの設定として適用 |
 | `PUT` | `/api/admin/secrets/openai-api-key` | 管理者がリクエスト本文の`api_key`をVault KV v2へ登録・更新し、成功後に非秘密の設定済み状態を記録。値は応答へ含めない |
 | `POST` | `/api/account/password` | ログイン中ユーザーが本人確認後にパスワードを変更 |
@@ -740,6 +743,7 @@ SDK導入のために既存のTask／Subtask／JobをSDKのSessionやRunStateへ
 - OpenAI APIキーは管理者が管理者ダッシュボードから登録するシステム共通キーとし、HashiCorp VaultのKV v2に保存する。設定画面は登録済み／未登録の状態だけを表示し、保存済みキーを再表示しない。PostgreSQL、ログ、イベント、ブラウザー永続ストレージにはキーを保存しない。
 - キー設定状態は、Vaultへの書込みが成功した後に`system_settings.openai_key_configured`へ記録する非秘密の状態フラグから表示する。管理APIはVaultキーを読み取らず、Vault KVの書込み権限のみを持つ。
 - 管理APIとWorkerにはVault AppRoleを別々に割り当てる。管理API用AppRoleは指定KVパスへの書込みに限定し、Worker用AppRoleは読取り専用とする。`role_id`と`secret_id`はDocker Secrets等のアクセス制限された読み取り専用ファイルから取得し、DBやイメージへ格納しない。Vaultのmount/pathはデプロイ設定とする。
+- OpenAIモデル一覧取得用にAPIコンテナへ専用AppRoleを渡し、OpenAIキーの指定KVパスだけを読取り可能にする。この資格情報はモデル一覧APIからのみ利用し、Tavilyキーや他のVaultパスへの読取り権限を付与しない。モデル一覧応答やログへキーを含めない。
 - Workerは各OpenAI API呼び出しの直前にVaultから最新キーを取得して公式SDKへ適用する。キー更新は以降の新しい呼び出しに反映される。Vault障害またはキー未設定・無効時はモデル呼び出しを明示的に失敗させ、古いキャッシュ値やダミー値へフォールバックしない。
 - APIキーはモデル要求にのみ用い、ユーザーUIへ返さない。Vault障害・キー未設定時はモデル要求を失敗させ、環境変数等のキーへフォールバックしない。キーを含むエラーのログマスキングは別途確認・運用すべき事項である。
 - Tavily APIキーは別のKV v2パス（`VAULT_TAVILY_KEY_PATH`）に保存し、Worker用AppRoleだけに読取権限を与える。管理APIはTavilyキーを読み書きせず、運用者がSecret Storeへ登録する。キーを環境変数、DB、イベント、ログ、UIへ複製しない。
@@ -801,19 +805,33 @@ SDK導入後の例外は共通実行アダプターで分類し、ターン上�
 - **アカウント設定**: 本人確認付きパスワード変更と、外部RESTクライアント用アクセスキーの発行・再発行を提供する。アクセスキーは発行時のみ平文表示し、再表示しない。
 - **進捗表示**: エージェントの内部思考をそのまま表示せず、状態、進捗要約、実行中ツール、承認待ち、生成された成果物を表示する。通信断時は再接続状態を明示し、SSE再開後にサーバー上の確定状態と同期する。画面上の表示だけをタスク状態の正として扱わない。
 
+### 12.4 モデルエンドポイントとモデル選択
+
+管理者のRuntime settingsでは、ManagerとWorkerそれぞれについてモデルエンドポイントを`OpenAI`または`Local LLM (Ollama)`から選択し、そのエンドポイントが返すモデルIDを検索可能なドロップダウンから選ぶ。モデル一覧は管理APIが取得し、ブラウザーへAPIキーやOllamaの認証情報を返さない。検索候補にないIDも入力可能とし、モデル一覧が一時的に取得できない場合に管理者が設定を失うことを防ぐ。
+
+Workerは会話モデルと画像生成モデルを別々に設定する。Workerのエンドポイント選択は両方のWorkerモデルIDに適用する。既定値は、ManagerがOpenAIの`gpt-6.1-sol`、Worker会話用がOpenAIの`gpt-6-luna`、Worker画像生成用がOpenAIの`gpt-image-2.5-sunburst`である。ManagerとWorkerのエンドポイント既定値はいずれもOpenAIとする。これらのIDは初期設定値であり、モデル提供状況の保証ではない。
+
+モデル一覧APIはOpenAIのモデル一覧とCompose内のOllamaサービスに対する`/api/tags`をサーバー側で取得し、モデルIDの配列として返す。OpenAI一覧取得はOpenAI APIのモデル一覧エンドポイントを使用し、APIキー読取専用の専用Vault AppRoleを用いる。Ollama接続先は`http://ollama:11434`に固定する。モデル一覧取得の失敗はプロバイダー別の取得エラーとしてUIに示す。
+
+新規タスク作成時はManager／Workerのプロバイダー、ManagerモデルID、Worker会話モデルID、Worker画像生成モデルIDを既存の`config_snapshot`へコピーする。既存タスクは保存済みスナップショットを優先し、プロバイダー追加前のタスクはOpenAIを選択したものとして解釈する。管理画面での変更は新規タスクだけに適用し、DB列追加マイグレーションは不要とする。
+
+ManagerとWorkerの会話実行では、OpenAI選択時に既存のOpenAI Responses API経路とVault管理キーを使用する。Ollama選択時はOllamaのOpenAI互換Chat Completions APIを使用し、Responses APIのみに依存する機能を呼び出さない。ローカル実行のためのAPIキーは固定のダミー値とし、Vaultキーを読み取らない。画像生成モデルIDは独立した設定値としてスナップショットへ保存するが、この変更自体は画像生成APIや画像成果物生成を実装するものではない。画像生成実行を追加する場合は、選択したプロバイダーがその機能を提供するかを別途検証する。
+
 ## 13. 設定・デプロイ
 
 Python 3.10で実行検証した`openai-agents==0.24.0`、`openai==3.35.1`、`pydantic==2.14.1`を固定する。OpenAI 3.xはHTTPX2を使うため、SDKのHTTP transportを差し替えるテストもHTTPX2に合わせる。SDKの宣言上の互換範囲だけでは利用量スキーマ等の実行時互換性を保証できないため、更新時は組み合わせを再検証する。SDKの実行機能を使うのはWorker内とし、APIからモデル実行を開始しない。SDK用の別サービスや別の状態DBは追加せず、API／Workerの分離と既存Vault AppRoleを維持する。トレース・機密データ収集を明示的に無効化し、既定の環境変数キー取得へ依存しない。既存環境はWorkerを停止し、バックエンドイメージを再ビルドしてマイグレーションを適用した後、API／Workerを再起動する。
 
 Runnerターン上限とサブタスクのツール総数上限はサーバー側環境設定から初期化し、APIが新規タスクの設定スナップショットに保存する。管理UIへは公開せず、既存API／UI契約を維持する。既存タスクのスナップショットに新項目がない場合は固定互換既定値24・20を適用し、実行時の最新管理設定で上限を変えない。
 
-現行実装の管理画面から変更できる運用設定にはモデルID、タスク内同時サブタスク数、最大試行回数、サブタスク単位とタスク全体の品質修正上限が含まれる。Vault接続・DB接続・Cookie設定等は環境設定で与える。設定更新は新規タスクへ適用し、既存タスクは作成時の`config_snapshot`を使う。承認、Sandbox通信許可、利用量・コスト等の設定は存在しない。
+現行実装の管理画面から変更できる運用設定にはManager／WorkerのモデルエンドポイントとモデルID、Workerの会話／画像生成モデルID、タスク内同時サブタスク数、最大試行回数、サブタスク単位とタスク全体の品質修正上限が含まれる。Vault接続・DB接続・Cookie設定等は環境設定で与える。設定更新は新規タスクへ適用し、既存タスクは作成時の`config_snapshot`を使う。画像生成モデルIDは保存・選択できるが、画像生成処理自体は未実装である。承認、Sandbox通信許可、利用量・コスト等の設定は存在しない。
 
 | デプロイ設定 | 内容 |
 |---|---|
 | `POSTGRES_PASSWORD` / `DATABASE_URL` | Compose PostgreSQLの資格情報と接続先。SQLiteはサポート対象外 |
-| `MANAGER_MODEL` | 管理者画面での初期設定に用いる管理エージェントのモデルID。必須。未設定時は起動時に明示エラー |
-| `WORKER_MODEL` | 管理者画面での初期設定に用いるサブエージェントの既定モデルID。必須。未設定時は起動時に明示エラー |
+| `MANAGER_MODEL_PROVIDER` / `WORKER_MODEL_PROVIDER` | 管理者画面での初期エンドポイント。既定値は`openai`。選択肢は`openai`／`ollama` |
+| `MANAGER_MODEL` | 管理者画面での初期ManagerモデルID。既定値は`gpt-6.1-sol` |
+| `WORKER_MODEL` | 管理者画面での初期Worker会話モデルID。既定値は`gpt-6-luna` |
+| `WORKER_IMAGE_MODEL` | 管理者画面での初期Worker画像生成モデルID。既定値は`gpt-image-2.5-sunburst` |
 | `INITIAL_ADMIN_EMAIL` | 初回起動時に作成する初期管理者のメールアドレス |
 | `INITIAL_ADMIN_PASSWORD` | 初期管理者作成用の初期パスワード。Secret Store等から一時注入し、初期化後は除去 |
 | `SESSION_COOKIE_SECURE` | セッションCookieの`Secure`属性。TLS終端環境ではtrueに設定 |
@@ -832,8 +850,10 @@ Runnerターン上限とサブタスクのツール総数上限はサーバー�
 | `OPENAI_BASE_URL` | OpenAI API接続先のデプロイ設定。標準接続先以外を利用する場合のみ設定 |
 | `VAULT_API_ROLE_ID_SOURCE` / `VAULT_API_SECRET_ID_SOURCE` | ComposeでAPI用AppRole資格情報を読み取り専用マウントするホスト側パス |
 | `VAULT_WORKER_ROLE_ID_SOURCE` / `VAULT_WORKER_SECRET_ID_SOURCE` | ComposeでWorker用AppRole資格情報を読み取り専用マウントするホスト側パス |
+| `VAULT_MODEL_CATALOG_ROLE_ID_FILE` / `VAULT_MODEL_CATALOG_SECRET_ID_FILE` | OpenAIモデル一覧専用の読取ロール資格情報をAPIへ渡すファイル |
+| `VAULT_MODEL_CATALOG_ROLE_ID_SOURCE` / `VAULT_MODEL_CATALOG_SECRET_ID_SOURCE` | Composeでモデル一覧専用ロール資格情報を読み取り専用マウントするホスト側パス |
 
-管理設定の初期値は`MANAGER_MODEL`、`WORKER_MODEL`、`MAX_CONCURRENT_AGENTS`、`MAX_AGENT_ATTEMPTS`と品質修正上限の環境変数から取得する。モデルID、同時実行数、試行数、品質修正上限は管理画面で更新でき、新規タスクへ適用する。OpenAI APIキーを保持する`OPENAI_API_KEY`環境変数は使用しない。
+管理設定の初期値はモデルエンドポイント、`MANAGER_MODEL`、`WORKER_MODEL`、`WORKER_IMAGE_MODEL`、`MAX_CONCURRENT_AGENTS`、`MAX_AGENT_ATTEMPTS`と品質修正上限の環境変数から取得する。管理画面での変更は新規タスクに適用し、エンドポイントと3種のモデルIDをタスクの`config_snapshot`へ保存する。OpenAI APIキーを保持する`OPENAI_API_KEY`環境変数は使用しない。
 
 現行Composeはnginx（HTTP port 8080）、Admin UI、User UI、API、PostgreSQLを起動し、任意で開発Vaultと1つのWorkerを起動する。nginx設定はTLS終端を行わないため、本番TLSは前段のロードバランサー等で提供する。SSE経路はnginxバッファリングを無効にし、長時間接続を許容する。Workerの複数レプリカ運用は共有タスクリース／レート制御がないため対象外である。
 

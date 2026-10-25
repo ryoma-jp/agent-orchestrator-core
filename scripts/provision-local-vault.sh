@@ -9,6 +9,15 @@ umask 027
 mkdir -p .local-vault
 chmod 750 .local-vault
 
+for credential_path in \
+    .local-vault/model-catalog-role-id \
+    .local-vault/model-catalog-secret-id
+do
+    if [ -d "$credential_path" ]; then
+        rmdir "$credential_path"
+    fi
+done
+
 if ! compose exec -T vault vault auth list -format=json | grep -q '"approle/"'; then
     compose exec -T vault vault auth enable approle
 fi
@@ -37,10 +46,21 @@ path "auth/token/lookup-self" {
 }
 POLICY
 
+compose exec -T vault vault policy write agent-orchestrator-model-catalog - <<'POLICY'
+path "secret/data/agent-orchestrator/openai" {
+    capabilities = ["read"]
+}
+path "auth/token/lookup-self" {
+    capabilities = ["read"]
+}
+POLICY
+
 compose exec -T vault vault write auth/approle/role/agent-orchestrator-api \
     token_policies=agent-orchestrator-api token_no_default_policy=true
 compose exec -T vault vault write auth/approle/role/agent-orchestrator-worker \
     token_policies=agent-orchestrator-worker token_no_default_policy=true
+compose exec -T vault vault write auth/approle/role/agent-orchestrator-model-catalog \
+        token_policies=agent-orchestrator-model-catalog token_no_default_policy=true
 
 compose exec -T vault vault read -field=role_id \
     auth/approle/role/agent-orchestrator-api/role-id \
@@ -54,6 +74,12 @@ compose exec -T vault vault read -field=role_id \
 compose exec -T vault vault write -f -field=secret_id \
     auth/approle/role/agent-orchestrator-worker/secret-id \
     > .local-vault/worker-secret-id
+compose exec -T vault vault read -field=role_id \
+    auth/approle/role/agent-orchestrator-model-catalog/role-id \
+    > .local-vault/model-catalog-role-id
+compose exec -T vault vault write -f -field=secret_id \
+    auth/approle/role/agent-orchestrator-model-catalog/secret-id \
+    > .local-vault/model-catalog-secret-id
 chmod 640 .local-vault/*
 
 printf '%s\n' 'Local Vault AppRoles provisioned.'

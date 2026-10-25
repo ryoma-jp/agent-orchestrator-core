@@ -61,6 +61,8 @@ from app.tools import (
     ToolRegistry,
 )
 from app import workspaces
+from app import model_catalog, openai_client as openai_client_module
+from app.config import Settings
 
 
 def test_task_instruction_is_bounded_and_nonempty():
@@ -507,6 +509,9 @@ def test_admin_quality_revision_limits_are_bounded():
     )
     assert settings.max_quality_revisions_per_subtask == 2
     assert settings.max_quality_revisions_per_task == 10
+    assert settings.manager_model_provider == "openai"
+    assert settings.worker_model_provider == "openai"
+    assert settings.worker_image_model == "gpt-image-2.5-sunburst"
     with pytest.raises(ValidationError):
         AdminSettingsUpdate(
             manager_model="manager",
@@ -516,6 +521,221 @@ def test_admin_quality_revision_limits_are_bounded():
             max_quality_revisions_per_subtask=6,
             max_quality_revisions_per_task=10,
         )
+
+
+def test_default_model_settings_use_openai_and_requested_models(monkeypatch):
+    for name in (
+        "MANAGER_MODEL_PROVIDER",
+        "MANAGER_MODEL",
+        "WORKER_MODEL_PROVIDER",
+        "WORKER_MODEL",
+        "WORKER_IMAGE_MODEL",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    settings = Settings(_env_file=None)
+
+    assert settings.manager_model_provider == "openai"
+    assert settings.manager_model == "gpt-6.1-sol"
+    assert settings.worker_model_provider == "openai"
+    assert settings.worker_model == "gpt-6-luna"
+    assert settings.worker_image_model == "gpt-image-2.5-sunburst"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("provider", "payload", "expected_url", "expected_headers", "expected"),
+    [
+        (
+            "openai",
+            {"data": [{"id": "model-b"}, {"id": "model-a"}]},
+            "https://api.openai.com/v1/models",
+            {"Authorization": "Bearer catalog-key"},
+            ["model-a", "model-b"],
+        ),
+        (
+            "ollama",
+            {"models": [{"name": "local-b"}, {"name": "local-a"}]},
+            "http://ollama:11434/api/tags",
+            {},
+            ["local-a", "local-b"],
+        ),
+    ],
+)
+async def test_model_catalog_uses_provider_endpoint(
+    monkeypatch, provider, payload, expected_url, expected_headers, expected
+):
+    captured = []
+
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return payload
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def get(self, url, headers):
+            captured.append((url, headers))
+            return FakeResponse()
+
+    monkeypatch.setattr(
+        model_catalog,
+        "get_settings",
+        lambda: SimpleNamespace(
+            openai_base_url="https://api.openai.com/v1",
+        ),
+    )
+    monkeypatch.setattr(
+        model_catalog,
+        "read_openai_model_catalog_key",
+        lambda: "catalog-key",
+    )
+    monkeypatch.setattr(
+        model_catalog,
+        "httpx",
+        SimpleNamespace(AsyncClient=lambda **_kwargs: FakeClient()),
+    )
+
+    models = await model_catalog.list_models(provider)
+
+    assert models == expected
+    assert captured == [(expected_url, expected_headers)]
+
+
+@pytest.mark.asyncio
+async def test_ollama_provider_uses_chat_completions_without_vault_key(
+    monkeypatch,
+):
+    captured = {}
+
+    class FakeClient:
+        async def close(self):
+            captured["closed"] = True
+
+    class FakeChatCompletionsModel:
+        def __init__(self, model, openai_client):
+            captured["model"] = model
+            captured["adapter_client"] = openai_client
+
+        async def get_response(self, **request):
+            captured["request"] = request
+            return "ollama-result"
+
+    def create_client(**kwargs):
+        captured["client_kwargs"] = kwargs
+        return FakeClient()
+
+    monkeypatch.setattr(
+        openai_client_module,
+        "get_settings",
+        lambda: SimpleNamespace(
+            agent_timeout_seconds=12,
+        ),
+    )
+    monkeypatch.setattr(openai_client_module, "AsyncOpenAI", create_client)
+    monkeypatch.setattr(
+        openai_client_module,
+        "OpenAIChatCompletionsModel",
+        FakeChatCompletionsModel,
+    )
+    monkeypatch.setattr(
+        openai_client_module,
+        "read_openai_api_key",
+        lambda: pytest.fail("Ollama must not read the OpenAI key"),
+    )
+
+    result = await openai_client_module.ConfiguredProviderModel(
+        "qwen2.5", "ollama", 1, None
+    ).get_response(tracing="disabled")
+
+    assert result == "ollama-result"
+    assert captured["model"] == "qwen2.5"
+    assert captured["client_kwargs"]["api_key"] == "ollama"
+    assert captured["client_kwargs"]["base_url"] == "http://ollama:11434/v1"
+    assert (
+        captured["request"]["tracing"]
+        is openai_client_module.ModelTracing.DISABLED
+    )
+    assert captured["closed"]
+
+
+@pytest.mark.asyncio
+async def test_ollama_provider_runs_structured_output_through_sdk(monkeypatch):
+    requests = []
+    sdk_client = openai_client_module.AsyncOpenAI
+
+    def respond(request):
+        requests.append(request)
+        return httpx2.Response(
+            200,
+            json={
+                "id": "chatcmpl-local",
+                "object": "chat.completion",
+                "created": 1,
+                "model": "qwen2.5",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": '{"answer":"Local response"}',
+                        },
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 10,
+                    "completion_tokens": 5,
+                    "total_tokens": 15,
+                },
+            },
+        )
+
+    def create_client(**kwargs):
+        return sdk_client(
+            **kwargs,
+            http_client=httpx2.AsyncClient(
+                transport=httpx2.MockTransport(respond)
+            ),
+        )
+
+    monkeypatch.setattr(
+        openai_client_module,
+        "get_settings",
+        lambda: SimpleNamespace(
+            max_agent_attempts=1,
+            agent_timeout_seconds=12,
+        ),
+    )
+    monkeypatch.setattr(openai_client_module, "AsyncOpenAI", create_client)
+    monkeypatch.setattr(
+        openai_client_module,
+        "read_openai_api_key",
+        lambda: pytest.fail("Ollama must not read the OpenAI key"),
+    )
+
+    result = await StructuredModelClient().generate(
+        model="qwen2.5",
+        provider="ollama",
+        schema_name="small_output",
+        schema=SmallOutput,
+        system_prompt="Return a short answer.",
+        input_text="Answer locally.",
+        max_attempts=1,
+    )
+
+    assert result.answer == "Local response"
+    assert len(requests) == 1
+    assert requests[0].url.path == "/v1/chat/completions"
+    assert requests[0].headers["authorization"] == "Bearer ollama"
+    assert requests[0].read()
 
 
 def test_tavily_api_key_request_rejects_empty_keys():

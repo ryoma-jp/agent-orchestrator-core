@@ -10,11 +10,14 @@ from app.config import get_settings
 from app.db import get_session
 from app.dependencies import require_admin, require_csrf
 from app.models import SystemSettings, Task, User, WebSession
+from app.model_catalog import ModelCatalogError, list_models
 from app.schemas import (
     AdminSettingsUpdate,
     AdminSettingsView,
     AdminTaskSummary,
     CreateUserRequest,
+    ModelCatalogView,
+    ModelProvider,
     OpenAIKeyRequest,
     PasswordResetRequest,
     TavilyKeyRequest,
@@ -29,8 +32,11 @@ router = APIRouter(prefix="/api/admin", tags=["administration"])
 def _default_settings() -> dict:
     settings = get_settings()
     return {
+        "manager_model_provider": settings.manager_model_provider,
         "manager_model": settings.manager_model,
+        "worker_model_provider": settings.worker_model_provider,
         "worker_model": settings.worker_model,
+        "worker_image_model": settings.worker_image_model,
         "max_concurrent_agents": settings.max_concurrent_agents,
         "max_agent_attempts": min(max(settings.max_agent_attempts, 1), 3),
         "max_quality_revisions_per_subtask": min(
@@ -93,6 +99,21 @@ async def update_admin_settings(
         tavily_key_configured=row.tavily_key_configured,
         version=row.version,
     )
+
+
+@router.get("/models", response_model=ModelCatalogView)
+async def get_model_catalog(
+    provider: ModelProvider,
+    admin: User = Depends(require_admin),
+):
+    try:
+        models = await list_models(provider)
+    except ModelCatalogError:
+        raise HTTPException(
+            status_code=502,
+            detail=f"{provider}_model_catalog_unavailable",
+        ) from None
+    return ModelCatalogView(provider=provider, models=models)
 
 
 @router.put(

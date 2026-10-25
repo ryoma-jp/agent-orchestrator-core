@@ -1,9 +1,10 @@
 import { useEffect, useState, type FormEvent } from 'react'
-import { Activity, ArrowUpRight, Check, CircleAlert, Command, KeyRound, LogOut, Plus, SlidersHorizontal, Users } from 'lucide-react'
+import { Activity, ArrowUpRight, Check, ChevronDown, CircleAlert, Command, KeyRound, LogOut, Plus, SlidersHorizontal, Users } from 'lucide-react'
 
 type User = { id: string; email: string; role: string; must_change_password: boolean }
 type TaskSummary = { id: string; owner_email: string; status: string; created_at: string; updated_at: string; error: { code?: string; message?: string } | null }
-type AdminSettings = { manager_model: string; worker_model: string; max_concurrent_agents: number; max_agent_attempts: number; max_quality_revisions_per_subtask: number; max_quality_revisions_per_task: number; openai_key_configured: boolean; tavily_key_configured: boolean; version: number }
+type ModelProvider = 'openai' | 'ollama'
+type AdminSettings = { manager_model_provider: ModelProvider; manager_model: string; worker_model_provider: ModelProvider; worker_model: string; worker_image_model: string; max_concurrent_agents: number; max_agent_attempts: number; max_quality_revisions_per_subtask: number; max_quality_revisions_per_task: number; openai_key_configured: boolean; tavily_key_configured: boolean; version: number }
 
 async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
   const headers = new Headers(init.headers)
@@ -19,6 +20,102 @@ async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
   }
   if (response.status === 204) return undefined as T
   return response.json() as Promise<T>
+}
+
+function useModelCatalog(provider: ModelProvider) {
+  const [models, setModels] = useState<string[]>([])
+  const [status, setStatus] = useState('Loading model IDs...')
+
+  useEffect(() => {
+    let active = true
+    setModels([])
+    setStatus('Loading model IDs...')
+    api<{ models: string[] }>(`/admin/models?provider=${provider}`)
+      .then((catalog) => {
+        if (!active) return
+        setModels(catalog.models)
+        setStatus(catalog.models.length ? `${catalog.models.length} models` : 'No models found')
+      })
+      .catch(() => {
+        if (active) setStatus('Model list unavailable')
+      })
+    return () => { active = false }
+  }, [provider])
+
+  return { models, status }
+}
+
+function ModelIdField({ label, name, value, models, listId, status }: { label: string; name: string; value: string; models: string[]; listId: string; status: string }) {
+  const [selectedModel, setSelectedModel] = useState(value)
+  const [search, setSearch] = useState('')
+  const [isOpen, setIsOpen] = useState(false)
+  const matchingModels = models.filter((model) =>
+    model.toLocaleLowerCase().includes(search.trim().toLocaleLowerCase()),
+  )
+
+  return <div
+    className="model-selector-field"
+    onBlur={(event) => {
+      const nextTarget = event.relatedTarget
+      if (!(nextTarget instanceof Node) || !event.currentTarget.contains(nextTarget)) {
+        setIsOpen(false)
+      }
+    }}
+  >
+    <label>{label}<div className="model-input-wrap">
+      <input
+        name={name}
+        value={selectedModel}
+        maxLength={200}
+        required
+        role="combobox"
+        aria-expanded={isOpen}
+        aria-controls={isOpen ? listId : undefined}
+        aria-autocomplete="list"
+        onFocus={() => { setIsOpen(true); setSearch('') }}
+        onChange={(event) => {
+          setSelectedModel(event.target.value)
+          setSearch(event.target.value)
+          setIsOpen(true)
+        }}
+        onKeyDown={(event) => {
+          if (event.key === 'Escape') setIsOpen(false)
+          if (event.key === 'ArrowDown') { setIsOpen(true); setSearch('') }
+        }}
+      />
+      <button
+        type="button"
+        className="model-dropdown-toggle"
+        title="Show model IDs"
+        aria-label={`Show ${label} options`}
+        aria-expanded={isOpen}
+        onClick={() => { setIsOpen((open) => !open); setSearch('') }}
+      ><ChevronDown size={15} /></button>
+    </div></label>
+    {isOpen && <div className="model-options-panel">
+      <input
+        type="search"
+        value={search}
+        placeholder="Search model IDs"
+        aria-label={`Search ${label}`}
+        onChange={(event) => setSearch(event.target.value)}
+        onKeyDown={(event) => {
+          if (event.key === 'Escape') setIsOpen(false)
+        }}
+      />
+      {matchingModels.length ? <div id={listId} className="model-options-list" role="listbox">
+        {matchingModels.map((model) => <button
+          key={model}
+          type="button"
+          role="option"
+          aria-selected={model === selectedModel}
+          onMouseDown={(event) => event.preventDefault()}
+          onClick={() => { setSelectedModel(model); setSearch(''); setIsOpen(false) }}
+        >{model}</button>)}
+      </div> : <div className="model-options-empty">{models.length ? 'No matching models' : status}</div>}
+    </div>}
+    <small>{status}</small>
+  </div>
 }
 
 function App() {
@@ -78,13 +175,21 @@ function Accounts({ onCreated }: { onCreated: () => Promise<void> }) {
 
 function SettingsPanel() {
   const [settings, setSettings] = useState<AdminSettings | null>(null)
+  const [managerProvider, setManagerProvider] = useState<ModelProvider>('openai')
+  const [workerProvider, setWorkerProvider] = useState<ModelProvider>('openai')
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
   const [busy, setBusy] = useState(false)
+  const managerCatalog = useModelCatalog(managerProvider)
+  const workerCatalog = useModelCatalog(workerProvider)
 
   useEffect(() => {
     api<AdminSettings>('/admin/settings')
-      .then(setSettings)
+      .then((loaded) => {
+        setSettings(loaded)
+        setManagerProvider(loaded.manager_model_provider)
+        setWorkerProvider(loaded.worker_model_provider)
+      })
       .catch((reason) => setError((reason as Error).message))
   }, [])
 
@@ -96,8 +201,11 @@ function SettingsPanel() {
       const saved = await api<AdminSettings>('/admin/settings', {
         method: 'PUT',
         body: JSON.stringify({
+          manager_model_provider: data.get('manager_model_provider'),
           manager_model: data.get('manager_model'),
+          worker_model_provider: data.get('worker_model_provider'),
           worker_model: data.get('worker_model'),
+          worker_image_model: data.get('worker_image_model'),
           max_concurrent_agents: Number(data.get('max_concurrent_agents')),
           max_agent_attempts: Number(data.get('max_agent_attempts')),
           max_quality_revisions_per_subtask: Number(data.get('max_quality_revisions_per_subtask')),
@@ -136,8 +244,11 @@ function SettingsPanel() {
     <div className="settings-layout">
       <form className="settings-form" onSubmit={saveSettings}>
         <div className="settings-section-title"><SlidersHorizontal size={17} /><div><h2>Agent runtime</h2><span>Model selection and execution limits</span></div></div>
-        <label>Manager model ID<input name="manager_model" defaultValue={settings.manager_model} maxLength={200} required /></label>
-        <label>Worker model ID<input name="worker_model" defaultValue={settings.worker_model} maxLength={200} required /></label>
+        <label>Manager endpoint<select name="manager_model_provider" value={managerProvider} onChange={(event) => setManagerProvider(event.target.value as ModelProvider)}><option value="openai">OpenAI</option><option value="ollama">Local LLM (Ollama)</option></select></label>
+        <ModelIdField label="Manager model ID" name="manager_model" value={settings.manager_model} models={managerCatalog.models} listId="manager-model-options" status={managerCatalog.status} />
+        <label>Worker endpoint<select name="worker_model_provider" value={workerProvider} onChange={(event) => setWorkerProvider(event.target.value as ModelProvider)}><option value="openai">OpenAI</option><option value="ollama">Local LLM (Ollama)</option></select></label>
+        <ModelIdField label="Worker conversational model ID" name="worker_model" value={settings.worker_model} models={workerCatalog.models} listId="worker-conversation-model-options" status={workerCatalog.status} />
+        <ModelIdField label="Worker image generation model ID" name="worker_image_model" value={settings.worker_image_model} models={workerCatalog.models} listId="worker-image-model-options" status={workerCatalog.status} />
         <div className="settings-number-grid"><label>Concurrent agents<input name="max_concurrent_agents" type="number" min={1} max={32} defaultValue={settings.max_concurrent_agents} required /></label><label>Maximum attempts<input name="max_agent_attempts" type="number" min={1} max={3} defaultValue={settings.max_agent_attempts} required /></label></div>
         <div className="settings-number-grid"><label>Revisions per subtask<input name="max_quality_revisions_per_subtask" type="number" min={0} max={5} defaultValue={settings.max_quality_revisions_per_subtask} required /></label><label>Total quality revisions<input name="max_quality_revisions_per_task" type="number" min={0} max={25} defaultValue={settings.max_quality_revisions_per_task} required /></label></div>
         <button className="admin-button" disabled={busy}><Check size={15} /> Save runtime settings</button>

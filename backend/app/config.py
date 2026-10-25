@@ -1,7 +1,10 @@
 from functools import lru_cache
+from typing import Literal
 
 from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+OLLAMA_BASE_URL = "http://ollama:11434"
 
 
 class Settings(BaseSettings):
@@ -9,8 +12,11 @@ class Settings(BaseSettings):
         "postgresql+asyncpg://orchestrator:orchestrator@"
         "localhost:5432/orchestrator"
     )
-    manager_model: str
-    worker_model: str
+    manager_model_provider: Literal["openai", "ollama"] = "openai"
+    manager_model: str = "gpt-6.1-sol"
+    worker_model_provider: Literal["openai", "ollama"] = "openai"
+    worker_model: str = "gpt-6-luna"
+    worker_image_model: str = "gpt-image-2.5-sunburst"
     initial_admin_email: str | None = None
     initial_admin_password: SecretStr | None = None
     session_cookie_secure: bool = False
@@ -41,6 +47,8 @@ class Settings(BaseSettings):
     vault_tavily_key_path: str = "agent-orchestrator/tavily"
     vault_api_role_id_file: str | None = None
     vault_api_secret_id_file: str | None = None
+    vault_model_catalog_role_id_file: str | None = None
+    vault_model_catalog_secret_id_file: str | None = None
     vault_worker_role_id_file: str | None = None
     vault_worker_secret_id_file: str | None = None
     workspace_root: str = ".data/workspaces"

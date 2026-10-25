@@ -47,6 +47,27 @@ def read_openai_api_key() -> str:
         raise RuntimeError("vault_key_read_failed") from exc
 
 
+def read_openai_model_catalog_key() -> str:
+    settings = get_settings()
+    try:
+        client = _authenticated_client(
+            settings.vault_model_catalog_role_id_file,
+            settings.vault_model_catalog_secret_id_file,
+        )
+        result = client.secrets.kv.v2.read_secret_version(
+            mount_point=settings.vault_kv_mount,
+            path=settings.vault_openai_key_path,
+        )
+        api_key = result["data"]["data"].get("api_key")
+        if not isinstance(api_key, str) or not api_key:
+            raise RuntimeError("openai_api_key_not_configured")
+        return api_key
+    except RuntimeError:
+        raise
+    except Exception as exc:
+        raise RuntimeError("vault_model_catalog_key_read_failed") from exc
+
+
 def read_tavily_api_key() -> str:
     settings = get_settings()
     try:

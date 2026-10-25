@@ -81,6 +81,7 @@ async def load_or_create_plan(
                 raise RuntimeError("initial_task_instruction_missing")
             generated_title = await model_client.generate(
                 model=config["manager_model"],
+                provider=config.get("manager_model_provider", "openai"),
                 schema_name="task_title",
                 schema=TaskTitle,
                 system_prompt=(
@@ -118,6 +119,7 @@ async def load_or_create_plan(
     available_skills = list_private_skills()
     plan = await model_client.generate(
         model=config["manager_model"],
+        provider=config.get("manager_model_provider", "openai"),
         schema_name="task_plan",
         schema=TaskPlan,
         system_prompt=(

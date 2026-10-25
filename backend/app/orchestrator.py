@@ -423,6 +423,7 @@ async def execute_task(
         }
         answer = await model_client.generate(
             model=config["manager_model"],
+            provider=config.get("manager_model_provider", "openai"),
             schema_name="integrated_answer",
             schema=IntegratedAnswer,
             system_prompt=(
@@ -457,6 +458,7 @@ async def execute_task(
         )
         final_review_results = await _review_checklist(
             model=config["manager_model"],
+            provider=config.get("manager_model_provider", "openai"),
             checklist=final_checklist,
             artifact={
                 "answer": answer.answer,
@@ -539,6 +541,7 @@ async def execute_task(
 async def _review_checklist(
     *,
     model: str,
+    provider: str = "openai",
     checklist: list[ChecklistItem],
     artifact: dict[str, object],
     plan_summary: str,
@@ -553,6 +556,7 @@ async def _review_checklist(
     if model_items:
         review = await model_client.generate(
             model=model,
+            provider=provider,
             schema_name="checklist_review",
             schema=ChecklistReviewResult,
             system_prompt=(
@@ -924,6 +928,7 @@ async def _execute_subtask(
     try:
         result = await model_client.generate(
             model=row.model_id,
+            provider=config.get("worker_model_provider", "openai"),
             schema_name="subtask_result",
             schema=SubtaskResult,
             system_prompt=system_prompt,
@@ -954,6 +959,7 @@ async def _execute_subtask(
         }
         result = await model_client.generate(
             model=row.model_id,
+            provider=config.get("worker_model_provider", "openai"),
             schema_name="subtask_result",
             schema=SubtaskResult,
             system_prompt=(
@@ -1084,6 +1090,7 @@ async def _review_subtask_result(
         ]
         review_results = await _review_checklist(
             model=config["manager_model"],
+            provider=config.get("manager_model_provider", "openai"),
             checklist=checklist,
             artifact=serialized,
             plan_summary=plan.summary,

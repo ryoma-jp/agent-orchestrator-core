@@ -34,14 +34,33 @@ services:
       timeout: 3s
       retries: 20
 
+  ollama:
+    image: ollama/ollama:latest
+    profiles: ["local-llm"]
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
   api:
     build:
       context: .
       target: backend
     environment:
       DATABASE_URL: ${DATABASE_URL:?Set DATABASE_URL in .env}
-      MANAGER_MODEL: ${MANAGER_MODEL:?Set MANAGER_MODEL in .env}
-      WORKER_MODEL: ${WORKER_MODEL:?Set WORKER_MODEL in .env}
+      MANAGER_MODEL_PROVIDER: ${MANAGER_MODEL_PROVIDER:-openai}
+      MANAGER_MODEL: ${MANAGER_MODEL:-gpt-6.1-sol}
+      WORKER_MODEL_PROVIDER: ${WORKER_MODEL_PROVIDER:-openai}
+      WORKER_MODEL: ${WORKER_MODEL:-gpt-6-luna}
+      WORKER_IMAGE_MODEL: ${WORKER_IMAGE_MODEL:-gpt-image-2.5-sunburst}
       SESSION_COOKIE_SECURE: ${SESSION_COOKIE_SECURE:-true}
       MAX_AGENT_TURNS: ${MAX_AGENT_TURNS:-24}
       MAX_TOOL_CALLS_PER_SUBTASK: ${MAX_TOOL_CALLS_PER_SUBTASK:-20}
@@ -50,6 +69,9 @@ services:
       VAULT_OPENAI_KEY_PATH: ${VAULT_OPENAI_KEY_PATH:-agent-orchestrator/openai}
       VAULT_API_ROLE_ID_FILE: /run/secrets/vault-api-role-id
       VAULT_API_SECRET_ID_FILE: /run/secrets/vault-api-secret-id
+      VAULT_MODEL_CATALOG_ROLE_ID_FILE: /run/secrets/vault-model-catalog-role-id
+      VAULT_MODEL_CATALOG_SECRET_ID_FILE: /run/secrets/vault-model-catalog-secret-id
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-https://api.openai.com/v1}
       WORKSPACE_ROOT: /var/lib/agent-orchestrator/workspaces
       WORKSPACE_INTERNAL_TOKEN: ${WORKSPACE_INTERNAL_TOKEN:?Set WORKSPACE_INTERNAL_TOKEN in .env}
     group_add:
@@ -63,6 +85,18 @@ services:
     volumes:
       - ${VAULT_API_ROLE_ID_SOURCE:-./secrets/vault-api-role-id}:/run/secrets/vault-api-role-id:ro
       - ${VAULT_API_SECRET_ID_SOURCE:-./secrets/vault-api-secret-id}:/run/secrets/vault-api-secret-id:ro
+      - type: bind
+        source: ${VAULT_MODEL_CATALOG_ROLE_ID_SOURCE:-./.local-vault/model-catalog-role-id}
+        target: /run/secrets/vault-model-catalog-role-id
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${VAULT_MODEL_CATALOG_SECRET_ID_SOURCE:-./.local-vault/model-catalog-secret-id}
+        target: /run/secrets/vault-model-catalog-secret-id
+        read_only: true
+        bind:
+          create_host_path: false
       - workspace_data:/var/lib/agent-orchestrator/workspaces
 
   worker:
@@ -75,8 +109,11 @@ services:
     command: ["/usr/local/bin/python", "-m", "app.worker"]
     environment:
       DATABASE_URL: ${DATABASE_URL:?Set DATABASE_URL in .env}
-      MANAGER_MODEL: ${MANAGER_MODEL:?Set MANAGER_MODEL in .env}
-      WORKER_MODEL: ${WORKER_MODEL:?Set WORKER_MODEL in .env}
+      MANAGER_MODEL_PROVIDER: ${MANAGER_MODEL_PROVIDER:-openai}
+      MANAGER_MODEL: ${MANAGER_MODEL:-gpt-6.1-sol}
+      WORKER_MODEL_PROVIDER: ${WORKER_MODEL_PROVIDER:-openai}
+      WORKER_MODEL: ${WORKER_MODEL:-gpt-6-luna}
+      WORKER_IMAGE_MODEL: ${WORKER_IMAGE_MODEL:-gpt-image-2.5-sunburst}
       MAX_CONCURRENT_AGENTS: ${MAX_CONCURRENT_AGENTS:-4}
       MAX_AGENT_ATTEMPTS: ${MAX_AGENT_ATTEMPTS:-3}
       MAX_AGENT_TURNS: ${MAX_AGENT_TURNS:-24}
@@ -124,8 +161,11 @@ services:
     profiles: ["setup"]
     environment:
       DATABASE_URL: ${DATABASE_URL:?Set DATABASE_URL in .env}
-      MANAGER_MODEL: ${MANAGER_MODEL:?Set MANAGER_MODEL in .env}
-      WORKER_MODEL: ${WORKER_MODEL:?Set WORKER_MODEL in .env}
+      MANAGER_MODEL_PROVIDER: ${MANAGER_MODEL_PROVIDER:-openai}
+      MANAGER_MODEL: ${MANAGER_MODEL:-gpt-6.1-sol}
+      WORKER_MODEL_PROVIDER: ${WORKER_MODEL_PROVIDER:-openai}
+      WORKER_MODEL: ${WORKER_MODEL:-gpt-6-luna}
+      WORKER_IMAGE_MODEL: ${WORKER_IMAGE_MODEL:-gpt-image-2.5-sunburst}
       INITIAL_ADMIN_EMAIL: ${INITIAL_ADMIN_EMAIL:?Set INITIAL_ADMIN_EMAIL in .env}
       INITIAL_ADMIN_PASSWORD: ${INITIAL_ADMIN_PASSWORD:?Set INITIAL_ADMIN_PASSWORD in .env}
     command: ["python", "-m", "app.cli", "create-initial-admin"]
@@ -161,3 +201,4 @@ services:
 volumes:
   postgres_data:
   workspace_data:
+  ollama_data:

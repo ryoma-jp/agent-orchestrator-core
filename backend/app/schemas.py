@@ -4,6 +4,8 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, SecretStr
 
+ModelProvider = Literal["openai", "ollama"]
+
 
 class LoginRequest(BaseModel):
     email: EmailStr
@@ -53,8 +55,13 @@ class AdminTaskSummary(BaseModel):
 
 
 class AdminSettingsUpdate(BaseModel):
+    manager_model_provider: ModelProvider = "openai"
     manager_model: str = Field(min_length=1, max_length=200)
+    worker_model_provider: ModelProvider = "openai"
     worker_model: str = Field(min_length=1, max_length=200)
+    worker_image_model: str = Field(
+        default="gpt-image-2.5-sunburst", min_length=1, max_length=200
+    )
     max_concurrent_agents: int = Field(ge=1, le=32)
     max_agent_attempts: int = Field(ge=1, le=3)
     max_quality_revisions_per_subtask: int = Field(ge=0, le=5)
@@ -65,6 +72,11 @@ class AdminSettingsView(AdminSettingsUpdate):
     openai_key_configured: bool
     tavily_key_configured: bool
     version: int
+
+
+class ModelCatalogView(BaseModel):
+    provider: ModelProvider
+    models: list[str]
 
 
 class OpenAIKeyRequest(BaseModel):

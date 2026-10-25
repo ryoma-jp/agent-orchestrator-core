@@ -113,7 +113,18 @@ tbody tr:hover { background: #f3f4ed; }
 .settings-section-title span { color: var(--muted); font-size: 10px; }
 .settings-form { display: grid; gap: 15px; }
 .settings-form label, .secret-panel label { display: grid; gap: 7px; font-size: 10px; font-weight: 700; }
-.settings-form input, .secret-panel input { width: 100%; height: 40px; padding: 0 10px; border: 1px solid #dfe0d8; border-radius: 2px; background: white; font-size: 11px; }
+.settings-form input, .settings-form select, .secret-panel input { width: 100%; height: 40px; padding: 0 10px; border: 1px solid #dfe0d8; border-radius: 2px; background: white; font-size: 11px; }
+.model-selector-field { position: relative; display: grid; gap: 5px; }
+.model-selector-field small { color: var(--muted); font-size: 10px; }
+.model-input-wrap { position: relative; }
+.model-input-wrap input { padding-right: 38px; }
+.model-dropdown-toggle { position: absolute; top: 1px; right: 1px; display: grid; width: 38px; height: 38px; place-items: center; border: 0; background: transparent; color: var(--muted); cursor: pointer; }
+.model-options-panel { position: absolute; z-index: 30; top: 100%; right: 0; left: 0; display: grid; gap: 6px; padding: 8px; border: 1px solid var(--line); background: white; box-shadow: 0 6px 18px rgb(20 24 18 / 14%); }
+.model-options-panel input { height: 34px; }
+.model-options-list { display: grid; max-height: 180px; gap: 2px; overflow-y: auto; }
+.model-options-list button { width: 100%; padding: 8px; border: 0; background: transparent; color: var(--ink); font-size: 11px; text-align: left; cursor: pointer; }
+.model-options-list button:hover, .model-options-list button:focus-visible { background: #f0f2eb; outline: none; }
+.model-options-empty { padding: 8px; color: var(--muted); font-size: 11px; }
 .settings-number-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
 .settings-form .admin-button { margin-top: 2px; }
 .secret-panel { min-width: 0; }
