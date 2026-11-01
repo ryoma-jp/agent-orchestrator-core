@@ -2999,6 +2999,7 @@ async def test_subtask_receives_conversation_history(monkeypatch):
     ]
     assert activity_details == [
         ("skill", "loaded", "tavily-search", "public"),
+        ("skill", "fallback", "image-generation-prompt", "fallback"),
         ("skill", "loaded", "deep-research", "private"),
         ("tool", "completed", None, None),
     ]
@@ -3006,7 +3007,23 @@ async def test_subtask_receives_conversation_history(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_subtask_captures_image_prompt_for_revision(monkeypatch):
+@pytest.mark.parametrize(
+    ("image_prompt_skill", "expected_skill_phase", "expected_skill_source"),
+    [
+        (
+            "Use the installed image prompt skill.",
+            "loaded",
+            "private",
+        ),
+        (None, "fallback", "fallback"),
+    ],
+)
+async def test_subtask_captures_image_prompt_for_revision(
+    monkeypatch,
+    image_prompt_skill,
+    expected_skill_phase,
+    expected_skill_source,
+):
     import json
 
     import app.orchestrator as orchestrator_module
@@ -3021,10 +3038,12 @@ async def test_subtask_captures_image_prompt_for_revision(monkeypatch):
         steps=25,
     )
     new_arguments = {
-        "prompt": (
-            "three adult women playing in one swimming pool scene"
-        ),
-        "negative_prompt": "collage, multiple panels, extra faces",
+        "image_prompt": {
+            "positive_prompt": (
+                "three adult women playing in one swimming pool scene"
+            ),
+            "negative_prompt": "collage, multiple panels, extra faces",
+        },
         "filename": "pool.png",
         "width": 768,
         "height": 1024,
@@ -3032,12 +3051,13 @@ async def test_subtask_captures_image_prompt_for_revision(monkeypatch):
     }
     captured = {}
     checkpoints = []
+    activities = []
 
     async def assert_lease(*_args):
         return None
 
-    async def record_activity(*_args, **_kwargs):
-        return None
+    async def record_activity(*_args, **kwargs):
+        activities.append(kwargs)
 
     async def checkpoint_image_generations(*args):
         checkpoints.append(args)
@@ -3088,6 +3108,16 @@ async def test_subtask_captures_image_prompt_for_revision(monkeypatch):
         lambda: "Search skill instructions.",
     )
     monkeypatch.setattr(
+        orchestrator_module,
+        "load_private_skill_if_present",
+        lambda _name: image_prompt_skill,
+    )
+    monkeypatch.setattr(
+        orchestrator_module,
+        "get_settings",
+        lambda: SimpleNamespace(comfyui_enabled=True),
+    )
+    monkeypatch.setattr(
         orchestrator_module.model_client, "generate", generate
     )
 
@@ -3125,11 +3155,25 @@ async def test_subtask_captures_image_prompt_for_revision(monkeypatch):
     assert runner_input["revision_feedback"] == (
         "Show exactly three people in one pool scene."
     )
+    assert "image_prompt" in captured["system_prompt"]
+    if image_prompt_skill is None:
+        assert "Apply its prompt rules yourself" in captured["system_prompt"]
+    else:
+        assert image_prompt_skill in captured["system_prompt"]
+    image_skill_activity = next(
+        activity
+        for activity in activities
+        if activity.get("skill_name") == "image-generation-prompt"
+    )
+    assert image_skill_activity["phase"] == expected_skill_phase
+    assert image_skill_activity["skill_source"] == expected_skill_source
     assert saved["image_generations"] == [
         {
             "artifact_path": "artifacts/revised-pool.png",
-            "prompt": new_arguments["prompt"],
-            "negative_prompt": new_arguments["negative_prompt"],
+            "prompt": new_arguments["image_prompt"]["positive_prompt"],
+            "negative_prompt": new_arguments["image_prompt"][
+                "negative_prompt"
+            ],
             "width": 768,
             "height": 1024,
             "steps": 30,
@@ -4859,6 +4903,37 @@ def test_private_skill_loader_reads_live_updates(tmp_path, monkeypatch):
     assert tools_module.load_private_skill("deep-research") == (
         "# Updated version"
     )
+
+
+def test_optional_private_skill_falls_back_only_when_directory_is_missing(
+    tmp_path, monkeypatch
+):
+    import app.tools as tools_module
+
+    skill_root = tmp_path / "private_skills"
+    skill_root.mkdir()
+    monkeypatch.setattr(
+        tools_module,
+        "get_settings",
+        lambda: SimpleNamespace(private_skills_path=str(skill_root)),
+    )
+
+    assert (
+        tools_module.load_private_skill_if_present(
+            "image-generation-prompt"
+        )
+        is None
+    )
+
+    skill_directory = skill_root / "image-generation-prompt"
+    skill_directory.mkdir()
+    (skill_directory / "SKILL.md").write_text(
+        "This is not a valid skill.", encoding="utf-8"
+    )
+    with pytest.raises(RuntimeError, match="private_skill_invalid"):
+        tools_module.load_private_skill_if_present(
+            "image-generation-prompt"
+        )
 
 
 @pytest.mark.asyncio

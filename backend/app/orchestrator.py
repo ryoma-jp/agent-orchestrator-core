@@ -17,6 +17,7 @@ from app.agent_runtime import (
 from app.agent_schemas import (
     ChecklistItem,
     ChecklistReviewResult,
+    ImageGenerationPrompt,
     ImageGenerationRecord,
     IntegratedAnswer,
     SourceReference,
@@ -42,7 +43,11 @@ from app.openai_client import (
     AgentExecutionError,
     DEFAULT_MAX_TOOL_CALLS,
 )
-from app.tools import load_private_skill, load_tavily_search_skill
+from app.tools import (
+    load_private_skill,
+    load_private_skill_if_present,
+    load_tavily_search_skill,
+)
 from app.orchestration_state import (
     assert_lease as _assert_lease,
     assert_lease_in_session as _assert_lease_in_session,
@@ -1184,18 +1189,20 @@ async def _execute_subtask(
             name == "comfyui_generate_image"
             and "error" not in result
             and isinstance(arguments, dict)
+            and isinstance(arguments.get("image_prompt"), dict)
             and isinstance(result.get("artifact_path"), str)
             and _is_generated_artifact_path(result["artifact_path"])
             and len(image_generations) < 10
         ):
             try:
+                image_prompt = ImageGenerationPrompt.model_validate(
+                    arguments["image_prompt"]
+                )
                 generation_record = ImageGenerationRecord.model_validate(
                     {
                         "artifact_path": result["artifact_path"],
-                        "prompt": arguments.get("prompt"),
-                        "negative_prompt": arguments.get(
-                            "negative_prompt", ""
-                        ),
+                        "prompt": image_prompt.positive_prompt,
+                        "negative_prompt": image_prompt.negative_prompt,
                         "width": arguments.get("width"),
                         "height": arguments.get("height"),
                         "steps": arguments.get("steps"),
@@ -1356,6 +1363,12 @@ async def _execute_subtask(
         execution_options["before_model_call"],
         include_image_tool=not reuse_image_checkpoint,
     )
+    settings = get_settings()
+    image_tool_enabled = (
+        not reuse_image_checkpoint
+        and getattr(settings, "comfyui_enabled", False)
+        and config.get("worker_image_provider", "comfyui") == "comfyui"
+    )
     system_prompt = (
         "Complete one informational subtask using the supplied context, "
         "your knowledge, and explicitly registered tools. "
@@ -1413,21 +1426,65 @@ async def _execute_subtask(
         + "\n\nUse only the registered tavily_web_search function for web "
         + "search. Do not invoke a shell or other commands."
     )
-    if (
-        get_settings().comfyui_enabled
-        and config.get("worker_image_provider", "comfyui") == "comfyui"
-    ):
+    if image_tool_enabled:
         system_prompt += (
             " Use comfyui_generate_image only when the user explicitly "
             "requests an image; it saves a PNG in this task's artifacts "
             "directory. Include the returned path in findings. Do not "
             "claim image generation succeeded unless the tool returns a "
-            "saved artifact path."
+            "saved artifact path. For each image call, construct a JSON "
+            "object with exactly the positive_prompt and negative_prompt "
+            "string keys, and pass that object unchanged as image_prompt; "
+            "keep filename and generation settings outside it."
         )
+    selected_skill_names = list(
+        getattr(row, "skill_names", None) or []
+    )
+    image_prompt_skill_name = "image-generation-prompt"
+    image_prompt_skill = None
+    if image_tool_enabled:
+        selected_skill_names = [
+            name
+            for name in selected_skill_names
+            if name != image_prompt_skill_name
+        ]
+        image_prompt_skill = load_private_skill_if_present(
+            image_prompt_skill_name
+        )
+        if image_prompt_skill is None:
+            system_prompt += (
+                " The image-generation-prompt skill is not installed. "
+                "Apply its prompt rules yourself: preserve the user's "
+                "visual requirements; use English words or short phrases "
+                "separated by ASCII commas; put desired content in "
+                "positive_prompt and exclusions in negative_prompt; use "
+                "an empty negative_prompt when there are no exclusions; "
+                "avoid contradictions and unverified model-specific "
+                "syntax; output no explanation or extra JSON keys."
+            )
+            await _record_subtask_activity(
+                row.task_id,
+                job_id,
+                lease_owner,
+                row,
+                conversation_sequence,
+                activity="skill",
+                phase="fallback",
+                summary=(
+                    "Image prompt skill unavailable; built-in prompt "
+                    "instructions used."
+                ),
+                skill_name=image_prompt_skill_name,
+                skill_source="fallback",
+            )
     selected_skills = [
         (skill_name, load_private_skill(skill_name))
-        for skill_name in (getattr(row, "skill_names", None) or [])
+        for skill_name in selected_skill_names
     ]
+    if image_prompt_skill is not None:
+        selected_skills.append(
+            (image_prompt_skill_name, image_prompt_skill)
+        )
     for skill_name, _instructions in selected_skills:
         await _record_subtask_activity(
             row.task_id,

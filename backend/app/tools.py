@@ -455,3 +455,28 @@ def list_private_skills() -> list[dict[str, str]]:
 def load_private_skill(skill_name: str) -> str:
     _, instructions = _read_private_skill(skill_name)
     return instructions
+
+
+def load_private_skill_if_present(skill_name: str) -> str | None:
+    if _PRIVATE_SKILL_NAME.fullmatch(skill_name) is None:
+        raise RuntimeError("private_skill_unavailable")
+    configured_root = Path(get_settings().private_skills_path).expanduser()
+    try:
+        configured_root.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise RuntimeError("private_skill_unavailable") from exc
+    try:
+        root = configured_root.resolve(strict=True)
+    except OSError as exc:
+        raise RuntimeError("private_skill_unavailable") from exc
+    if not root.is_dir():
+        raise RuntimeError("private_skill_unavailable")
+    try:
+        (root / skill_name).lstat()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise RuntimeError("private_skill_unavailable") from exc
+    return load_private_skill(skill_name)

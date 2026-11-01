@@ -146,6 +146,26 @@ class ChecklistReviewResult(BaseModel):
     results: list[ChecklistItemResult] = Field(max_length=20)
 
 
+class ImageGenerationPrompt(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    positive_prompt: str = Field(min_length=1, max_length=4_000)
+    negative_prompt: str = Field(max_length=2_000)
+
+    @field_validator("positive_prompt")
+    @classmethod
+    def validate_positive_prompt(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("image_positive_prompt_empty")
+        return value
+
+    @field_validator("negative_prompt")
+    @classmethod
+    def normalize_negative_prompt(cls, value: str) -> str:
+        return value.strip()
+
+
 class ImageGenerationRecord(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

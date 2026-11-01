@@ -41,7 +41,10 @@ async def test_comfyui_image_is_validated_and_saved_to_task_workspace(
             workflow = payload["prompt"]
             assert workflow["1"]["class_type"] == "CheckpointLoaderSimple"
             assert workflow["1"]["inputs"]["ckpt_name"] == "model.safetensors"
-            assert workflow["2"]["inputs"]["text"] == "A paper crane"
+            assert workflow["2"]["inputs"]["text"] == (
+                "A paper crane, folded paper, centered composition"
+            )
+            assert workflow["3"]["inputs"]["text"] == "blurry"
             workflow_prefix["value"] = workflow["7"]["inputs"][
                 "filename_prefix"
             ]
@@ -89,8 +92,12 @@ async def test_comfyui_image_is_validated_and_saved_to_task_workspace(
     )
     result = await tool._generate(
         ComfyUIImageArguments(
-            prompt=" A paper crane ",
-            negative_prompt="blurry",
+            image_prompt={
+                "positive_prompt": (
+                    " A paper crane, folded paper, centered composition "
+                ),
+                "negative_prompt": "blurry",
+            },
             filename="crane.png",
             width=512,
             height=768,
@@ -166,9 +173,27 @@ def test_subtask_image_tool_follows_image_provider(
 
 def test_comfyui_arguments_reject_unsafe_paths_and_dimensions():
     with pytest.raises(ValidationError):
-        ComfyUIImageArguments(prompt="image", filename="../image.png")
+        ComfyUIImageArguments(
+            image_prompt={"positive_prompt": "image", "negative_prompt": ""},
+            filename="../image.png",
+        )
     with pytest.raises(ValidationError):
-        ComfyUIImageArguments(prompt="image", width=513)
+        ComfyUIImageArguments(
+            image_prompt={"positive_prompt": "image", "negative_prompt": ""},
+            width=513,
+        )
+    with pytest.raises(ValidationError):
+        ComfyUIImageArguments(
+            image_prompt={"positive_prompt": "image"}
+        )
+    with pytest.raises(ValidationError):
+        ComfyUIImageArguments(
+            image_prompt={
+                "positive_prompt": "image",
+                "negative_prompt": "",
+                "style": "extra",
+            }
+        )
 
 
 def test_generated_png_paths_satisfy_file_presence_check():

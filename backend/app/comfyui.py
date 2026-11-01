@@ -9,6 +9,7 @@ from urllib.parse import quote
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from app.agent_schemas import ImageGenerationPrompt
 from app.config import get_settings
 from app.tools import ToolRegistration
 
@@ -19,22 +20,13 @@ _SAFE_FILE_COMPONENT = re.compile(r"[^/\\\x00-\x1f\x7f]+\Z")
 class ComfyUIImageArguments(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    prompt: str = Field(min_length=1, max_length=4_000)
-    negative_prompt: str = Field(default="", max_length=2_000)
+    image_prompt: ImageGenerationPrompt
     filename: str = Field(
         default="generated-image.png", min_length=5, max_length=220
     )
     width: int = Field(default=1024, ge=256, le=1536)
     height: int = Field(default=1024, ge=256, le=1536)
     steps: int = Field(default=25, ge=1, le=60)
-
-    @field_validator("prompt")
-    @classmethod
-    def validate_prompt(cls, value: str) -> str:
-        value = value.strip()
-        if not value:
-            raise ValueError("image_prompt_empty")
-        return value
 
     @field_validator("filename")
     @classmethod
@@ -72,11 +64,12 @@ class ComfyUIImageGenerationTool:
         settings = get_settings()
         return ToolRegistration(
             name="comfyui_generate_image",
-            version="1",
+            version="2",
             description=(
                 "Generate a user-requested PNG image with ComfyUI and save "
-                "it under this task's artifacts directory. Use only for "
-                "explicit image requests."
+                "it under this task's artifacts directory. Pass the exact "
+                "two-key positive_prompt/negative_prompt JSON as "
+                "image_prompt. Use only for explicit image requests."
             ),
             risk_class="writes_data",
             timeout_seconds=settings.comfyui_timeout_seconds + 60,
@@ -85,16 +78,25 @@ class ComfyUIImageGenerationTool:
             openai_parameters={
                 "type": "object",
                 "properties": {
-                    "prompt": {"type": "string"},
-                    "negative_prompt": {"type": "string"},
+                    "image_prompt": {
+                        "type": "object",
+                        "properties": {
+                            "positive_prompt": {"type": "string"},
+                            "negative_prompt": {"type": "string"},
+                        },
+                        "required": [
+                            "positive_prompt",
+                            "negative_prompt",
+                        ],
+                        "additionalProperties": False,
+                    },
                     "filename": {"type": "string"},
                     "width": {"type": "integer"},
                     "height": {"type": "integer"},
                     "steps": {"type": "integer"},
                 },
                 "required": [
-                    "prompt",
-                    "negative_prompt",
+                    "image_prompt",
                     "filename",
                     "width",
                     "height",
@@ -290,12 +292,15 @@ class ComfyUIImageGenerationTool:
             },
             "2": {
                 "class_type": "CLIPTextEncode",
-                "inputs": {"text": arguments.prompt, "clip": ["1", 1]},
+                "inputs": {
+                    "text": arguments.image_prompt.positive_prompt,
+                    "clip": ["1", 1],
+                },
             },
             "3": {
                 "class_type": "CLIPTextEncode",
                 "inputs": {
-                    "text": arguments.negative_prompt,
+                    "text": arguments.image_prompt.negative_prompt,
                     "clip": ["1", 1],
                 },
             },
