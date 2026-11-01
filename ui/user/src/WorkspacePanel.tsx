@@ -35,6 +35,20 @@ type ExplorerNodeData = {
   empty?: boolean
 }
 
+const IMAGE_PREVIEW_MAX_BYTES = 20 * 1024 * 1024
+const IMAGE_PREVIEW_EXTENSIONS = new Set(['png', 'jpg', 'jpeg', 'webp', 'gif'])
+const IMAGE_PREVIEW_MIME_TYPES = new Set([
+  'image/png',
+  'image/jpeg',
+  'image/webp',
+  'image/gif',
+])
+
+function isPreviewableImage(file: WorkspaceFile) {
+  const extension = file.path.split('.').at(-1)?.toLowerCase() ?? ''
+  return IMAGE_PREVIEW_EXTENSIONS.has(extension)
+}
+
 function formatModifiedAt(value: string) {
   return new Date(value).toLocaleString('ja-JP', {
     year: 'numeric',
@@ -163,6 +177,9 @@ export default function WorkspacePanel({
   const [files, setFiles] = useState<WorkspaceEntry[]>([])
   const [selected, setSelected] = useState<WorkspaceFile | null>(null)
   const [content, setContent] = useState('')
+  const [imagePreviewUrl, setImagePreviewUrl] = useState<string | null>(null)
+  const [imagePreviewLoading, setImagePreviewLoading] = useState(false)
+  const [imagePreviewError, setImagePreviewError] = useState('')
   const [loading, setLoading] = useState(true)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
@@ -201,6 +218,65 @@ export default function WorkspacePanel({
       alive = false
     }
   }, [taskId])
+
+  const previewImage = selected && isPreviewableImage(selected) ? selected : null
+  const canPreviewImage =
+    previewImage !== null && previewImage.size_bytes <= IMAGE_PREVIEW_MAX_BYTES
+
+  useEffect(() => {
+    if (!canPreviewImage || !previewImage) {
+      setImagePreviewUrl(null)
+      setImagePreviewLoading(false)
+      setImagePreviewError('')
+      return
+    }
+
+    let active = true
+    let objectUrl: string | null = null
+    setImagePreviewUrl(null)
+    setImagePreviewLoading(true)
+    setImagePreviewError('')
+    const encodedPath = previewImage.path
+      .split('/')
+      .map(encodeURIComponent)
+      .join('/')
+    fetch(`/api/tasks/${taskId}/workspace/files/${encodedPath}`, {
+      credentials: 'include',
+    })
+      .then((response) => {
+        if (!response.ok) throw new Error(`Image read failed (${response.status})`)
+        return response.blob()
+      })
+      .then((blob) => {
+        const mediaType = blob.type.toLowerCase().split(';', 1)[0]
+        if (!IMAGE_PREVIEW_MIME_TYPES.has(mediaType)) {
+          throw new Error('This file is not a supported raster image.')
+        }
+        objectUrl = URL.createObjectURL(blob)
+        if (!active) {
+          URL.revokeObjectURL(objectUrl)
+          return
+        }
+        setImagePreviewUrl(objectUrl)
+      })
+      .catch((reason: Error) => {
+        if (active) setImagePreviewError(reason.message)
+      })
+      .finally(() => {
+        if (active) setImagePreviewLoading(false)
+      })
+
+    return () => {
+      active = false
+      if (objectUrl) URL.revokeObjectURL(objectUrl)
+    }
+  }, [
+    taskId,
+    canPreviewImage,
+    previewImage?.path,
+    previewImage?.size_bytes,
+    previewImage?.updated_at,
+  ])
 
   useEffect(() => {
     if (!refreshOnCompletion) return
@@ -438,7 +514,35 @@ export default function WorkspacePanel({
                     </button>
                   </div>
                 </div>
-                {textFile ? (
+                {previewImage ? (
+                  canPreviewImage ? (
+                    <div
+                      className={`image-preview ${imagePreviewLoading ? 'is-loading' : ''}`}
+                      aria-busy={imagePreviewLoading}
+                    >
+                      {imagePreviewUrl && (
+                        <img
+                          src={imagePreviewUrl}
+                          alt={selected.path}
+                          onLoad={() => setImagePreviewLoading(false)}
+                          onError={() => {
+                            setImagePreviewLoading(false)
+                            setImagePreviewError('The image could not be displayed.')
+                            setImagePreviewUrl(null)
+                          }}
+                        />
+                      )}
+                      {imagePreviewLoading && <span>Loading image...</span>}
+                      {imagePreviewError && (
+                        <span role="alert">{imagePreviewError}</span>
+                      )}
+                    </div>
+                  ) : (
+                    <div className="workspace-empty">
+                      Image preview is limited to 20 MiB. Download to open this file.
+                    </div>
+                  )
+                ) : textFile ? (
                   <>
                     <Suspense
                       fallback={
