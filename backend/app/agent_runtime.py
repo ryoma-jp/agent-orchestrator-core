@@ -12,11 +12,18 @@ model_client = StructuredModelClient()
 tool_registry = ToolRegistry([TavilySearchTool().registration()])
 
 
-def subtask_tool_registry(task_id, config, before_workspace_write):
+def subtask_tool_registry(
+    task_id,
+    config,
+    before_workspace_write,
+    *,
+    include_image_tool=True,
+):
     registrations = [TavilySearchTool().registration()]
     exposed_risk_classes = {"read_only"}
     if (
-        get_settings().comfyui_enabled
+        include_image_tool
+        and get_settings().comfyui_enabled
         and config.get("worker_image_provider", "comfyui") == "comfyui"
     ):
         registrations.append(

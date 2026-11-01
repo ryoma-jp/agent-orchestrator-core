@@ -14,6 +14,7 @@ from app.agent_schemas import (
     ChecklistItemResult,
     ChecklistReviewResult,
     GeneratedArtifact,
+    ImageGenerationRecord,
     IntegratedAnswer,
     PlannedSubtask,
     SubtaskResult,
@@ -25,6 +26,7 @@ from app.models import (
     ApiAccessKey,
     ConversationMessage,
     Event,
+    ImageGenerationRevision,
     Job,
     QualityReview,
     Subtask,
@@ -41,6 +43,7 @@ from app.quality import (
 from app.routers.tasks import (
     add_message,
     edit_message,
+    list_image_revisions,
 )
 from app.routers.workspace import list_task_files, upload_task_file
 from app.schemas import (
@@ -89,6 +92,98 @@ def test_task_view_includes_generated_title():
     assert TaskView.model_validate(task).model_dump()["title"] == (
         "Accessible color palette guide"
     )
+
+
+@pytest.mark.asyncio
+async def test_image_revision_history_is_owner_scoped_and_ordered():
+    owner_id = uuid.uuid4()
+    task_id = uuid.uuid4()
+    subtask_id = uuid.uuid4()
+    review_id = uuid.uuid4()
+    earlier = ImageGenerationRevision(
+        id=uuid.uuid4(),
+        task_id=task_id,
+        subtask_id=subtask_id,
+        plan_version=1,
+        conversation_sequence=3,
+        generation_no=1,
+        trigger_quality_review_id=None,
+        source_artifact_paths=[],
+        artifact_path="artifacts/initial.png",
+        prompt="initial pool prompt",
+        negative_prompt="collage",
+        model_id="checkpoint.safetensors",
+        width=768,
+        height=1024,
+        steps=25,
+        unmet_items=[],
+        is_backfilled=False,
+        created_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+    )
+    later = ImageGenerationRevision(
+        id=uuid.uuid4(),
+        task_id=task_id,
+        subtask_id=subtask_id,
+        plan_version=1,
+        conversation_sequence=3,
+        generation_no=2,
+        trigger_quality_review_id=review_id,
+        source_artifact_paths=["artifacts/initial.png"],
+        artifact_path="artifacts/revised.png",
+        prompt="three women playing in one pool",
+        negative_prompt="face grid, collage",
+        model_id="checkpoint.safetensors",
+        width=768,
+        height=1024,
+        steps=30,
+        unmet_items=[
+            {
+                "item_id": "scene",
+                "description": "Three women play in one pool.",
+                "evidence": "The first image was a face grid.",
+                "deficiency": "The image shows unrelated faces.",
+            }
+        ],
+        is_backfilled=False,
+        created_at=datetime(2026, 1, 2, tzinfo=timezone.utc),
+    )
+
+    class FakeResult:
+        def all(self):
+            return [
+                (earlier, "Generate requested image"),
+                (later, "Generate requested image"),
+            ]
+
+    class FakeSession:
+        def __init__(self, owns_task):
+            self.owns_task = owns_task
+            self.history_read = False
+
+        async def scalar(self, _statement):
+            return task_id if self.owns_task else None
+
+        async def execute(self, _statement):
+            self.history_read = True
+            return FakeResult()
+
+    user = SimpleNamespace(id=owner_id)
+    own_session = FakeSession(True)
+    history = await list_image_revisions(task_id, user, own_session)
+
+    assert [item.generation_no for item in history] == [1, 2]
+    assert history[1].trigger_quality_review_id == review_id
+    assert history[1].unmet_items[0].deficiency == (
+        "The image shows unrelated faces."
+    )
+    assert history[1].prompt == "three women playing in one pool"
+    assert own_session.history_read
+
+    other_session = FakeSession(False)
+    with pytest.raises(HTTPException) as exc_info:
+        await list_image_revisions(task_id, user, other_session)
+    assert exc_info.value.status_code == 404
+    assert not other_session.history_read
 
 
 def test_empty_task_instruction_is_rejected():
@@ -1014,9 +1109,11 @@ async def test_subtask_quality_review_retries_with_only_failed_items(
         )
 
     revision_feedback = []
+    revision_contexts = []
 
     async def revise(*_args, **kwargs):
         revision_feedback.append(kwargs["revision_feedback"])
+        revision_contexts.append(kwargs["image_revision_context"])
         return SubtaskResult(
             status="succeeded",
             summary="Version 2.4 is supported.",
@@ -1096,6 +1193,19 @@ async def test_subtask_quality_review_retries_with_only_failed_items(
     assert revision_feedback == [
         "- Name the relevant version: Name the relevant version."
     ]
+    review_row = next(
+        item
+        for item in session.added
+        if isinstance(item, QualityReview)
+        and item.verdict == "revision_requested"
+    )
+    assert revision_contexts[0]["trigger_quality_review_id"] == str(
+        review_row.id
+    )
+    assert revision_contexts[0]["source_artifact_paths"] == [
+        "artifacts/cat.png"
+    ]
+    assert revision_contexts[0]["unmet_items"][0]["item_id"] == "finding"
     assert stored.status == "accepted"
     assert stored.quality_revision_count == 1
     verdicts = [
@@ -1416,6 +1526,12 @@ async def test_first_plan_generates_and_persists_purpose_title(monkeypatch):
     assert task.title == "Accessible project dashboard"
     assert task.title_generated is True
     assert "first instruction" in generated_options["system_prompt"]
+    assert "dedicated image-generation subtask" in generated_options[
+        "system_prompt"
+    ]
+    assert "Preserve each explicit visual requirement" in generated_options[
+        "system_prompt"
+    ]
     assert "deep-research" in generated_options["system_prompt"]
     assert result[2][0].skill_names == ["deep-research"]
 
@@ -2440,9 +2556,14 @@ async def test_checklist_review_passes_loaded_images_to_model(monkeypatch):
             results=[
                 {
                     "item_id": "image-content",
-                    "passed": True,
-                    "evidence": "The image shows a cat.",
-                    "deficiency": "",
+                    "passed": False,
+                    "evidence": "",
+                    "deficiency": "The image shows the wrong scene.",
+                    "revision_target": "image",
+                    "target_image_paths": [
+                        "artifacts/cat.png",
+                        "artifacts/not-attached.png",
+                    ],
                 }
             ]
         )
@@ -2475,7 +2596,9 @@ async def test_checklist_review_passes_loaded_images_to_model(monkeypatch):
         "omitted_paths": ["artifacts/omitted.png"],
         "attached_images_follow_path_order": True,
     }
-    assert results[0]["passed"]
+    assert not results[0]["passed"]
+    assert results[0]["revision_target"] == "image"
+    assert results[0]["target_image_paths"] == ["artifacts/cat.png"]
 
 
 @pytest.mark.asyncio
@@ -2883,6 +3006,679 @@ async def test_subtask_receives_conversation_history(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_subtask_captures_image_prompt_for_revision(monkeypatch):
+    import json
+
+    import app.orchestrator as orchestrator_module
+
+    task_id = uuid.uuid4()
+    previous = ImageGenerationRecord(
+        artifact_path="artifacts/previous.png",
+        prompt="three women at a pool",
+        negative_prompt="collage, multiple panels",
+        width=768,
+        height=1024,
+        steps=25,
+    )
+    new_arguments = {
+        "prompt": (
+            "three adult women playing in one swimming pool scene"
+        ),
+        "negative_prompt": "collage, multiple panels, extra faces",
+        "filename": "pool.png",
+        "width": 768,
+        "height": 1024,
+        "steps": 30,
+    }
+    captured = {}
+    checkpoints = []
+
+    async def assert_lease(*_args):
+        return None
+
+    async def record_activity(*_args, **_kwargs):
+        return None
+
+    async def checkpoint_image_generations(*args):
+        checkpoints.append(args)
+
+    async def generate(**kwargs):
+        captured.update(kwargs)
+        await kwargs["on_tool_result"](
+            "comfyui_generate_image",
+            json.dumps(new_arguments),
+            {"artifact_path": "artifacts/revised-pool.png"},
+        )
+        return SubtaskResult(
+            status="succeeded",
+            summary="Generated a revised pool image.",
+            findings=[],
+            sources=[],
+            tool_runs=[],
+            questions=[],
+            error="",
+        )
+
+    monkeypatch.setattr(
+        orchestrator_module, "_assert_lease", assert_lease
+    )
+    monkeypatch.setattr(
+        orchestrator_module,
+        "_agent_options",
+        lambda *_args, **_kwargs: {"before_model_call": assert_lease},
+    )
+    monkeypatch.setattr(
+        orchestrator_module,
+        "_record_subtask_activity",
+        record_activity,
+    )
+    monkeypatch.setattr(
+        orchestrator_module,
+        "_checkpoint_image_generations",
+        checkpoint_image_generations,
+    )
+    monkeypatch.setattr(
+        orchestrator_module,
+        "subtask_tool_registry",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        orchestrator_module,
+        "load_tavily_search_skill",
+        lambda: "Search skill instructions.",
+    )
+    monkeypatch.setattr(
+        orchestrator_module.model_client, "generate", generate
+    )
+
+    result = await orchestrator_module._execute_subtask(
+        SimpleNamespace(
+            id=uuid.uuid4(),
+            task_id=task_id,
+            plan_version=1,
+            tool_calls_used=0,
+            tool_calls_limit=20,
+            title="Generate an image",
+            instruction="Draw three women playing in a pool.",
+            artifact_goal="Show three women playing in one pool scene.",
+            acceptance_checklist=[],
+            dependencies=[],
+            model_id="test-worker",
+            skill_names=[],
+        ),
+        SimpleNamespace(summary="Image task"),
+        {},
+        [],
+        uuid.uuid4(),
+        "worker-test",
+        1,
+        revision_feedback="Show exactly three people in one pool scene.",
+        previous_image_generations=[previous],
+        config={"max_tool_calls_per_subtask": 20},
+    )
+
+    runner_input = json.loads(captured["input_text"])
+    saved = orchestrator_module._serialize_subtask_result(result)
+    assert runner_input["previous_image_generations"] == [
+        previous.model_dump(mode="json")
+    ]
+    assert runner_input["revision_feedback"] == (
+        "Show exactly three people in one pool scene."
+    )
+    assert saved["image_generations"] == [
+        {
+            "artifact_path": "artifacts/revised-pool.png",
+            "prompt": new_arguments["prompt"],
+            "negative_prompt": new_arguments["negative_prompt"],
+            "width": 768,
+            "height": 1024,
+            "steps": 30,
+        }
+    ]
+    assert "prompt" not in result.tool_runs[0].model_dump()
+    assert len(checkpoints) == 1
+    assert checkpoints[0][3][0].artifact_path == (
+        "artifacts/revised-pool.png"
+    )
+
+
+def test_final_image_failure_maps_to_unique_generation_source():
+    import app.orchestrator as orchestrator_module
+
+    source_id = str(uuid.uuid4())
+    generated = {
+        "status": "succeeded",
+        "image_generations": [
+            {
+                "artifact_path": "artifacts/pool.png",
+                "prompt": "three people playing in a pool",
+                "negative_prompt": "collage",
+                "width": 768,
+                "height": 1024,
+                "steps": 25,
+            }
+        ],
+    }
+    failed_item = {
+        "item_id": "scene",
+        "required": True,
+        "passed": False,
+        "description": "Three women play in one pool scene.",
+        "deficiency": "The image contains many separate faces.",
+        "revision_target": "image",
+        "target_image_paths": ["artifacts/pool.png"],
+    }
+
+    requests, unresolved = orchestrator_module._image_revision_requests(
+        [failed_item], {source_id: generated}
+    )
+
+    assert requests == {source_id: [failed_item]}
+    assert not unresolved
+    assert orchestrator_module._stored_revision_feedback(
+        {
+            "image_revision_feedback": "Remove the unrelated face grid.",
+            "quality_review": [],
+        }
+    ) == "Remove the unrelated face grid."
+
+    failed_item["target_image_paths"] = ["artifacts/unattached.png"]
+    requests, unresolved = orchestrator_module._image_revision_requests(
+        [failed_item], {source_id: generated}
+    )
+    assert requests == {}
+    assert unresolved
+
+
+@pytest.mark.asyncio
+async def test_begin_image_revision_persists_feedback_and_counter(monkeypatch):
+    import app.orchestrator as orchestrator_module
+
+    task_id = uuid.uuid4()
+    subtask_id = uuid.uuid4()
+    previous_result = {"status": "succeeded", "summary": "Old image"}
+    stored = SimpleNamespace(
+        status="accepted",
+        quality_revision_count=1,
+        result=previous_result,
+    )
+    revision_context = {
+        "trigger_quality_review_id": str(uuid.uuid4()),
+        "source_artifact_paths": ["artifacts/old.png"],
+        "unmet_items": [],
+    }
+
+    class FakeSession:
+        def __init__(self):
+            self.added = []
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def get(self, _model, _identity, **_kwargs):
+            return stored
+
+        def add(self, value):
+            self.added.append(value)
+
+        async def commit(self):
+            return None
+
+    async def assert_lease(*_args):
+        return None
+
+    row = SimpleNamespace(
+        id=subtask_id,
+        title="Generate image",
+        status="accepted",
+        quality_revision_count=1,
+        result=previous_result,
+    )
+    session = FakeSession()
+    monkeypatch.setattr(
+        orchestrator_module, "SessionFactory", lambda: session
+    )
+    monkeypatch.setattr(
+        orchestrator_module, "_assert_lease_in_session", assert_lease
+    )
+
+    await orchestrator_module._begin_image_revision(
+        task_id,
+        uuid.uuid4(),
+        "worker-test",
+        row,
+        previous_result,
+        "Remove unrelated faces and keep one pool scene.",
+        revision_context,
+        4,
+    )
+
+    assert stored.status == "revising"
+    assert stored.quality_revision_count == 2
+    assert stored.result["image_revision_feedback"] == (
+        "Remove unrelated faces and keep one pool scene."
+    )
+    assert stored.result["image_revision_context"] == revision_context
+    assert row.result == stored.result
+    assert session.added[0].payload_json["status"] == "revising"
+
+
+@pytest.mark.asyncio
+async def test_image_generation_checkpoint_persists_and_clears_feedback(
+    monkeypatch,
+):
+    import app.orchestrator as orchestrator_module
+
+    record = ImageGenerationRecord(
+        artifact_path="artifacts/revised.png",
+        prompt="three women playing in one pool scene",
+        negative_prompt="collage",
+        width=768,
+        height=1024,
+        steps=30,
+    )
+    stored_result = {
+        "status": "succeeded",
+        "summary": "Previous subtask result.",
+        "findings": [],
+        "sources": [],
+        "tool_runs": [],
+        "questions": [],
+        "error": "",
+        "image_revision_feedback": "Replace the face grid.",
+    }
+    stored = SimpleNamespace(result=stored_result)
+
+    class FakeSession:
+        def __init__(self):
+            self.added = []
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def get(self, _model, _identity, **_kwargs):
+            return stored
+
+        async def scalar(self, _statement):
+            return 0
+
+        def add(self, value):
+            self.added.append(value)
+
+        async def commit(self):
+            return None
+
+    async def assert_lease(*_args):
+        return None
+
+    row = SimpleNamespace(
+        id=uuid.uuid4(),
+        task_id=uuid.uuid4(),
+        plan_version=1,
+        result=stored_result,
+    )
+    review_id = uuid.uuid4()
+    revision_context = {
+        "trigger_quality_review_id": str(review_id),
+        "source_artifact_paths": ["artifacts/previous.png"],
+        "unmet_items": [
+            {
+                "item_id": "scene",
+                "description": "Show one pool scene.",
+                "evidence": "Many separate faces are visible.",
+                "deficiency": "The composition is a face grid.",
+            }
+        ],
+    }
+    session = FakeSession()
+    monkeypatch.setattr(
+        orchestrator_module, "SessionFactory", lambda: session
+    )
+    monkeypatch.setattr(
+        orchestrator_module, "_assert_lease_in_session", assert_lease
+    )
+
+    await orchestrator_module._checkpoint_image_generations(
+        uuid.uuid4(),
+        "worker-test",
+        row,
+        [record],
+        record,
+        revision_context,
+        "test-image-model",
+        4,
+    )
+
+    assert stored.result["image_generations"] == [
+        record.model_dump(mode="json")
+    ]
+    assert stored.result["image_revision_feedback"] == ""
+    assert stored.result["image_revision_completed"] is True
+    assert row.result == stored.result
+    assert orchestrator_module._stored_revision_feedback(stored.result) == ""
+    history = next(
+        item
+        for item in session.added
+        if isinstance(item, ImageGenerationRevision)
+    )
+    assert history.trigger_quality_review_id == review_id
+    assert history.unmet_items == revision_context["unmet_items"]
+    assert history.source_artifact_paths == ["artifacts/previous.png"]
+    assert history.prompt == record.prompt
+    progress_event = next(
+        item for item in session.added if isinstance(item, Event)
+    )
+    assert progress_event.payload_json["activity"] == "image_generation"
+    assert "prompt" not in progress_event.payload_json
+    restored = orchestrator_module._restore_subtask_result(stored.result)
+    assert restored.status == "succeeded"
+    assert restored._image_generations == [record]
+
+
+@pytest.mark.asyncio
+async def test_final_image_review_revises_source_subtask(monkeypatch):
+    import json
+
+    import app.orchestrator as orchestrator_module
+
+    task_id = uuid.uuid4()
+    job_id = uuid.uuid4()
+    subtask_id = uuid.uuid4()
+    old_image = ImageGenerationRecord(
+        artifact_path="artifacts/old-pool.png",
+        prompt="three women at a pool",
+        negative_prompt="collage",
+        width=768,
+        height=1024,
+        steps=25,
+    )
+    new_image = ImageGenerationRecord(
+        artifact_path="artifacts/new-pool.png",
+        prompt="three women playing in one pool scene",
+        negative_prompt="collage, multiple separate faces",
+        width=768,
+        height=1024,
+        steps=30,
+    )
+    source_result = {
+        "status": "succeeded",
+        "summary": "Generated the requested image.",
+        "findings": [],
+        "sources": [],
+        "tool_runs": [],
+        "questions": [],
+        "error": "",
+        "image_generations": [old_image.model_dump(mode="json")],
+    }
+    row = SimpleNamespace(
+        id=subtask_id,
+        task_id=task_id,
+        status="accepted",
+        result=source_result,
+        title="Generate the requested image",
+        instruction="Draw three women playing in a pool.",
+        artifact_goal="Show three women playing in one pool scene.",
+        acceptance_checklist=[],
+        dependencies=[],
+        model_id="test-worker",
+        quality_revision_count=0,
+        tool_calls_used=1,
+        tool_calls_limit=20,
+        plan_version=1,
+    )
+    task = SimpleNamespace(
+        config_snapshot={
+            "max_concurrent_agents": 1,
+            "max_agent_attempts": 1,
+            "manager_model": "test-manager",
+            "max_quality_revisions_per_task": 3,
+            "max_quality_revisions_per_subtask": 2,
+            "max_tool_calls_per_subtask": 20,
+        }
+    )
+    conversation = [
+        SimpleNamespace(
+            sequence=1,
+            role="user",
+            content="Draw three women playing in a pool.",
+        )
+    ]
+
+    class FakeSession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def get(self, model, _identity):
+            return task if model is Task else None
+
+        async def scalars(self, _statement):
+            return conversation
+
+    plan = SimpleNamespace(
+        summary="Generate the requested image.",
+        final_checklist=[
+            ChecklistItem(
+                id="scene",
+                description="Three women play together in one pool.",
+            )
+        ],
+    )
+
+    async def load_plan(*_args):
+        return plan, 1, [row]
+
+    async def quality_revision_count(*_args):
+        return 0
+
+    syntheses = []
+    reviewed_paths = []
+    revision_calls = []
+    saved_verdicts = []
+    saved_review_ids = []
+    finished = {}
+    reviews = [
+        [
+            {
+                "item_id": "scene",
+                "description": "Three women play together in one pool.",
+                "required": True,
+                "passed": False,
+                "evidence": "Many separate faces are visible.",
+                "deficiency": "The image is a grid of unrelated faces.",
+                "revision_target": "image",
+                "target_image_paths": [old_image.artifact_path],
+            }
+        ],
+        [
+            {
+                "item_id": "scene",
+                "description": "Three women play together in one pool.",
+                "required": True,
+                "passed": True,
+                "evidence": "Three women are together in a pool scene.",
+                "deficiency": "",
+                "revision_target": "answer",
+                "target_image_paths": [],
+            }
+        ],
+    ]
+
+    async def generate(**kwargs):
+        syntheses.append(json.loads(kwargs["input_text"]))
+        return IntegratedAnswer(
+            answer="The revised image is ready.",
+            caveats=[],
+            artifacts=[],
+        )
+
+    async def review_checklist(**kwargs):
+        reviewed_paths.append(kwargs["image_paths"])
+        return reviews.pop(0)
+
+    async def begin_image_revision(*_args, **_kwargs):
+        row.quality_revision_count += 1
+
+    async def execute_subtask(*_args, **kwargs):
+        revision_calls.append(kwargs)
+        revised = SubtaskResult(
+            status="succeeded",
+            summary="Generated a revised pool scene.",
+            findings=[],
+            sources=[],
+            tool_runs=[],
+            questions=[],
+            error="",
+        )
+        revised._image_generations = [new_image]
+        return revised
+
+    async def review_subtask(_row, initial_result, *_args, **_kwargs):
+        serialized = orchestrator_module._serialize_subtask_result(
+            initial_result
+        )
+        _row.result = serialized
+        _row.status = "accepted"
+        return (
+            serialized,
+            "accepted",
+            [],
+        )
+
+    async def save_quality_review(**kwargs):
+        saved_verdicts.append(kwargs["verdict"])
+        review_id = uuid.uuid4()
+        saved_review_ids.append(review_id)
+        return review_id
+
+    async def finish_task(*_args, **kwargs):
+        finished.update(kwargs)
+
+    async def no_requeue(*_args):
+        return False
+
+    async def mark_subtasks_running(*_args):
+        return None
+
+    monkeypatch.setattr(
+        orchestrator_module, "SessionFactory", FakeSession
+    )
+    monkeypatch.setattr(
+        orchestrator_module,
+        "_load_or_create_plan",
+        load_plan,
+    )
+    monkeypatch.setattr(
+        orchestrator_module,
+        "_requeue_if_new_messages",
+        no_requeue,
+    )
+    monkeypatch.setattr(
+        orchestrator_module,
+        "_quality_revision_count",
+        quality_revision_count,
+    )
+    monkeypatch.setattr(
+        orchestrator_module,
+        "_mark_subtasks_running",
+        mark_subtasks_running,
+    )
+    monkeypatch.setattr(
+        orchestrator_module, "_review_checklist", review_checklist
+    )
+    monkeypatch.setattr(
+        orchestrator_module, "_save_quality_review", save_quality_review
+    )
+    monkeypatch.setattr(
+        orchestrator_module, "_begin_image_revision", begin_image_revision
+    )
+    monkeypatch.setattr(
+        orchestrator_module, "_execute_subtask", execute_subtask
+    )
+    monkeypatch.setattr(
+        orchestrator_module, "_review_subtask_result", review_subtask
+    )
+    monkeypatch.setattr(
+        orchestrator_module, "_finish_task", finish_task
+    )
+    monkeypatch.setattr(
+        orchestrator_module, "_agent_options", lambda *_args, **_kwargs: {}
+    )
+    monkeypatch.setattr(
+        orchestrator_module, "_format_conversation", lambda _messages: ""
+    )
+    monkeypatch.setattr(
+        orchestrator_module.model_client, "generate", generate
+    )
+
+    await orchestrator_module.execute_task(task_id, job_id, "worker-test")
+
+    assert len(revision_calls) == 1
+    assert revision_calls[0]["previous_image_generations"] == [old_image]
+    assert revision_calls[0]["revision_feedback"] == (
+        "- Three women play together in one pool.: "
+        "The image is a grid of unrelated faces."
+    )
+    assert revision_calls[0]["image_revision_context"] == {
+        "trigger_quality_review_id": str(saved_review_ids[0]),
+        "source_artifact_paths": [old_image.artifact_path],
+        "unmet_items": [
+            {
+                "item_id": "scene",
+                "description": "Three women play together in one pool.",
+                "evidence": "Many separate faces are visible.",
+                "deficiency": "The image is a grid of unrelated faces.",
+            }
+        ],
+    }
+    assert reviewed_paths == [
+        [old_image.artifact_path],
+        [new_image.artifact_path],
+    ]
+    assert syntheses[1]["generated_artifact_paths"] == [
+        new_image.artifact_path
+    ]
+    assert saved_verdicts == ["revision_requested", "accepted"]
+    assert finished["fully_completed"]
+    assert finished["generated_artifact_paths"] == [
+        new_image.artifact_path
+    ]
+
+    row.status = "revising"
+    row.result["image_revision_feedback"] = ""
+    row.result["image_revision_completed"] = True
+    reviews.append(
+        [
+            {
+                "item_id": "scene",
+                "description": "Three women play together in one pool.",
+                "required": True,
+                "passed": True,
+                "evidence": "Three women are together in a pool scene.",
+                "deficiency": "",
+                "revision_target": "answer",
+                "target_image_paths": [],
+            }
+        ]
+    )
+    await orchestrator_module.execute_task(task_id, job_id, "worker-test")
+
+    assert len(revision_calls) == 1
+    assert reviewed_paths[-1] == [new_image.artifact_path]
+    assert syntheses[-1]["generated_artifact_paths"] == [
+        new_image.artifact_path
+    ]
+
+
+@pytest.mark.asyncio
 async def test_tool_budget_limit_finalizes_partial_subtask(monkeypatch):
     import app.orchestrator as orchestrator_module
 
@@ -2956,6 +3752,81 @@ async def test_tool_budget_limit_finalizes_partial_subtask(monkeypatch):
     assert row.tool_calls_used == 20
     assert result.tool_runs[0].error_code == "tool_call_limit_exceeded"
     assert len(calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_saved_subtask_result_keeps_image_checkpoint(monkeypatch):
+    import app.orchestrator as orchestrator_module
+
+    record = ImageGenerationRecord(
+        artifact_path="artifacts/revised.png",
+        prompt="revised image prompt",
+        negative_prompt="collage",
+        width=768,
+        height=1024,
+        steps=30,
+    )
+    stored = SimpleNamespace(
+        status="revising",
+        result={
+            "image_generations": [record.model_dump(mode="json")],
+            "image_revision_feedback": "Remove unrelated faces.",
+        },
+        error=None,
+    )
+
+    class FakeSession:
+        def __init__(self):
+            self.added = []
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def get(self, _model, _identity):
+            return stored
+
+        def add(self, value):
+            self.added.append(value)
+
+        async def commit(self):
+            return None
+
+    async def assert_lease(*_args):
+        return None
+
+    session = FakeSession()
+    row = SimpleNamespace(id=uuid.uuid4(), title="Generate image")
+    monkeypatch.setattr(
+        orchestrator_module, "SessionFactory", lambda: session
+    )
+    monkeypatch.setattr(
+        orchestrator_module, "_assert_lease_in_session", assert_lease
+    )
+
+    await orchestrator_module._save_subtask_result(
+        uuid.uuid4(),
+        uuid.uuid4(),
+        "worker-test",
+        row,
+        {"status": "failed", "summary": "Model output failed."},
+        None,
+        3,
+    )
+
+    assert stored.status == "failed"
+    assert stored.result["image_generations"] == [
+        record.model_dump(mode="json")
+    ]
+    assert stored.result["image_revision_feedback"] == (
+        "Remove unrelated faces."
+    )
+    assert all(
+        "image_revision_feedback" not in event.payload_json
+        for event in session.added
+    )
 
 
 @pytest.mark.asyncio

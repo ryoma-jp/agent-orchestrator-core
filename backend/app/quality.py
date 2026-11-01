@@ -102,6 +102,16 @@ def normalize_checklist_results(
                 "requires_additional_tool_calls": (
                     requires_additional_tool_calls
                 ),
+                "revision_target": (
+                    proposed.get(item.id).revision_target
+                    if proposed.get(item.id) is not None
+                    else "answer"
+                ),
+                "target_image_paths": (
+                    proposed.get(item.id).target_image_paths
+                    if proposed.get(item.id) is not None
+                    else []
+                ),
             }
         )
     return normalized

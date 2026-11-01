@@ -14,7 +14,9 @@ from app.dependencies import require_ready_task_user, require_task_csrf
 from app.models import (
     ConversationMessage,
     Event,
+    ImageGenerationRevision,
     Job,
+    Subtask,
     SystemSettings,
     Task,
     TaskDeletionJob,
@@ -26,6 +28,7 @@ from app.routers.workspace import (
     _owned_task,
 )
 from app.schemas import (
+    ImageGenerationRevisionView,
     MessageCreate,
     MessageView,
     TaskCreate,
@@ -159,6 +162,58 @@ async def get_task(
     if task is None:
         raise HTTPException(status_code=404, detail="Task not found")
     return task
+
+
+@router.get(
+    "/{task_id}/image-revisions",
+    response_model=list[ImageGenerationRevisionView],
+)
+async def list_image_revisions(
+    task_id: uuid.UUID,
+    user: User = Depends(require_ready_task_user),
+    db: AsyncSession = Depends(get_session),
+):
+    task = await db.scalar(
+        select(Task.id).where(
+            Task.id == task_id,
+            Task.owner_id == user.id,
+            Task.deletion_requested_at.is_(None),
+        )
+    )
+    if task is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    rows = await db.execute(
+        select(ImageGenerationRevision, Subtask.title)
+        .join(Subtask, Subtask.id == ImageGenerationRevision.subtask_id)
+        .where(ImageGenerationRevision.task_id == task_id)
+        .order_by(
+            ImageGenerationRevision.created_at,
+            ImageGenerationRevision.id,
+        )
+    )
+    return [
+        ImageGenerationRevisionView(
+            id=revision.id,
+            subtask_id=revision.subtask_id,
+            subtask_title=subtask_title,
+            plan_version=revision.plan_version,
+            generation_no=revision.generation_no,
+            trigger_quality_review_id=revision.trigger_quality_review_id,
+            source_artifact_paths=revision.source_artifact_paths,
+            artifact_path=revision.artifact_path,
+            prompt=revision.prompt,
+            negative_prompt=revision.negative_prompt,
+            model_id=revision.model_id,
+            width=revision.width,
+            height=revision.height,
+            steps=revision.steps,
+            unmet_items=revision.unmet_items,
+            is_backfilled=revision.is_backfilled,
+            created_at=revision.created_at,
+        )
+        for revision, subtask_title in rows.all()
+    ]
 
 
 @router.get("/{task_id}/messages", response_model=list[MessageView])

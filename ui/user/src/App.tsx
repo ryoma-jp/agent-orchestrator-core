@@ -19,6 +19,18 @@ type Task = {
   completion_report: { plan_version: number; unmet_items: { target_type: string; subtask_title: string | null; item_id: string; description: string; evidence: string; deficiency: string }[] } | null;
   pending_tool_approval: ToolBudgetApproval | null
 }
+type ImageRevisionUnmetItem = {
+  item_id: string; description: string; evidence: string; deficiency: string
+}
+type ImageRevision = {
+  id: string; subtask_id: string; subtask_title: string
+  plan_version: number | null; generation_no: number
+  trigger_quality_review_id: string | null; source_artifact_paths: string[]
+  artifact_path: string; prompt: string; negative_prompt: string
+  model_id: string; width: number; height: number; steps: number
+  unmet_items: ImageRevisionUnmetItem[]; is_backfilled: boolean
+  created_at: string
+}
 type Message = { id: string; sequence: number; role: 'user' | 'assistant'; content: string; created_at: string }
 type ProgressItem = { id: string; conversationSequence: number; content: string }
 const statusLabel: Record<string, string> = {
@@ -36,6 +48,7 @@ function App() {
   const [editingMessageId, setEditingMessageId] = useState<string | null>(null)
   const [editingContent, setEditingContent] = useState('')
   const [progress, setProgress] = useState<ProgressItem[]>([])
+  const [imageRevisions, setImageRevisions] = useState<ImageRevision[]>([])
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
   const [showCreate, setShowCreate] = useState(false)
@@ -65,19 +78,31 @@ function App() {
     let alive = true
     const taskId = active.id
     setProgress([])
-    api<Message[]>(`/tasks/${taskId}/messages`)
-      .then((value) => { if (alive) setMessages(value) })
+    setImageRevisions([])
+    Promise.all([
+      api<Message[]>(`/tasks/${taskId}/messages`),
+      api<ImageRevision[]>(`/tasks/${taskId}/image-revisions`),
+    ])
+      .then(([history, revisions]) => {
+        if (alive) { setMessages(history); setImageRevisions(revisions) }
+      })
       .catch((reason) => { if (alive) setError(reason.message) })
     const stream = new EventSource(`/api/tasks/${taskId}/events`, { withCredentials: true })
     const sync = async () => {
       if (!alive) return
       try {
-        const [task, history, updatedTasks] = await Promise.all([
+        const [task, history, updatedTasks, revisions] = await Promise.all([
           api<Task>(`/tasks/${taskId}`),
           api<Message[]>(`/tasks/${taskId}/messages`),
           api<Task[]>('/tasks'),
+          api<ImageRevision[]>(`/tasks/${taskId}/image-revisions`),
         ])
-        if (alive) { setActive(task); setMessages(history); setTasks(updatedTasks) }
+        if (alive) {
+          setActive(task)
+          setMessages(history)
+          setTasks(updatedTasks)
+          setImageRevisions(revisions)
+        }
       } catch { /* A later event or reconnect will retry the read. */ }
     }
     const recordProgress = (event: Event) => {
@@ -111,6 +136,12 @@ function App() {
               : phase === 'blocked' ? `${toolName}はツール予算上限のため実行されませんでした。`
                 : phase === 'failed' ? `${toolName}の実行に失敗しました。`
                   : ''
+          } else if (activity === 'image_generation') {
+            content = typeof payload.summary === 'string'
+              ? payload.summary
+              : '画像生成履歴を保存しました。'
+            void api<ImageRevision[]>(`/tasks/${taskId}/image-revisions`)
+              .then((revisions) => { if (alive) setImageRevisions(revisions) })
         } else {
           content = typeof payload.summary === 'string' ? payload.summary : ''
         }
@@ -320,6 +351,47 @@ function App() {
               {active.status === 'queued' && <div className="progress-note"><LoaderCircle size={15} /> Waiting for an available worker</div>}
               {active.status === 'needs_attention' && <div className="clarification-note" role="status"><MessageSquareText size={15} /> Reply below to continue this task.</div>}
               {active.status === 'partially_completed' && active.completion_report && <article className="partial-block"><strong>未達項目 · 計画 v{active.completion_report.plan_version}</strong><ul>{active.completion_report.unmet_items.map((item) => <li key={`${item.target_type}-${item.subtask_title}-${item.item_id}`}><b>{item.subtask_title ?? '最終回答'}: {item.description}</b>{item.deficiency && <span>{item.deficiency}</span>}{item.evidence && <small>確認内容: {item.evidence}</small>}</li>)}</ul></article>}
+              {imageRevisions.length > 0 && <section className="image-revision-history">
+                <details>
+                  <summary className="image-revision-heading">
+                    <span>画像生成履歴</span><small>{imageRevisions.length}世代</small>
+                  </summary>
+                  <ol>
+                    {imageRevisions.map((revision) => <li key={revision.id}>
+                      <details className="image-revision-entry">
+                        <summary>
+                          <span>生成 {revision.generation_no} · {revision.artifact_path}</span>
+                          <time>{new Date(revision.created_at).toLocaleString('ja-JP')}</time>
+                        </summary>
+                        <div className="image-revision-body">
+                          <p className="image-revision-meta">
+                            {revision.subtask_title} · {revision.model_id} · {revision.width} × {revision.height} · {revision.steps} steps
+                            {revision.is_backfilled ? ' · 既存保存データから取込（過去履歴なし）' : ''}
+                          </p>
+                          {revision.source_artifact_paths.length > 0 && <div className="image-revision-items">
+                            <strong>修正前の画像</strong>
+                            <ul>{revision.source_artifact_paths.map((path) => <li key={path}><code>{path}</code></li>)}</ul>
+                          </div>}
+                          {revision.unmet_items.length > 0 ? <div className="image-revision-items">
+                            <strong>修正の契機となった未達項目</strong>
+                            <ul>{revision.unmet_items.map((item) => <li key={item.item_id}>
+                              <b>{item.description}</b>
+                              {item.deficiency && <span>{item.deficiency}</span>}
+                              {item.evidence && <small>確認内容: {item.evidence}</small>}
+                            </li>)}</ul>
+                          </div> : <p className="image-revision-meta">初回生成、または関連する未達項目はありません。</p>}
+                          <div className="image-revision-prompt">
+                            <strong>生成プロンプト</strong><pre>{revision.prompt}</pre>
+                          </div>
+                          {revision.negative_prompt && <div className="image-revision-prompt">
+                            <strong>除外プロンプト</strong><pre>{revision.negative_prompt}</pre>
+                          </div>}
+                        </div>
+                      </details>
+                    </li>)}
+                  </ol>
+                </details>
+              </section>}
               {active.result && !messages.some((message) => message.role === 'assistant' && message.content === active.result) && <article className="result-block"><div className="result-label"><Check size={14} /> RESULT</div><p>{active.result}</p></article>}
               {active.error && active.status === 'failed' && <article className="error-block"><strong>{active.error.code ?? 'Task error'}</strong><p>{active.error.message ?? 'The task could not be completed.'}</p></article>}
             </div>

@@ -128,6 +128,33 @@ class TaskView(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
+class ImageRevisionUnmetItem(BaseModel):
+    item_id: str
+    description: str
+    evidence: str = ""
+    deficiency: str = ""
+
+
+class ImageGenerationRevisionView(BaseModel):
+    id: uuid.UUID
+    subtask_id: uuid.UUID
+    subtask_title: str
+    plan_version: int | None
+    generation_no: int
+    trigger_quality_review_id: uuid.UUID | None
+    source_artifact_paths: list[str]
+    artifact_path: str
+    prompt: str
+    negative_prompt: str
+    model_id: str
+    width: int
+    height: int
+    steps: int
+    unmet_items: list[ImageRevisionUnmetItem]
+    is_backfilled: bool
+    created_at: datetime
+
+
 class TaskFileView(BaseModel):
     id: uuid.UUID
     kind: Literal["file"] = "file"

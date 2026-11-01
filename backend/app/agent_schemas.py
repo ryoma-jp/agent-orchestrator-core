@@ -5,6 +5,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    PrivateAttr,
     field_validator,
     model_validator,
 )
@@ -133,6 +134,10 @@ class ChecklistItemResult(BaseModel):
     evidence: str = Field(max_length=2_000)
     deficiency: str = Field(max_length=1_000)
     requires_additional_tool_calls: bool = False
+    revision_target: Literal["answer", "image", "both"] = "answer"
+    target_image_paths: list[str] = Field(
+        default_factory=list, max_length=5
+    )
 
 
 class ChecklistReviewResult(BaseModel):
@@ -141,8 +146,23 @@ class ChecklistReviewResult(BaseModel):
     results: list[ChecklistItemResult] = Field(max_length=20)
 
 
+class ImageGenerationRecord(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    artifact_path: str = Field(min_length=1, max_length=300)
+    prompt: str = Field(min_length=1, max_length=4_000)
+    negative_prompt: str = Field(max_length=2_000)
+    width: int = Field(ge=256, le=1536)
+    height: int = Field(ge=256, le=1536)
+    steps: int = Field(ge=1, le=60)
+
+
 class SubtaskResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
+
+    _image_generations: list[ImageGenerationRecord] = PrivateAttr(
+        default_factory=list
+    )
 
     status: Literal["succeeded", "partial", "needs_input", "failed"]
     summary: str = Field(max_length=4_000)

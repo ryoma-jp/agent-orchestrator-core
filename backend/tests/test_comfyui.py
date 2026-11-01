@@ -127,16 +127,17 @@ def test_comfyui_tool_requires_explicit_write_permission():
 
 
 @pytest.mark.parametrize(
-    ("enabled", "image_provider", "expected"),
+    ("enabled", "image_provider", "include_image_tool", "expected"),
     [
-        (True, "comfyui", True),
-        (True, "openai", False),
-        (True, "ollama", False),
-        (False, "comfyui", False),
+        (True, "comfyui", True, True),
+        (True, "comfyui", False, False),
+        (True, "openai", True, False),
+        (True, "ollama", True, False),
+        (False, "comfyui", True, False),
     ],
 )
 def test_subtask_image_tool_follows_image_provider(
-    monkeypatch, enabled, image_provider, expected
+    monkeypatch, enabled, image_provider, include_image_tool, expected
 ):
     monkeypatch.setattr(
         agent_runtime_module,
@@ -154,6 +155,7 @@ def test_subtask_image_tool_follows_image_provider(
             "worker_image_model": "model.safetensors",
         },
         before_workspace_write,
+        include_image_tool=include_image_tool,
     )
     tool_names = {
         definition["name"] for definition in registry.openai_definitions()

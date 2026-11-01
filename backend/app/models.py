@@ -311,6 +311,60 @@ class QualityReview(Base):
     )
 
 
+class ImageGenerationRevision(Base):
+    __tablename__ = "image_generation_revisions"
+    __table_args__ = (
+        UniqueConstraint(
+            "subtask_id",
+            "generation_no",
+            name="uq_image_generation_revisions_subtask_generation",
+        ),
+        CheckConstraint(
+            "generation_no >= 1",
+            name="ck_image_generation_revisions_generation_no",
+        ),
+        Index(
+            "ix_image_generation_revisions_review_id",
+            "trigger_quality_review_id",
+        ),
+        Index(
+            "ix_image_generation_revisions_task_created",
+            "task_id",
+            "created_at",
+            "id",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    task_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("tasks.id", ondelete="CASCADE"), index=True
+    )
+    subtask_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("subtasks.id", ondelete="CASCADE"), index=True
+    )
+    plan_version: Mapped[int | None] = mapped_column(Integer)
+    conversation_sequence: Mapped[int | None] = mapped_column(Integer)
+    generation_no: Mapped[int] = mapped_column(Integer)
+    trigger_quality_review_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("quality_reviews.id", ondelete="SET NULL")
+    )
+    source_artifact_paths: Mapped[list] = mapped_column(JSONB, default=list)
+    artifact_path: Mapped[str] = mapped_column(Text)
+    prompt: Mapped[str] = mapped_column(Text)
+    negative_prompt: Mapped[str] = mapped_column(Text, default="")
+    model_id: Mapped[str] = mapped_column(String(200), default="")
+    width: Mapped[int] = mapped_column(Integer)
+    height: Mapped[int] = mapped_column(Integer)
+    steps: Mapped[int] = mapped_column(Integer)
+    unmet_items: Mapped[list] = mapped_column(JSONB, default=list)
+    is_backfilled: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
 class Event(Base):
     __tablename__ = "events"
     id: Mapped[int] = mapped_column(

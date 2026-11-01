@@ -17,6 +17,7 @@ from app.agent_runtime import (
 from app.agent_schemas import (
     ChecklistItem,
     ChecklistReviewResult,
+    ImageGenerationRecord,
     IntegratedAnswer,
     SourceReference,
     SubtaskResult,
@@ -31,6 +32,7 @@ from app.db import SessionFactory
 from app.models import (
     ConversationMessage,
     Event,
+    ImageGenerationRevision,
     Job,
     QualityReview,
     Subtask,
@@ -195,6 +197,7 @@ async def execute_task(
         for row in subtask_rows
         if row.status in accepted_statuses and isinstance(row.result, dict)
     }
+    subtasks_by_id = {str(row.id): row for row in subtask_rows}
     pending = {
         str(row.id): row
         for row in subtask_rows
@@ -241,21 +244,31 @@ async def execute_task(
             stored_result = (
                 row.result if isinstance(row.result, dict) else None
             )
+            if (
+                previous_status[str(row.id)] == "revising"
+                and stored_result
+                and stored_result.get("image_revision_completed") is True
+            ):
+                return _restore_subtask_result(stored_result)
             if previous_status[str(row.id)] == "reviewing" and stored_result:
-                fields = SubtaskResult.model_fields
-                return SubtaskResult.model_validate(
-                    {
-                        key: value
-                        for key, value in stored_result.items()
-                        if key in fields
-                    }
-                )
+                return _restore_subtask_result(stored_result)
             revision_feedback = ""
             if row.quality_revision_count and stored_result:
-                revision_feedback = _revision_feedback(
-                    stored_result.get("quality_review", [])
+                revision_feedback = _stored_revision_feedback(
+                    stored_result
                 )
-            return await _execute_subtask(
+            previous_image_generations = _stored_image_generations(
+                stored_result or {}
+            )
+            image_revision_context = (
+                stored_result.get("image_revision_context")
+                if isinstance(stored_result, dict)
+                and isinstance(
+                    stored_result.get("image_revision_context"), dict
+                )
+                else None
+            )
+            result = await _execute_subtask(
                 row,
                 plan,
                 result_by_id,
@@ -264,8 +277,13 @@ async def execute_task(
                 lease_owner,
                 config["max_agent_attempts"],
                 revision_feedback=revision_feedback,
+                previous_image_generations=previous_image_generations,
+                image_revision_context=image_revision_context,
                 config=config,
             )
+            if not result._image_generations:
+                result._image_generations = previous_image_generations
+            return result
 
         outcomes = await asyncio.gather(
             *(execute_or_resume(row) for row in ready),
@@ -308,7 +326,7 @@ async def execute_task(
                     raise outcome
                 raise RuntimeError("subtask_execution_failed") from outcome
             if outcome.status == "needs_input":
-                serialized = outcome.model_dump(mode="json")
+                serialized = _serialize_subtask_result(outcome)
                 await _save_subtask_result(
                     task_id,
                     job_id,
@@ -320,7 +338,7 @@ async def execute_task(
                 )
                 user_questions.extend(outcome.questions)
             elif outcome.status == "failed":
-                serialized = outcome.model_dump(mode="json")
+                serialized = _serialize_subtask_result(outcome)
                 await _save_subtask_result(
                     task_id,
                     job_id,
@@ -496,15 +514,42 @@ async def execute_task(
             config.get("max_quality_revisions_per_task", 10)
         )
         checks_passed = required_checklist_items_passed(final_review_results)
+        image_revision_requests, unresolved_image_revision = (
+            _image_revision_requests(final_review_results, result_by_id)
+        )
         can_revise = (
             not checks_passed and total_revisions < task_revision_limit
         )
+        if unresolved_image_revision:
+            can_revise = False
+        subtask_revision_limit = int(
+            config.get("max_quality_revisions_per_subtask", 2)
+        )
+        for source_id in image_revision_requests:
+            source_row = subtasks_by_id.get(source_id)
+            if source_row is None:
+                can_revise = False
+                break
+            tool_call_limit = (
+                source_row.tool_calls_limit
+                if source_row.tool_calls_limit is not None
+                else config.get(
+                    "max_tool_calls_per_subtask", DEFAULT_MAX_TOOL_CALLS
+                )
+            )
+            if (
+                source_row.quality_revision_count
+                >= subtask_revision_limit
+                or source_row.tool_calls_used >= tool_call_limit
+            ):
+                can_revise = False
+                break
         final_verdict = (
             "accepted"
             if checks_passed
             else "revision_requested" if can_revise else "partially_accepted"
         )
-        await _save_quality_review(
+        trigger_review_id = await _save_quality_review(
             task_id=task_id,
             job_id=job_id,
             lease_owner=lease_owner,
@@ -519,6 +564,114 @@ async def execute_task(
         )
         if final_verdict != "revision_requested":
             break
+        for source_id, image_failures in image_revision_requests.items():
+            source_row = subtasks_by_id[source_id]
+            previous_result = result_by_id[source_id]
+            previous_image_generations = _stored_image_generations(
+                previous_result
+            )
+            image_revision_feedback = _revision_feedback(image_failures)
+            image_revision_context = _image_revision_context(
+                trigger_review_id,
+                image_failures,
+                [
+                    record.artifact_path
+                    for record in previous_image_generations
+                ],
+            )
+            await _begin_image_revision(
+                task_id,
+                job_id,
+                lease_owner,
+                source_row,
+                previous_result,
+                image_revision_feedback,
+                image_revision_context,
+                planned_through_sequence,
+            )
+            revised_result = await _execute_subtask(
+                source_row,
+                plan,
+                result_by_id,
+                latest_conversation,
+                job_id,
+                lease_owner,
+                config["max_agent_attempts"],
+                revision_feedback=image_revision_feedback,
+                previous_image_generations=previous_image_generations,
+                image_revision_context=image_revision_context,
+                config=config,
+            )
+            if revised_result.status in {"succeeded", "partial"}:
+                revised_serialized, revision_status, revision_questions = (
+                    await _review_subtask_result(
+                        source_row,
+                        revised_result,
+                        plan,
+                        result_by_id,
+                        latest_conversation,
+                        task_id,
+                        job_id,
+                        lease_owner,
+                        plan_version,
+                        config,
+                        planned_through_sequence,
+                    )
+                )
+            else:
+                revised_serialized = _serialize_subtask_result(
+                    revised_result
+                )
+                await _save_subtask_result(
+                    task_id,
+                    job_id,
+                    lease_owner,
+                    source_row,
+                    revised_serialized,
+                    None,
+                    planned_through_sequence,
+                )
+                revision_status = revised_result.status
+                revision_questions = revised_result.questions
+            if revision_status == "needs_input":
+                await _pause_for_user_input(
+                    task_id,
+                    job_id,
+                    lease_owner,
+                    planned_through_sequence,
+                    revision_questions,
+                )
+                return
+            if revision_status in {"waiting_approval", "requeued"}:
+                return
+            if revision_status == "failed":
+                raise RuntimeError("subtask_reported_failure")
+            result_by_id[source_id] = revised_serialized
+            source_row.status = revision_status
+            partial_unmet_items = [
+                item
+                for item in partial_unmet_items
+                if item.get("subtask_id") != source_id
+            ]
+            if revision_status == "partially_accepted":
+                partial_unmet_items.extend(
+                    _unmet_report_items(
+                        revised_serialized.get("quality_review", []),
+                        target_type="subtask",
+                        subtask_id=source_row.id,
+                        subtask_title=source_row.title,
+                    )
+                )
+        if image_revision_requests:
+            generated_artifact_paths = _generated_artifact_paths(
+                result_by_id
+            )
+            synthesis_context["subtask_results"] = list(
+                result_by_id.values()
+            )
+            synthesis_context["generated_artifact_paths"] = (
+                generated_artifact_paths
+            )
         previous_answer = answer.answer
         previous_artifacts = [
             item.model_dump(mode="json") for item in answer.artifacts
@@ -713,6 +866,10 @@ async def _review_checklist(
                 "requires_additional_tool_calls=true only when resolving it "
                 "requires another permitted read-only tool call; use false "
                 "when it can be corrected from the supplied evidence. "
+                "For each failed item, set revision_target to answer, image, "
+                "or both according to what must change. When image_review is "
+                "supplied and an image must change, list only relevant "
+                "attached_paths in target_image_paths; do not invent paths. "
                 "When image_review is supplied, attached images follow "
                 "attached_paths order. Do not claim that omitted images "
                 "were visually reviewed. "
@@ -724,7 +881,25 @@ async def _review_checklist(
             max_attempts=max_attempts,
             **(execution_options or {}),
         )
-    return normalize_checklist_results(checklist, review, artifact)
+    normalized = normalize_checklist_results(checklist, review, artifact)
+    proposed = {result.item_id: result for result in review.results}
+    attached_paths = set(selected_image_paths)
+    for result in normalized:
+        if result["revision_target"] not in {"image", "both"}:
+            result["target_image_paths"] = []
+            continue
+        proposed_result = proposed.get(result["item_id"])
+        requested_paths = (
+            proposed_result.target_image_paths
+            if proposed_result is not None
+            else []
+        )
+        if not requested_paths and len(attached_paths) == 1:
+            requested_paths = list(attached_paths)
+        result["target_image_paths"] = [
+            path for path in requested_paths if path in attached_paths
+        ]
+    return normalized
 
 
 async def _quality_revision_count(task_id: uuid.UUID) -> int:
@@ -756,11 +931,13 @@ async def _save_quality_review(
     subtask_status: str | None = None,
     subtask_result: dict[str, object] | None = None,
     increment_revision: bool = False,
-) -> None:
+) -> uuid.UUID:
+    review_id = uuid.uuid4()
     async with SessionFactory() as session:
         await _assert_lease_in_session(session, job_id, lease_owner)
         session.add(
             QualityReview(
+                id=review_id,
                 task_id=task_id,
                 plan_version=plan_version,
                 target_type=target_type,
@@ -779,7 +956,18 @@ async def _save_quality_review(
                 raise RuntimeError("subtask_not_found")
             subtask.status = subtask_status
             if subtask_result is not None:
-                subtask.result = subtask_result
+                stored_result = dict(subtask_result)
+                if verdict == "revision_requested":
+                    stored_result["image_revision_context"] = (
+                        _image_revision_context(
+                            review_id,
+                            results,
+                            _generated_artifact_paths(
+                                {"subtask": stored_result}
+                            ),
+                        )
+                    )
+                subtask.result = stored_result
             if increment_revision:
                 subtask.quality_revision_count += 1
             session.add(
@@ -808,6 +996,7 @@ async def _save_quality_review(
             )
         )
         await session.commit()
+    return review_id
 
 
 def _revision_feedback(results: list[dict[str, object]]) -> str:
@@ -815,6 +1004,127 @@ def _revision_feedback(results: list[dict[str, object]]) -> str:
     return "\n".join(
         f"- {item['description']}: {item['deficiency']}" for item in failures
     )
+
+
+def _image_revision_context(
+    review_id: uuid.UUID | None,
+    review_results: list[dict[str, object]],
+    fallback_source_paths: list[str],
+) -> dict[str, object]:
+    failures = failed_required_checklist_items(review_results)
+    target_paths = {
+        path
+        for item in failures
+        for path in item.get("target_image_paths", [])
+        if isinstance(path, str) and _is_generated_artifact_path(path)
+    }
+    source_paths = target_paths or {
+        path
+        for path in fallback_source_paths
+        if _is_generated_artifact_path(path)
+    }
+    return {
+        "trigger_quality_review_id": (
+            str(review_id) if review_id is not None else None
+        ),
+        "source_artifact_paths": sorted(source_paths),
+        "unmet_items": [
+            {
+                "item_id": item["item_id"],
+                "description": item["description"],
+                "evidence": item.get("evidence", ""),
+                "deficiency": item.get("deficiency", ""),
+            }
+            for item in failures
+        ],
+    }
+
+
+def _stored_revision_feedback(result: dict[str, object]) -> str:
+    image_feedback = result.get("image_revision_feedback")
+    if isinstance(image_feedback, str):
+        return image_feedback
+    quality_review = result.get("quality_review", [])
+    if not isinstance(quality_review, list):
+        return ""
+    return _revision_feedback(quality_review)
+
+
+def _image_revision_requests(
+    review_results: list[dict[str, object]],
+    subtask_results: dict[str, dict[str, object]],
+) -> tuple[dict[str, list[dict[str, object]]], bool]:
+    owners_by_path: dict[str, list[str]] = {}
+    for subtask_id, result in subtask_results.items():
+        for record in _stored_image_generations(result):
+            owners_by_path.setdefault(record.artifact_path, []).append(
+                subtask_id
+            )
+
+    requests: dict[str, list[dict[str, object]]] = {}
+    unresolved = False
+    for item in failed_required_checklist_items(review_results):
+        if item.get("revision_target") not in {"image", "both"}:
+            continue
+        target_paths = item.get("target_image_paths", [])
+        if not isinstance(target_paths, list) or not target_paths:
+            unresolved = True
+            continue
+        for path in target_paths:
+            owners = (
+                owners_by_path.get(path, [])
+                if isinstance(path, str)
+                else []
+            )
+            if len(owners) != 1:
+                unresolved = True
+                continue
+            requests.setdefault(owners[0], []).append(item)
+    return requests, unresolved
+
+
+def _stored_image_generations(
+    result: dict[str, object],
+) -> list[ImageGenerationRecord]:
+    stored = result.get("image_generations", [])
+    if not isinstance(stored, list):
+        return []
+    records = []
+    for item in stored:
+        if not isinstance(item, dict):
+            continue
+        try:
+            record = ImageGenerationRecord.model_validate(item)
+        except ValueError:
+            continue
+        if _is_generated_artifact_path(record.artifact_path):
+            records.append(record)
+    return records
+
+
+def _serialize_subtask_result(result: SubtaskResult) -> dict[str, object]:
+    serialized = result.model_dump(mode="json")
+    if result._image_generations:
+        serialized["image_generations"] = [
+            record.model_dump(mode="json")
+            for record in result._image_generations
+        ]
+    return serialized
+
+
+def _restore_subtask_result(
+    stored_result: dict[str, object],
+) -> SubtaskResult:
+    fields = SubtaskResult.model_fields
+    result = SubtaskResult.model_validate(
+        {
+            key: value
+            for key, value in stored_result.items()
+            if key in fields
+        }
+    )
+    result._image_generations = _stored_image_generations(stored_result)
+    return result
 
 
 def _unmet_report_items(
@@ -847,12 +1157,15 @@ async def _execute_subtask(
     lease_owner,
     max_attempts,
     revision_feedback: str = "",
+    previous_image_generations: list[ImageGenerationRecord] | None = None,
+    image_revision_context: dict[str, object] | None = None,
     config: dict | None = None,
 ) -> SubtaskResult:
     config = config or {}
     sources_by_url: dict[str, SourceReference] = {}
     tool_runs: list[ToolExecutionRecord] = []
     tool_observations: list[dict[str, object]] = []
+    image_generations: list[ImageGenerationRecord] = []
     tool_budget_exhausted = False
     conversation_sequence = conversation[-1].sequence if conversation else None
 
@@ -867,6 +1180,41 @@ async def _execute_subtask(
         tool_observations.append(
             {"name": name, "arguments": arguments, "result": result}
         )
+        if (
+            name == "comfyui_generate_image"
+            and "error" not in result
+            and isinstance(arguments, dict)
+            and isinstance(result.get("artifact_path"), str)
+            and _is_generated_artifact_path(result["artifact_path"])
+            and len(image_generations) < 10
+        ):
+            try:
+                generation_record = ImageGenerationRecord.model_validate(
+                    {
+                        "artifact_path": result["artifact_path"],
+                        "prompt": arguments.get("prompt"),
+                        "negative_prompt": arguments.get(
+                            "negative_prompt", ""
+                        ),
+                        "width": arguments.get("width"),
+                        "height": arguments.get("height"),
+                        "steps": arguments.get("steps"),
+                    }
+                )
+            except ValueError:
+                pass
+            else:
+                image_generations.append(generation_record)
+                await _checkpoint_image_generations(
+                    job_id,
+                    lease_owner,
+                    row,
+                    image_generations,
+                    generation_record,
+                    image_revision_context,
+                    config.get("worker_image_model", ""),
+                    conversation_sequence,
+                )
         if result.get("error") == "tool_call_limit_exceeded":
             tool_budget_exhausted = True
         query = (
@@ -982,6 +1330,10 @@ async def _execute_subtask(
             "plan_summary": plan.summary,
             "dependency_results": dependency_results,
             "revision_feedback": revision_feedback,
+            "previous_image_generations": [
+                record.model_dump(mode="json")
+                for record in (previous_image_generations or [])
+            ],
         },
         ensure_ascii=False,
     )
@@ -995,10 +1347,14 @@ async def _execute_subtask(
         subtask_id=getattr(row, "id", None),
         conversation_sequence=conversation_sequence,
     )
+    reuse_image_checkpoint = bool(previous_image_generations) and not (
+        revision_feedback
+    )
     active_tool_registry = subtask_tool_registry(
         row.task_id,
         config,
         execution_options["before_model_call"],
+        include_image_tool=not reuse_image_checkpoint,
     )
     system_prompt = (
         "Complete one informational subtask using the supplied context, "
@@ -1011,6 +1367,17 @@ async def _execute_subtask(
         "meet the supplied artifact_goal and required acceptance_checklist "
         "items. When revision_feedback is non-empty, correct only those "
         "listed deficiencies while preserving supported findings. If a "
+        "previous_image_generations record is supplied, use its prompt and "
+        "negative_prompt as the starting point for image revisions, preserve "
+        "details that already meet the request, and change or add only what "
+        "the revision feedback requires. Replace the prompt entirely only "
+        "when it fundamentally conflicts with the user's request. If an "
+        "image revision is requested, call the registered image tool to "
+        "generate a new image rather than only describing the changes. "
+        "If previous_image_generations is supplied and revision_feedback is "
+        "empty, reuse its artifact_path and do not call the image tool again; "
+        "include the reused path in findings. "
+        "If a "
         "deficiency identifies a false premise or missing prerequisite, "
         "resolve that prerequisite first. Use needs_input when essential "
         "information must come from the user; put concise, specific "
@@ -1149,6 +1516,7 @@ async def _execute_subtask(
             result.error = "tool_call_limit_exceeded"
     result.sources = list(sources_by_url.values())[:15]
     result.tool_runs = tool_runs[:10]
+    result._image_generations = image_generations
     return result
 
 
@@ -1192,6 +1560,18 @@ async def _save_subtask_result(
     async with SessionFactory() as session:
         await _assert_lease_in_session(session, job_id, lease_owner)
         stored = await session.get(Subtask, row.id)
+        previous_result = (
+            stored.result if isinstance(stored.result, dict) else {}
+        )
+        result = dict(result)
+        for key in (
+            "image_generations",
+            "image_revision_feedback",
+            "image_revision_completed",
+            "image_revision_context",
+        ):
+            if key not in result and key in previous_result:
+                result[key] = previous_result[key]
         stored.status = status_override or (
             "blocked"
             if result["status"] == "needs_input"
@@ -1225,6 +1605,162 @@ async def _save_subtask_result(
         await session.commit()
 
 
+async def _begin_image_revision(
+    task_id: uuid.UUID,
+    job_id: uuid.UUID,
+    lease_owner: str,
+    row,
+    previous_result: dict[str, object],
+    revision_feedback: str,
+    image_revision_context: dict[str, object],
+    conversation_sequence: int,
+) -> None:
+    async with SessionFactory() as session:
+        await _assert_lease_in_session(session, job_id, lease_owner)
+        stored = await session.get(
+            Subtask, row.id, with_for_update=True
+        )
+        if stored is None:
+            raise RuntimeError("subtask_not_found")
+        stored.status = "revising"
+        stored.quality_revision_count += 1
+        stored.result = {
+            **previous_result,
+            "image_revision_feedback": revision_feedback,
+            "image_revision_context": image_revision_context,
+        }
+        row.status = stored.status
+        row.quality_revision_count = stored.quality_revision_count
+        row.result = stored.result
+        session.add(
+            Event(
+                task_id=task_id,
+                type="subtask.status_changed",
+                payload_json={
+                    "subtask_id": str(row.id),
+                    "status": stored.status,
+                    "title": row.title,
+                    "conversation_sequence": conversation_sequence,
+                },
+            )
+        )
+        await session.commit()
+
+
+async def _checkpoint_image_generations(
+    job_id: uuid.UUID,
+    lease_owner: str,
+    row,
+    generations: list[ImageGenerationRecord],
+    new_generation: ImageGenerationRecord,
+    revision_context: dict[str, object] | None,
+    model_id: str,
+    conversation_sequence: int | None,
+) -> None:
+    async with SessionFactory() as session:
+        await _assert_lease_in_session(session, job_id, lease_owner)
+        stored = await session.get(
+            Subtask, row.id, with_for_update=True
+        )
+        if stored is None:
+            raise RuntimeError("subtask_not_found")
+        result = (
+            dict(stored.result)
+            if isinstance(stored.result, dict)
+            else {}
+        )
+        result["image_generations"] = [
+            generation.model_dump(mode="json")
+            for generation in generations
+        ]
+        if "image_revision_feedback" in result:
+            result["image_revision_feedback"] = ""
+            result["image_revision_completed"] = True
+        if revision_context is not None:
+            result["image_revision_context"] = revision_context
+            result["image_revision_feedback"] = ""
+            result["image_revision_completed"] = True
+        stored.result = result
+        row.result = result
+        generation_no = int(
+            await session.scalar(
+                select(
+                    func.coalesce(
+                        func.max(ImageGenerationRevision.generation_no), 0
+                    )
+                    + 1
+                ).where(
+                    ImageGenerationRevision.subtask_id == row.id
+                )
+            )
+            or 1
+        )
+        trigger_review_id = None
+        review_id_value = (
+            revision_context.get("trigger_quality_review_id")
+            if revision_context is not None
+            else None
+        )
+        if isinstance(review_id_value, uuid.UUID):
+            trigger_review_id = review_id_value
+        elif isinstance(review_id_value, str):
+            try:
+                trigger_review_id = uuid.UUID(review_id_value)
+            except ValueError:
+                trigger_review_id = None
+        source_paths = (
+            revision_context.get("source_artifact_paths", [])
+            if revision_context is not None
+            else []
+        )
+        unmet_items = (
+            revision_context.get("unmet_items", [])
+            if revision_context is not None
+            else []
+        )
+        session.add(
+            ImageGenerationRevision(
+                id=uuid.uuid4(),
+                task_id=row.task_id,
+                subtask_id=row.id,
+                plan_version=getattr(row, "plan_version", None),
+                conversation_sequence=conversation_sequence,
+                generation_no=generation_no,
+                trigger_quality_review_id=trigger_review_id,
+                source_artifact_paths=[
+                    path
+                    for path in source_paths
+                    if isinstance(path, str)
+                    and _is_generated_artifact_path(path)
+                ] if isinstance(source_paths, list) else [],
+                artifact_path=new_generation.artifact_path,
+                prompt=new_generation.prompt,
+                negative_prompt=new_generation.negative_prompt,
+                model_id=model_id,
+                width=new_generation.width,
+                height=new_generation.height,
+                steps=new_generation.steps,
+                unmet_items=(
+                    unmet_items if isinstance(unmet_items, list) else []
+                ),
+            )
+        )
+        session.add(
+            Event(
+                task_id=row.task_id,
+                type="agent.progress",
+                payload_json={
+                    "activity": "image_generation",
+                    "phase": "completed",
+                    "summary": "画像生成履歴を保存しました。",
+                    "subtask_id": str(row.id),
+                    "conversation_sequence": conversation_sequence,
+                },
+            )
+        )
+        await session.commit()
+
+
 async def _review_subtask_result(
     row,
     initial_result: SubtaskResult,
@@ -1240,7 +1776,7 @@ async def _review_subtask_result(
 ) -> tuple[dict[str, object], str, list[str]]:
     current_result = initial_result
     while current_result.status in {"succeeded", "partial"}:
-        serialized = current_result.model_dump(mode="json")
+        serialized = _serialize_subtask_result(current_result)
         await _save_subtask_result(
             task_id,
             job_id,
@@ -1342,7 +1878,7 @@ async def _review_subtask_result(
             "partially_accepted": "partially_accepted",
         }[verdict]
         revision_round = row.quality_revision_count
-        await _save_quality_review(
+        trigger_review_id = await _save_quality_review(
             task_id=task_id,
             job_id=job_id,
             lease_owner=lease_owner,
@@ -1362,6 +1898,12 @@ async def _review_subtask_result(
             return saved_result, subtask_status, []
 
         row.quality_revision_count += 1
+        previous_image_generations = current_result._image_generations
+        image_revision_context = _image_revision_context(
+            trigger_review_id,
+            review_results,
+            _generated_artifact_paths({"subtask": serialized}),
+        )
         current_result = await _execute_subtask(
             row,
             plan,
@@ -1371,8 +1913,12 @@ async def _review_subtask_result(
             lease_owner,
             config["max_agent_attempts"],
             revision_feedback=_revision_feedback(review_results),
+            previous_image_generations=previous_image_generations,
+            image_revision_context=image_revision_context,
             config=config,
         )
+        if not current_result._image_generations:
+            current_result._image_generations = previous_image_generations
         if current_result.status not in {"succeeded", "partial"}:
             failed_result = current_result.model_dump(mode="json")
             await _save_subtask_result(
@@ -1563,6 +2109,10 @@ def _is_generated_artifact_path(path: str) -> bool:
 def _generated_artifact_paths(results: dict) -> list[str]:
     paths = set()
     for result in results.values():
+        paths.update(
+            record.artifact_path
+            for record in _stored_image_generations(result)
+        )
         tool_runs = result.get("tool_runs", [])
         if not isinstance(tool_runs, list):
             continue
