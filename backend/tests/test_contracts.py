@@ -112,10 +112,13 @@ async def test_image_revision_history_is_owner_scoped_and_ordered():
         artifact_path="artifacts/initial.png",
         prompt="initial pool prompt",
         negative_prompt="collage",
+        openai_prompt=None,
         model_id="checkpoint.safetensors",
         width=768,
         height=1024,
         steps=25,
+        seed=123,
+        quality=None,
         unmet_items=[],
         is_backfilled=False,
         created_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
@@ -132,10 +135,16 @@ async def test_image_revision_history_is_owner_scoped_and_ordered():
         artifact_path="artifacts/revised.png",
         prompt="three women playing in one pool",
         negative_prompt="face grid, collage",
+        openai_prompt=(
+            "three women playing in one pool\n\nDo not include: "
+            "face grid, collage"
+        ),
         model_id="checkpoint.safetensors",
         width=768,
         height=1024,
         steps=30,
+        seed=456,
+        quality=None,
         unmet_items=[
             {
                 "item_id": "scene",
@@ -177,6 +186,8 @@ async def test_image_revision_history_is_owner_scoped_and_ordered():
         "The image shows unrelated faces."
     )
     assert history[1].prompt == "three women playing in one pool"
+    assert history[1].openai_prompt == later.openai_prompt
+    assert history[1].seed == 456
     assert own_session.history_read
 
     other_session = FakeSession(False)
@@ -2535,13 +2546,21 @@ async def test_review_image_loader_fetches_only_generated_artifact_paths(
 
 @pytest.mark.asyncio
 async def test_checklist_review_passes_loaded_images_to_model(monkeypatch):
+    from io import BytesIO
+
     import app.orchestrator as orchestrator_module
+    from PIL import Image
 
     task_id = uuid.uuid4()
-    png_bytes = b"\x89PNG\r\n\x1a\nimage payload"
+    png_buffer = BytesIO()
+    Image.new("RGB", (256, 256), "white").save(
+        png_buffer, format="PNG"
+    )
+    png_bytes = png_buffer.getvalue()
     loaded_paths = []
     model_images = []
     model_inputs = []
+    model_system_prompts = []
 
     async def load_images(_task_id, image_paths):
         loaded_paths.extend(image_paths)
@@ -2552,6 +2571,7 @@ async def test_checklist_review_passes_loaded_images_to_model(monkeypatch):
         model_inputs.append(
             orchestrator_module.json.loads(kwargs["input_text"])
         )
+        model_system_prompts.append(kwargs["system_prompt"])
         return ChecklistReviewResult(
             results=[
                 {
@@ -2564,12 +2584,29 @@ async def test_checklist_review_passes_loaded_images_to_model(monkeypatch):
                         "artifacts/cat.png",
                         "artifacts/not-attached.png",
                     ],
-                }
+                },
+                {
+                        "item_id": "system-image-visual-integrity",
+                        "passed": False,
+                        "evidence": "The hand near the cup is visible.",
+                        "deficiency": "The fingers do not connect naturally.",
+                        "revision_target": "image",
+                        "target_image_paths": ["artifacts/cat.png"],
+                    },
             ]
         )
 
     monkeypatch.setattr(
         orchestrator_module, "_load_review_images", load_images
+    )
+    monkeypatch.setattr(
+        orchestrator_module,
+        "load_private_skill_if_present",
+        lambda name: (
+            "Inspect anatomy and background details."
+            if name == "image-generation"
+            else None
+        ),
     )
     monkeypatch.setattr(orchestrator_module.model_client, "generate", generate)
 
@@ -2590,15 +2627,48 @@ async def test_checklist_review_passes_loaded_images_to_model(monkeypatch):
     )
 
     assert loaded_paths == ["artifacts/cat.png"]
-    assert model_images == [png_bytes]
+    assert model_images[0] == png_bytes
+    assert len(model_images) == 5
     assert model_inputs[0]["image_review"] == {
         "attached_paths": ["artifacts/cat.png"],
         "omitted_paths": ["artifacts/omitted.png"],
-        "attached_images_follow_path_order": True,
+        "image_views": [
+            {"artifact_path": "artifacts/cat.png", "view": "full image"},
+            {
+                "artifact_path": "artifacts/cat.png",
+                "view": "top-left detail crop",
+            },
+            {
+                "artifact_path": "artifacts/cat.png",
+                "view": "top-right detail crop",
+            },
+            {
+                "artifact_path": "artifacts/cat.png",
+                "view": "bottom-left detail crop",
+            },
+            {
+                "artifact_path": "artifacts/cat.png",
+                "view": "bottom-right detail crop",
+            },
+        ],
+        "omitted_detail_views": [],
+        "image_views_follow_input_image_order": True,
     }
+    assert "Inspect anatomy and background details." in (
+        model_system_prompts[0]
+    )
+    assert "ChecklistReviewResult schema" in model_system_prompts[0]
     assert not results[0]["passed"]
     assert results[0]["revision_target"] == "image"
     assert results[0]["target_image_paths"] == ["artifacts/cat.png"]
+    visual_integrity = next(
+        result
+        for result in results
+        if result["item_id"].startswith("system-image-visual-integrity")
+    )
+    assert not visual_integrity["passed"]
+    assert visual_integrity["revision_target"] == "image"
+    assert visual_integrity["target_image_paths"] == ["artifacts/cat.png"]
 
 
 @pytest.mark.asyncio
@@ -2999,7 +3069,7 @@ async def test_subtask_receives_conversation_history(monkeypatch):
     ]
     assert activity_details == [
         ("skill", "loaded", "tavily-search", "public"),
-        ("skill", "fallback", "image-generation-prompt", "fallback"),
+        ("skill", "fallback", "image-generation", "fallback"),
         ("skill", "loaded", "deep-research", "private"),
         ("tool", "completed", None, None),
     ]
@@ -3047,7 +3117,6 @@ async def test_subtask_captures_image_prompt_for_revision(
         "filename": "pool.png",
         "width": 768,
         "height": 1024,
-        "steps": 30,
     }
     captured = {}
     checkpoints = []
@@ -3065,9 +3134,13 @@ async def test_subtask_captures_image_prompt_for_revision(
     async def generate(**kwargs):
         captured.update(kwargs)
         await kwargs["on_tool_result"](
-            "comfyui_generate_image",
+            "openai_generate_image",
             json.dumps(new_arguments),
-            {"artifact_path": "artifacts/revised-pool.png"},
+            {
+                "artifact_path": "artifacts/revised-pool.png",
+                "seed": None,
+                "quality": "auto",
+            },
         )
         return SubtaskResult(
             status="succeeded",
@@ -3134,7 +3207,7 @@ async def test_subtask_captures_image_prompt_for_revision(
             acceptance_checklist=[],
             dependencies=[],
             model_id="test-worker",
-            skill_names=[],
+            skill_names=["image-generation-prompt"],
         ),
         SimpleNamespace(summary="Image task"),
         {},
@@ -3144,7 +3217,11 @@ async def test_subtask_captures_image_prompt_for_revision(
         1,
         revision_feedback="Show exactly three people in one pool scene.",
         previous_image_generations=[previous],
-        config={"max_tool_calls_per_subtask": 20},
+        config={
+            "max_tool_calls_per_subtask": 20,
+            "worker_image_provider": "openai",
+            "worker_image_model": "gpt-image-2.5-sunburst",
+        },
     )
 
     runner_input = json.loads(captured["input_text"])
@@ -3163,7 +3240,7 @@ async def test_subtask_captures_image_prompt_for_revision(
     image_skill_activity = next(
         activity
         for activity in activities
-        if activity.get("skill_name") == "image-generation-prompt"
+        if activity.get("skill_name") == "image-generation"
     )
     assert image_skill_activity["phase"] == expected_skill_phase
     assert image_skill_activity["skill_source"] == expected_skill_source
@@ -3176,7 +3253,13 @@ async def test_subtask_captures_image_prompt_for_revision(
             ],
             "width": 768,
             "height": 1024,
-            "steps": 30,
+            "steps": None,
+            "seed": None,
+            "quality": "auto",
+            "openai_prompt": (
+                "three adult women playing in one swimming pool scene\n\n"
+                "Do not include: collage, multiple panels, extra faces"
+            ),
         }
     ]
     assert "prompt" not in result.tool_runs[0].model_dump()
@@ -3184,6 +3267,24 @@ async def test_subtask_captures_image_prompt_for_revision(
     assert checkpoints[0][3][0].artifact_path == (
         "artifacts/revised-pool.png"
     )
+
+
+def test_answer_revision_limit_keeps_configured_limit():
+    import app.orchestrator as orchestrator_module
+
+    answer_failure = [{"revision_target": "answer"}]
+    assert orchestrator_module._image_revision_limit(5, answer_failure) == 5
+
+
+def test_image_revision_limit_is_capped_and_preserves_lower_limits():
+    import app.orchestrator as orchestrator_module
+
+    image_failure = [{"revision_target": "image"}]
+    answer_failure = [{"revision_target": "answer"}]
+    assert orchestrator_module._image_revision_limit(0, image_failure) == 0
+    assert orchestrator_module._image_revision_limit(1, image_failure) == 1
+    assert orchestrator_module._image_revision_limit(5, image_failure) == 2
+    assert orchestrator_module._image_revision_limit(5, answer_failure) == 5
 
 
 def test_final_image_failure_maps_to_unique_generation_source():
@@ -4919,21 +5020,17 @@ def test_optional_private_skill_falls_back_only_when_directory_is_missing(
     )
 
     assert (
-        tools_module.load_private_skill_if_present(
-            "image-generation-prompt"
-        )
+        tools_module.load_private_skill_if_present("image-generation")
         is None
     )
 
-    skill_directory = skill_root / "image-generation-prompt"
+    skill_directory = skill_root / "image-generation"
     skill_directory.mkdir()
     (skill_directory / "SKILL.md").write_text(
         "This is not a valid skill.", encoding="utf-8"
     )
     with pytest.raises(RuntimeError, match="private_skill_invalid"):
-        tools_module.load_private_skill_if_present(
-            "image-generation-prompt"
-        )
+        tools_module.load_private_skill_if_present("image-generation")
 
 
 @pytest.mark.asyncio

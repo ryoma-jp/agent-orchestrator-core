@@ -146,10 +146,13 @@ class ImageGenerationRevisionView(BaseModel):
     artifact_path: str
     prompt: str
     negative_prompt: str
+    openai_prompt: str | None
     model_id: str
     width: int
     height: int
-    steps: int
+    steps: int | None
+    seed: int | None
+    quality: str | None
     unmet_items: list[ImageRevisionUnmetItem]
     is_backfilled: bool
     created_at: datetime

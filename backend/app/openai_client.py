@@ -40,7 +40,11 @@ SDK_VERSION = "0.24.0"
 AGENT_DEFINITION_VERSION = "1"
 
 
-def _model_input(input_text: str, input_images: list[bytes] | None):
+def _model_input(
+    input_text: str,
+    input_images: list[bytes] | None,
+    image_detail: str = "auto",
+):
     if not input_images:
         return input_text
     content: list[dict[str, str]] = [
@@ -53,7 +57,7 @@ def _model_input(input_text: str, input_images: list[bytes] | None):
                 "data:image/png;base64,"
                 + base64.b64encode(image).decode("ascii")
             ),
-            "detail": "auto",
+            "detail": image_detail,
         }
         for image in input_images
     )
@@ -345,7 +349,15 @@ class StructuredModelClient:
             try:
                 result = await Runner.run(
                     agent,
-                    _model_input(input_text + retry_note, input_images),
+                    _model_input(
+                        input_text + retry_note,
+                        input_images,
+                        image_detail=(
+                            "high"
+                            if provider == "openai" and input_images
+                            else "auto"
+                        ),
+                    ),
                     context=execution_context or AgentExecutionContext(),
                     max_turns=max_turns,
                     run_config=RunConfig(

@@ -7,37 +7,21 @@ from collections.abc import Awaitable, Callable
 from urllib.parse import quote
 
 import httpx
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, Field, field_validator
 
-from app.agent_schemas import ImageGenerationPrompt
 from app.config import get_settings
+from app.image_generation import ImageGenerationArguments
 from app.tools import ToolRegistration
 
 _PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 _SAFE_FILE_COMPONENT = re.compile(r"[^/\\\x00-\x1f\x7f]+\Z")
 
 
-class ComfyUIImageArguments(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    image_prompt: ImageGenerationPrompt
-    filename: str = Field(
-        default="generated-image.png", min_length=5, max_length=220
-    )
+class ComfyUIImageArguments(ImageGenerationArguments):
     width: int = Field(default=1024, ge=256, le=1536)
     height: int = Field(default=1024, ge=256, le=1536)
     steps: int = Field(default=25, ge=1, le=60)
-
-    @field_validator("filename")
-    @classmethod
-    def validate_filename(cls, value: str) -> str:
-        if (
-            _SAFE_FILE_COMPONENT.fullmatch(value) is None
-            or value in {".", ".."}
-            or not value.casefold().endswith(".png")
-        ):
-            raise ValueError("image_filename_invalid")
-        return value
+    seed: int | None = Field(default=None, ge=0, le=2**63 - 1)
 
     @field_validator("width", "height")
     @classmethod
@@ -94,6 +78,7 @@ class ComfyUIImageGenerationTool:
                     "width": {"type": "integer"},
                     "height": {"type": "integer"},
                     "steps": {"type": "integer"},
+                    "seed": {"type": ["integer", "null"]},
                 },
                 "required": [
                     "image_prompt",
@@ -101,6 +86,7 @@ class ComfyUIImageGenerationTool:
                     "width",
                     "height",
                     "steps",
+                    "seed",
                 ],
                 "additionalProperties": False,
             },
@@ -122,8 +108,13 @@ class ComfyUIImageGenerationTool:
         suffix = uuid.uuid4().hex[:8]
         filename = f"{raw_arguments.filename[:-4]}-{suffix}.png"
         filename_prefix = f"task-{self.task_id.hex}-{suffix}"
+        seed = (
+            raw_arguments.seed
+            if raw_arguments.seed is not None
+            else uuid.uuid4().int % (2**63)
+        )
         workflow = self._workflow(
-            raw_arguments, checkpoint_name, filename_prefix
+            raw_arguments, checkpoint_name, filename_prefix, seed
         )
         base_url = settings.comfyui_base_url.rstrip("/")
         timeout_seconds = settings.comfyui_timeout_seconds
@@ -175,6 +166,7 @@ class ComfyUIImageGenerationTool:
             "artifact_path": relative_path,
             "width": raw_arguments.width,
             "height": raw_arguments.height,
+            "seed": seed,
             "format": "png",
         }
 
@@ -284,6 +276,7 @@ class ComfyUIImageGenerationTool:
         arguments: ComfyUIImageArguments,
         checkpoint_name: str,
         filename_prefix: str,
+        seed: int,
     ) -> dict[str, dict[str, object]]:
         return {
             "1": {
@@ -315,7 +308,7 @@ class ComfyUIImageGenerationTool:
             "5": {
                 "class_type": "KSampler",
                 "inputs": {
-                    "seed": uuid.uuid4().int % (2**63),
+                    "seed": seed,
                     "steps": arguments.steps,
                     "cfg": 7.0,
                     "sampler_name": "euler",

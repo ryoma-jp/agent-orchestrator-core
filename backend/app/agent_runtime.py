@@ -6,6 +6,7 @@ from app.openai_client import (
 from app.orchestration_state import assert_lease, requeue_if_new_messages
 from app.comfyui import ComfyUIImageGenerationTool
 from app.config import get_settings
+from app.image_generation import OpenAIImageGenerationTool
 from app.tools import TavilySearchTool, ToolRegistry
 
 model_client = StructuredModelClient()
@@ -21,15 +22,26 @@ def subtask_tool_registry(
 ):
     registrations = [TavilySearchTool().registration()]
     exposed_risk_classes = {"read_only"}
+    image_provider = config.get("worker_image_provider", "comfyui")
+    settings = get_settings()
     if (
         include_image_tool
-        and get_settings().comfyui_enabled
-        and config.get("worker_image_provider", "comfyui") == "comfyui"
+        and image_provider == "comfyui"
+        and settings.comfyui_enabled
     ):
         registrations.append(
             ComfyUIImageGenerationTool(
                 task_id=task_id,
                 checkpoint_name=config.get("worker_image_model", ""),
+                before_workspace_write=before_workspace_write,
+            ).registration()
+        )
+        exposed_risk_classes.add("writes_data")
+    elif include_image_tool and image_provider == "openai":
+        registrations.append(
+            OpenAIImageGenerationTool(
+                task_id=task_id,
+                model=config.get("worker_image_model", ""),
                 before_workspace_write=before_workspace_write,
             ).registration()
         )

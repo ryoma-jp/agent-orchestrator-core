@@ -45,6 +45,7 @@ async def test_comfyui_image_is_validated_and_saved_to_task_workspace(
                 "A paper crane, folded paper, centered composition"
             )
             assert workflow["3"]["inputs"]["text"] == "blurry"
+            workflow_prefix["seed"] = workflow["5"]["inputs"]["seed"]
             workflow_prefix["value"] = workflow["7"]["inputs"][
                 "filename_prefix"
             ]
@@ -102,11 +103,15 @@ async def test_comfyui_image_is_validated_and_saved_to_task_workspace(
             width=512,
             height=768,
             steps=20,
+            seed=123,
         )
     )
 
     assert result["artifact_path"].startswith("artifacts/crane-")
     assert result["artifact_path"].endswith(".png")
+    assert result["seed"] == 123
+    assert workflow_prefix["seed"] == 123
+    assert workflow_prefix["seed"] == 123
     assert len(saved_files) == 1
     saved_file = saved_files[0]
     assert saved_file.method == "PUT"
@@ -134,22 +139,25 @@ def test_comfyui_tool_requires_explicit_write_permission():
 
 
 @pytest.mark.parametrize(
-    ("enabled", "image_provider", "include_image_tool", "expected"),
+    ("enabled", "image_provider", "include_image_tool", "expected_tool"),
     [
-        (True, "comfyui", True, True),
-        (True, "comfyui", False, False),
-        (True, "openai", True, False),
-        (True, "ollama", True, False),
-        (False, "comfyui", True, False),
+        (True, "comfyui", True, "comfyui_generate_image"),
+        (True, "comfyui", False, None),
+        (False, "openai", True, "openai_generate_image"),
+        (True, "ollama", True, None),
+        (False, "comfyui", True, None),
     ],
 )
 def test_subtask_image_tool_follows_image_provider(
-    monkeypatch, enabled, image_provider, include_image_tool, expected
+    monkeypatch, enabled, image_provider, include_image_tool, expected_tool
 ):
     monkeypatch.setattr(
         agent_runtime_module,
         "get_settings",
-        lambda: SimpleNamespace(comfyui_enabled=enabled),
+        lambda: SimpleNamespace(
+            comfyui_enabled=enabled,
+            agent_timeout_seconds=120,
+        ),
     )
 
     async def before_workspace_write():
@@ -168,7 +176,8 @@ def test_subtask_image_tool_follows_image_provider(
         definition["name"] for definition in registry.openai_definitions()
     }
 
-    assert ("comfyui_generate_image" in tool_names) is expected
+    assert (expected_tool in tool_names) is (expected_tool is not None)
+    assert "tavily_web_search" in tool_names
 
 
 def test_comfyui_arguments_reject_unsafe_paths_and_dimensions():

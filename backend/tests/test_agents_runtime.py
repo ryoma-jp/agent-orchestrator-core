@@ -73,6 +73,26 @@ async def test_invalid_output_is_corrected_with_bounded_retries(sdk_transport):
     assert "corrected JSON" in str(transport.requests[1]["input"])
 
 
+def test_model_input_defaults_image_detail_to_auto():
+    from app.openai_client import _model_input
+
+    model_input = _model_input("review", [b"image"])
+    image_input = model_input[0]["content"][1]
+    assert image_input["detail"] == "auto"
+
+
+@pytest.mark.asyncio
+async def test_openai_image_review_inputs_use_high_detail(sdk_transport):
+    transport = sdk_transport(['{"answer":"reviewed"}'])
+    await generate(
+        provider="openai",
+        input_images=[b"\x89PNG\r\n\x1a\nimage"],
+    )
+    image_input = transport.requests[0]["input"][0]["content"][1]
+    assert image_input["type"] == "input_image"
+    assert image_input["detail"] == "high"
+
+
 @pytest.mark.asyncio
 async def test_invalid_output_stops_without_exposing_provider_output(
     sdk_transport,

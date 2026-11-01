@@ -27,7 +27,9 @@ type ImageRevision = {
   plan_version: number | null; generation_no: number
   trigger_quality_review_id: string | null; source_artifact_paths: string[]
   artifact_path: string; prompt: string; negative_prompt: string
-  model_id: string; width: number; height: number; steps: number
+  openai_prompt: string | null
+  model_id: string; width: number; height: number; steps: number | null
+  seed: number | null; quality: string | null
   unmet_items: ImageRevisionUnmetItem[]; is_backfilled: boolean
   created_at: string
 }
@@ -365,7 +367,11 @@ function App() {
                         </summary>
                         <div className="image-revision-body">
                           <p className="image-revision-meta">
-                            {revision.subtask_title} · {revision.model_id} · {revision.width} × {revision.height} · {revision.steps} steps
+                            {revision.subtask_title} · {revision.model_id} · {revision.width} × {revision.height}
+                            {revision.steps !== null ? ` · ${revision.steps} steps` : ''}
+                            {revision.seed !== null ? ` · seed ${revision.seed}` : ''}
+                            {revision.quality ? ` · quality ${revision.quality}` : ''}
+                            {revision.quality ? ` · quality ${revision.quality}` : ''}
                             {revision.is_backfilled ? ' · 既存保存データから取込（過去履歴なし）' : ''}
                           </p>
                           {revision.source_artifact_paths.length > 0 && <div className="image-revision-items">
@@ -385,6 +391,9 @@ function App() {
                           </div>
                           {revision.negative_prompt && <div className="image-revision-prompt">
                             <strong>除外プロンプト</strong><pre>{revision.negative_prompt}</pre>
+                          </div>}
+                          {revision.openai_prompt && <div className="image-revision-prompt">
+                            <strong>OpenAI送信プロンプト</strong><pre>{revision.openai_prompt}</pre>
                           </div>}
                         </div>
                       </details>

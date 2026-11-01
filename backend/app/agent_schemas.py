@@ -143,7 +143,7 @@ class ChecklistItemResult(BaseModel):
 class ChecklistReviewResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    results: list[ChecklistItemResult] = Field(max_length=20)
+    results: list[ChecklistItemResult] = Field(max_length=21)
 
 
 class ImageGenerationPrompt(BaseModel):
@@ -172,9 +172,12 @@ class ImageGenerationRecord(BaseModel):
     artifact_path: str = Field(min_length=1, max_length=300)
     prompt: str = Field(min_length=1, max_length=4_000)
     negative_prompt: str = Field(max_length=2_000)
-    width: int = Field(ge=256, le=1536)
-    height: int = Field(ge=256, le=1536)
-    steps: int = Field(ge=1, le=60)
+    width: int = Field(ge=256, le=3840)
+    height: int = Field(ge=256, le=3840)
+    steps: int | None = Field(default=None, ge=1, le=60)
+    seed: int | None = Field(default=None, ge=0, le=2**63 - 1)
+    quality: str | None = Field(default=None, max_length=40)
+    openai_prompt: str | None = Field(default=None, max_length=6_100)
 
 
 class SubtaskResult(BaseModel):
