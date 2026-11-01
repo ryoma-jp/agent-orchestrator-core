@@ -86,16 +86,25 @@ class ToolRegistration:
 
 
 class ToolRegistry:
-    def __init__(self, tools: list[ToolRegistration]):
+    def __init__(
+        self,
+        tools: list[ToolRegistration],
+        exposed_risk_classes: set[str] | None = None,
+    ):
         self._tools = {tool.name: tool for tool in tools}
         if len(self._tools) != len(tools):
             raise ValueError("duplicate_tool_name")
+        self._exposed_risk_classes = frozenset(
+            {"read_only"}
+            if exposed_risk_classes is None
+            else exposed_risk_classes
+        )
 
     def openai_definitions(self) -> list[dict[str, object]]:
         return [
             tool.openai_definition()
             for tool in self._tools.values()
-            if tool.risk_class == "read_only"
+            if tool.risk_class in self._exposed_risk_classes
         ]
 
     async def execute(
@@ -104,7 +113,7 @@ class ToolRegistry:
         tool = self._tools.get(name)
         if tool is None:
             return {"error": "tool_not_allowed"}
-        if tool.risk_class != "read_only":
+        if tool.risk_class not in self._exposed_risk_classes:
             return {"error": "tool_requires_approval"}
         try:
             raw_arguments = json.loads(arguments_json)

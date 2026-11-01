@@ -511,6 +511,7 @@ def test_admin_quality_revision_limits_are_bounded():
     assert settings.max_quality_revisions_per_task == 10
     assert settings.manager_model_provider == "openai"
     assert settings.worker_model_provider == "openai"
+    assert settings.worker_image_provider == "openai"
     assert settings.worker_image_model == "gpt-image-2.5-sunburst"
     with pytest.raises(ValidationError):
         AdminSettingsUpdate(
@@ -529,6 +530,7 @@ def test_default_model_settings_use_openai_and_requested_models(monkeypatch):
         "MANAGER_MODEL",
         "WORKER_MODEL_PROVIDER",
         "WORKER_MODEL",
+        "WORKER_IMAGE_PROVIDER",
         "WORKER_IMAGE_MODEL",
     ):
         monkeypatch.delenv(name, raising=False)
@@ -539,6 +541,7 @@ def test_default_model_settings_use_openai_and_requested_models(monkeypatch):
     assert settings.manager_model == "gpt-6.1-sol"
     assert settings.worker_model_provider == "openai"
     assert settings.worker_model == "gpt-6-luna"
+    assert settings.worker_image_provider == "openai"
     assert settings.worker_image_model == "gpt-image-2.5-sunburst"
 
 
@@ -559,6 +562,27 @@ def test_default_model_settings_use_openai_and_requested_models(monkeypatch):
             "http://ollama:11434/api/tags",
             {},
             ["local-a", "local-b"],
+        ),
+        (
+            "comfyui",
+            {
+                "CheckpointLoaderSimple": {
+                    "input": {
+                        "required": {
+                            "ckpt_name": [
+                                [
+                                    "checkpoint-b.safetensors",
+                                    "checkpoint-a.safetensors",
+                                ],
+                                {},
+                            ]
+                        }
+                    }
+                }
+            },
+            "http://comfyui:8188/object_info/CheckpointLoaderSimple",
+            {},
+            ["checkpoint-a.safetensors", "checkpoint-b.safetensors"],
         ),
     ],
 )
@@ -590,6 +614,7 @@ async def test_model_catalog_uses_provider_endpoint(
         "get_settings",
         lambda: SimpleNamespace(
             openai_base_url="https://api.openai.com/v1",
+            comfyui_base_url="http://comfyui:8188",
         ),
     )
     monkeypatch.setattr(
@@ -1921,11 +1946,17 @@ async def test_user_questions_pause_task_and_are_saved_as_assistant_message(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("token_available", "artifact_requested"),
-    [(True, True), (False, True), (True, False)],
+    ("token_available", "artifact_requested", "generated_image"),
+    [
+        (True, True, True),
+        (True, True, False),
+        (False, True, False),
+        (True, False, True),
+        (True, False, False),
+    ],
 )
 async def test_finish_task_persists_requested_artifact(
-    monkeypatch, token_available, artifact_requested
+    monkeypatch, token_available, artifact_requested, generated_image
 ):
     import app.orchestrator as orchestrator_module
 
@@ -2050,6 +2081,11 @@ async def test_finish_task_persists_requested_artifact(
         2,
         fully_completed=False,
         completion_report=report,
+        generated_artifact_paths=(
+            ["artifacts/generated-image-1234abcd.png"]
+            if generated_image
+            else []
+        ),
     )
     if artifact_requested and not token_available:
         with pytest.raises(
@@ -2064,12 +2100,16 @@ async def test_finish_task_persists_requested_artifact(
     await finish
 
     assert task.status == "partially_completed"
-    expected_paths = (
-        ["artifacts/research.md"] if artifact_requested else []
-    )
-    expected_answer = "Partial answer"
+    expected_paths = []
     if artifact_requested:
-        expected_answer += "\n\nSaved files: `artifacts/research.md`"
+        expected_paths.append("artifacts/research.md")
+    if generated_image:
+        expected_paths.append("artifacts/generated-image-1234abcd.png")
+    expected_answer = "Partial answer"
+    if expected_paths:
+        expected_answer += "\n\nSaved files: " + ", ".join(
+            f"`{path}`" for path in expected_paths
+        )
     assert task.result == expected_answer
     assert task.error is None
     assert task.completion_report == report
@@ -2085,7 +2125,7 @@ async def test_finish_task_persists_requested_artifact(
         and item.type == "task.partially_completed"
     )
     assert completion_event.payload_json["artifact_paths"] == expected_paths
-    assert len(client.requests) == len(expected_paths)
+    assert len(client.requests) == int(artifact_requested)
     if artifact_requested:
         assert client.timeout == 60
         assert client.requests[0][0].endswith(

@@ -50,6 +50,33 @@ services:
               count: all
               capabilities: [gpu]
 
+  comfyui:
+    image: ghcr.io/lecode-official/comfyui-docker:${COMFYUI_IMAGE_TAG:-0.6.3}
+    profiles: ["image-generation"]
+    init: true
+    restart: unless-stopped
+    environment:
+      USER_ID: ${COMFYUI_USER_ID:-1000}
+      GROUP_ID: ${COMFYUI_GROUP_ID:-1000}
+    expose:
+      - "8188"
+    volumes:
+      - type: bind
+        source: ${COMFYUI_MODELS_SOURCE:-./.comfyui/models}
+        target: /opt/comfyui/models
+        read_only: true
+        bind:
+          create_host_path: false
+    tmpfs:
+      - /opt/comfyui/output:size=1073741824,mode=1777
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
   api:
     build:
       context: .
@@ -60,6 +87,7 @@ services:
       MANAGER_MODEL: ${MANAGER_MODEL:-gpt-6.1-sol}
       WORKER_MODEL_PROVIDER: ${WORKER_MODEL_PROVIDER:-openai}
       WORKER_MODEL: ${WORKER_MODEL:-gpt-6-luna}
+      WORKER_IMAGE_PROVIDER: ${WORKER_IMAGE_PROVIDER:-openai}
       WORKER_IMAGE_MODEL: ${WORKER_IMAGE_MODEL:-gpt-image-2.5-sunburst}
       SESSION_COOKIE_SECURE: ${SESSION_COOKIE_SECURE:-true}
       MAX_AGENT_TURNS: ${MAX_AGENT_TURNS:-24}
@@ -72,6 +100,7 @@ services:
       VAULT_MODEL_CATALOG_ROLE_ID_FILE: /run/secrets/vault-model-catalog-role-id
       VAULT_MODEL_CATALOG_SECRET_ID_FILE: /run/secrets/vault-model-catalog-secret-id
       OPENAI_BASE_URL: ${OPENAI_BASE_URL:-https://api.openai.com/v1}
+      COMFYUI_BASE_URL: ${COMFYUI_BASE_URL:-http://comfyui:8188}
       WORKSPACE_ROOT: /var/lib/agent-orchestrator/workspaces
       WORKSPACE_INTERNAL_TOKEN: ${WORKSPACE_INTERNAL_TOKEN:?Set WORKSPACE_INTERNAL_TOKEN in .env}
     group_add:
@@ -113,6 +142,7 @@ services:
       MANAGER_MODEL: ${MANAGER_MODEL:-gpt-6.1-sol}
       WORKER_MODEL_PROVIDER: ${WORKER_MODEL_PROVIDER:-openai}
       WORKER_MODEL: ${WORKER_MODEL:-gpt-6-luna}
+      WORKER_IMAGE_PROVIDER: ${WORKER_IMAGE_PROVIDER:-openai}
       WORKER_IMAGE_MODEL: ${WORKER_IMAGE_MODEL:-gpt-image-2.5-sunburst}
       MAX_CONCURRENT_AGENTS: ${MAX_CONCURRENT_AGENTS:-4}
       MAX_AGENT_ATTEMPTS: ${MAX_AGENT_ATTEMPTS:-3}
@@ -121,6 +151,10 @@ services:
       WORKSPACE_ARTIFACT_TIMEOUT_SECONDS: ${WORKSPACE_ARTIFACT_TIMEOUT_SECONDS:-60}
       WORKSPACE_ARTIFACT_MAX_ATTEMPTS: ${WORKSPACE_ARTIFACT_MAX_ATTEMPTS:-3}
       TAVILY_TIMEOUT_SECONDS: ${TAVILY_TIMEOUT_SECONDS:-20}
+      COMFYUI_ENABLED: ${COMFYUI_ENABLED:-false}
+      COMFYUI_BASE_URL: ${COMFYUI_BASE_URL:-http://comfyui:8188}
+      COMFYUI_TIMEOUT_SECONDS: ${COMFYUI_TIMEOUT_SECONDS:-300}
+      COMFYUI_MAX_IMAGE_BYTES: ${COMFYUI_MAX_IMAGE_BYTES:-20971520}
       TAVILY_SEARCH_SKILL_PATH: /opt/agent-skills/tavily-search/SKILL.md
       PRIVATE_SKILLS_PATH: /opt/private-agent-skills
       OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}

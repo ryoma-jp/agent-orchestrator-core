@@ -10,6 +10,7 @@
 
 | 区分 | 現行実装 | 将来設計・未実装 |
 |---|---|---|
+| 画像生成 | オプションのGPU付きComfyUIサービス、画像用プロバイダーの独立選択とComfyUIチェックポイント一覧、Workerの固定生成Tool、PNG検証・TaskFile保存・最終判定へのパス伝播 | 任意ワークフロー／ノード、カスタムノード、モデル形式別のワークフロー、OpenAI／Ollama画像生成 |
 | 実行基盤 | PostgreSQL、FastAPI、独立API／Worker、PostgreSQLジョブ行のロックと期限付きリース | Worker間のタスク実行リース、fencing token、共有同時実行枠・RPM／TPM制御、複数Worker運用保証 |
 | エージェント実行方式 | OpenAI Agents SDKのAgent／Runnerを共通実行アダプター経由で利用。タスク制御・永続化は独自オーケストレーターに維持 | Handoffs、動的なAgent.as_tool()委譲、Session自動保存、承認用RunStateの永続化 |
 | エージェント | 初回指示の目的を表すタスクタイトルを含む構造化計画、成果物目標・チェックリストによる個別受け入れと最終成果物判定、設定上限付き品質修正、準完了状態、依存関係に沿った読み取り専用サブタスクの並行実行、Tavily公式Agent Skillを指示へ組み込んだTavily CLI検索、入力テキスト添付の計画入力、要求ファイルの構造化出力・Workspace保存、ツール予算超過時の部分成果レビューと追加予算承認、最大3回の設定可能な試行 | ファイル／シェル操作ツール、任意形式添付の解析、副作用操作の承認、タスクSandbox内でのエージェント実行 |
@@ -76,6 +77,7 @@ flowchart TB
             Throttling["呼び出し上限・再試行制御"]
             ToolRegistry["許可済みツールアダプター<br/>引数・権限・リース検査"]
             TavilyAdapter["Tavily CLI実行アダプター"]
+            ComfyUIAdapter["ComfyUI HTTP APIアダプター<br/>固定画像生成グラフ"]
             SkillRegistry["Agent Skill読込・指示組込み"]
             RAGAdapter["RAG検索アダプター"]
             Safety["承認・サンドボックス境界"]
@@ -89,6 +91,7 @@ flowchart TB
             Throttling --> OpenAIClient
             AgentRunner --> ToolRegistry
             ToolRegistry --> TavilyAdapter
+            ToolRegistry --> ComfyUIAdapter
             Orchestrator --> SkillRegistry
             SkillRegistry --> Safety
             Orchestrator --> RAGAdapter
@@ -103,6 +106,7 @@ flowchart TB
     OpenAI["OpenAI API<br/>管理者設定の共通キー"]
     Vault["HashiCorp Vault<br/>KV v2: OpenAI/Tavilyキー"]
     TavilyCLI["Tavily CLI (tvly)"]
+    ComfyUI["ComfyUI container<br/>任意GPU画像生成・内部接続のみ"]
     Tavily["Tavily Search API"]
     Skills["Private Skills"]
     Sandbox["Sandbox service/container<br/>task_idごとの永続Workspace"]
@@ -121,6 +125,7 @@ flowchart TB
     EventStream -->|SSE| UserUI
     OpenAIClient --> OpenAI
     TavilyAdapter --> TavilyCLI
+    ComfyUIAdapter --> ComfyUI
     TavilyCLI --> Tavily
     SkillRegistry --> Skills
     Safety -->|隔離されたコマンド・ファイル操作| Sandbox
@@ -144,11 +149,11 @@ flowchart TB
 | タスクサービス | 永続DBを介したタスク受付・状態変更・ジョブ登録を行い、タスクごとのWorkspaceを確保する。エージェント実行はWorkerへ委譲する |
 | オーケストレーター | Worker内でDBから状態を読み、管理エージェントへ計画・内容評価・統合を依頼する。依存関係に沿った起動、機械的検証、品質修正予算、リース検査、追加指示の検出、状態・イベントの確定をコードで制御する。SDK導入後も維持する |
 | 管理エージェント | 作業の目的・制約を解釈し、計画・チェックリスト・内容評価・修正方針・統合回答を構造化出力する。DB更新、実行権限、上限変更の主体にはしない |
-| サブエージェント | 割り当てられたサブタスクの成果を生成・修正し、許可された読み取り専用ツールを利用する。自己申告の成功を成果の受け入れとはみなさない |
+| サブエージェント | 割り当てられたサブタスクの成果を生成・修正し、許可された読み取り専用ツールを利用する。画像用プロバイダーが有効なComfyUIの場合に限り、要求画像を生成する専用Toolを利用する。自己申告の成功を成果の受け入れとはみなさない |
 | エージェント実行器 | 共通実行アダプターがプロンプト・入力・Pydantic出力型をSDKのAgentへ設定し、Runnerによるモデル／ツールループを実行する。タスク状態は直接確定しない |
 | OpenAIクライアント | Agents SDKからモデル接続アダプターを通じて公式OpenAI Python SDKを呼び出す。各要求直前のVaultキー取得、タイムアウト、限定再試行、必要なJSONフォールバックを維持する。共有RPM／TPM制御・利用量の永続集計は未実装 |
-| Worker | PostgreSQLの実行ジョブを `FOR UPDATE SKIP LOCKED` で取得し、期限付きリースを更新しながら計画・サブタスク実行・品質レビュー／修正・結果統合を行う。内部API経由で許可されたテキスト添付を読み、会話向け回答と要求ファイルを保存する。WorkerイメージにTavily CLIと公式Skill群を導入する |
-| ツール／スキル／Workspace | Workerは公式`tavily-search` Skillと読み取り専用bind mount上のプライベートSkill本文をサブエージェントの指示へ組み込み、登録済みの読み取り専用ツールだけを実行する。APIはTaskFile APIと永続Workspaceを提供する。タスク別実行Sandbox、Terminal、Git操作、RAGは未実装 |
+| Worker | PostgreSQLの実行ジョブを `FOR UPDATE SKIP LOCKED` で取得し、期限付きリースを更新しながら計画・サブタスク実行・品質レビュー／修正・結果統合を行う。内部API経由で許可されたテキスト添付を読み、会話向け回答と要求ファイルを保存する。WorkerイメージにTavily CLIと公式Skill群を導入し、設定時はComfyUIへ内部HTTP接続する |
+| ツール／スキル／Workspace | Workerは公式`tavily-search` Skillと読み取り専用bind mount上のプライベートSkill本文をサブエージェントの指示へ組み込み、既定では登録済みの読み取り専用ツールだけを実行する。画像用プロバイダーがComfyUIの場合のみ、固定ワークフローで生成画像をWorkspaceへ保存する専用`writes_data` Toolを追加する。一般の副作用ツール、タスク別Sandbox、Terminal、Git操作、RAGは未実装 |
 | 永続化 | PostgreSQLにタスク状態、保留中のツール予算承認、TaskFileメタデータ、削除ジョブを保存し、ファイル内容はタスクUUID別Workspaceボリュームに保存する。副作用承認・要約・タスク実行リースは未実装 |
 | SSE配信 | PostgreSQLに保存済みのイベントを取得して順序付きでクライアントに配信し、Last-Event-IDによる再接続を支援 |
 
@@ -242,13 +247,13 @@ flowchart TB
 
 ### 4.3 サブエージェント
 
-現行実装ではサブタスクごとに設定済みWorkerモデルを用い、同一タスク内の独立した依存関係レベルを最大32件まで並行実行する。必要に応じてTavily公式`tavily-search` Skillの手順に基づく読み取り専用Web検索や、計画で選択されたプライベートSkillを利用できる。プライベートSkillはWorkerに読み取り専用bind mountされたディレクトリから実行ごとに読み込む。出力は `SubtaskResult`（`succeeded`／`partial`／`needs_input`／`failed`、summary、findings、sources、tool_runs、questions、error）で検証する。サブタスク個別の再開、Worker間の共有レート制限はない。OpenAI Agents SDKにAgent Skillsの自動ローダーやシェル実行器はないため、WorkerがSkill本文を指示へ明示的に組み込み、検索専用Function Toolが固定されたCLIコマンドを実行する。モデルには任意シェルを公開しない。
+現行実装ではサブタスクごとに設定済みWorkerモデルを用い、同一タスク内の独立した依存関係レベルを最大32件まで並行実行する。必要に応じてTavily公式`tavily-search` Skillの手順に基づく読み取り専用Web検索や、計画で選択されたプライベートSkillを利用できる。ComfyUIが有効で画像用プロバイダーに選択されている場合は、ユーザーが要求した画像を生成する専用Toolも利用できる。プライベートSkillはWorkerに読み取り専用bind mountされたディレクトリから実行ごとに読み込む。出力は `SubtaskResult`（`succeeded`／`partial`／`needs_input`／`failed`、summary、findings、sources、tool_runs、questions、error）で検証する。サブタスク個別の再開、Worker間の共有レート制限はない。OpenAI Agents SDKにAgent Skillsの自動ローダーやシェル実行器はないため、WorkerがSkill本文を指示へ明示的に組み込み、検索専用Function Toolが固定されたCLIコマンドを実行する。モデルには任意シェルを公開しない。
 
 サブタスクの構造化出力は`SubtaskResult`（`succeeded`／`partial`／`needs_input`／`failed`、summary、findings、sources、tool_runs、questions、error）で検証する。ツール予算到達時は`partial`を返し、実行済みの検索結果・記録とともに管理エージェントの受け入れ判定へ進める。成果物はこの結果を指し、独立した中間成果物ファイルやストレージはない。受け入れ可否はサブエージェントの自己申告ではなく管理エージェントのチェックリスト判定で決め、修正時は未達項目と不足内容を渡す。
 
 ### 4.4 Tool Callingと構造化データ
 
-現行Workerはサブタスク実行に限りAgents SDKのFunction Toolsを通じてTavily検索を呼び出す。検索Function Toolは固定された`tvly search - --max-results <n> --json`だけを起動し、検索queryはstdinへ渡す。Tavily HTTPエンドポイントをアプリケーションから直接呼ばない。ツール名と引数を登録内容・JSON Schemaで検証する。サブタスクの初期上限はタスク作成時の`config_snapshot.max_tool_calls_per_subtask`（既定20回、設定範囲0〜100）とし、失敗・中断・形式再試行・品質修正・Worker再取得で使用数をリセットしない。上限到達時はCLIを起動せず、Runnerを部分結果のStructured Outputへ誘導する。管理エージェントが追加調査を必須と判定した場合、ユーザーの明示承認1回につき同じタスク設定スナップショットの初期上限と同数を追加する。承認回数・累積許可数にアプリケーション上限は設けず、追加調査の費用と継続判断はユーザーに委ねる。初期上限が0の場合は承認要求を出さず、部分結果を統合する。単一Runnerのツール呼び出し上限は100回とし、承認済み残数がそれを超える場合はRunner実行を複数回に分割する。計画、サブタスク結果、レビュー、統合応答はPydantic型をAgentのoutput_typeへ設定してStructured Outputsで要求し、非対応の場合は通常JSONへ切り替えて同じ型で検証する。統合応答の要求ファイル本文も構造化出力として検証する。Tavily以外のツール実装と副作用ツールは未実装である。
+現行Workerはサブタスク実行に限りAgents SDKのFunction Toolsを通じてTavily検索を呼び出し、画像用プロバイダーがComfyUIの場合は要求画像を生成する専用Toolも登録する。検索Function Toolは固定された`tvly search - --max-results <n> --json`だけを起動し、検索queryはstdinへ渡す。Tavily HTTPエンドポイントをアプリケーションから直接呼ばない。ComfyUI Toolは固定生成グラフだけを送信し、画像プロンプトから任意ワークフローやノードを構成させない。ツール名と引数を登録内容・JSON Schemaで検証する。サブタスクの初期上限はタスク作成時の`config_snapshot.max_tool_calls_per_subtask`（既定20回、設定範囲0〜100）とし、失敗・中断・形式再試行・品質修正・Worker再取得で使用数をリセットしない。上限到達時は外部Toolを起動せず、Runnerを部分結果のStructured Outputへ誘導する。管理エージェントが追加調査を必須と判定した場合、ユーザーの明示承認1回につき同じタスク設定スナップショットの初期上限と同数を追加する。承認回数・累積許可数にアプリケーション上限は設けず、追加調査の費用と継続判断はユーザーに委ねる。初期上限が0の場合は承認要求を出さず、部分結果を統合する。単一Runnerのツール呼び出し上限は100回とし、承認済み残数がそれを超える場合はRunner実行を複数回に分割する。計画、サブタスク結果、レビュー、統合応答はPydantic型をAgentのoutput_typeへ設定してStructured Outputsで要求し、非対応の場合は通常JSONへ切り替えて同じ型で検証する。統合応答の要求ファイル本文も構造化出力として検証する。ComfyUIの専用画像生成Tool以外の一般ツール実装と、副作用操作の承認を要するToolは未実装である。
 
 現行実装のサブタスク結果:
 
@@ -448,6 +453,14 @@ APIはタスク、初期メッセージ、イベント、ジョブをDBへコミ
 
 各サービスは非rootユーザーで実行し、可能な範囲で読み取り専用ルートファイルシステム、ヘルスチェック、graceful shutdownを設定する。タスクSandbox単位のCPU・メモリ・ストレージ上限は初期設計では保留し、問題が確認された場合に使用状況に基づき対策する。Worker終了時は新しいジョブの取得を止め、実行中ジョブの状態・リースを安全に解放または期限切れにする。Compose等の単一ホスト構成は初期デプロイに適するが、高可用性や複数ホストへの拡張時にはPostgreSQLをマネージドサービス等へ移し、ジョブのリース・排他制御が全ワーカーで共有されることを維持する。
 
+## 5.5 ComfyUI画像生成サービス
+
+画像生成はComfyUI Dockerを独立サービスとして実行し、Workerから内部HTTP APIで利用する。Composeの`image-generation`プロファイルでのみ起動し、公式`ghcr.io/lecode-official/comfyui-docker`イメージを使用する。イメージタグは設定可能とし、既定値は検証対象の固定タグとする。ComfyUIはGPU予約を行い、モデルディレクトリをホストから読み取り専用でマウントする。モデルファイルの追加・更新はサービス停止中にホスト側で行う。生成出力はComfyUIコンテナ内の一時領域とし、タスクWorkspaceへの保存後に永続コピーを残さない。
+
+ComfyUIの8188番ポートはComposeネットワーク内だけで公開し、ホストポートやnginxへ公開しない。Workerだけがサービスへ接続し、ブラウザーからComfyUI UIやAPIへ直接接続させない。WorkerにDockerソケット、モデルディレクトリ、ComfyUIのファイルシステムアクセスは与えない。ComfyUIを使うWorkerでは`COMFYUI_ENABLED`と内部接続先を設定し、WorkerとComfyUIの両方を起動する。通常のWorker運用ではGPUサービスを必須にしない。
+
+初期実装はComfyUIの標準`CheckpointLoaderSimple`を使う固定グラフに限定し、チェックポイント名はタスク作成時に保存される`worker_image_model`から解決する。チェックポイントはモデルディレクトリの`checkpoints/`に配置する。管理画面で画像用プロバイダーにComfyUIを選択した場合、管理APIはComfyUIの`/object_info/CheckpointLoaderSimple`から`ckpt_name`候補を取得して画像モデル欄へ返す。ComfyUIが停止中または一覧取得に失敗した場合はプロバイダー別エラーを表示し、候補外のファイル名も手入力できる。ComfyUI以外の画像モデル候補は各プロバイダーの一覧APIから取得するが、OpenAI／Ollamaによる画像生成実行は未実装である。任意ワークフロー、任意ノード、カスタムノードの動的実行、画像編集は対象外であり、モデル固有のノード構成を必要とする場合は別途設計する。
+
 ## 6. タスク実行・状態管理
 
 ### 6.1 状態遷移
@@ -566,7 +579,7 @@ Runnerターン上限は既定24・許容範囲1〜64、サブタスクの初期
 
 プライベートSkillは`.ai_agent_base/private_skills/<skill-name>/SKILL.md`に配置し、ComposeのWorkerだけがホストディレクトリを`/opt/private-agent-skills`へ読み取り専用bind mountする。既定のホストパスは`./.ai_agent_base/private_skills`で、`PRIVATE_SKILLS_SOURCE`により変更できる。Skill本文をWorkerイメージへコピーせず、ホスト上の更新は次回の計画カタログ取得またはサブエージェント実行時の読込に反映する。Workerは計画時にディレクトリ直下の有効なSkill名と説明を列挙し、管理エージェントに候補として渡す。計画の`skill_names`は候補内の名前を最大2件まで指定し、PostgreSQLのSubtaskへ保存する。サブエージェント実行ごとに指定された`SKILL.md`を再読込するため、保存済み計画の再試行でも最新の内容を使う。
 
-Skill名は小文字英数字とハイフンからなるディレクトリ名とfront matterの`name`が一致するものに限り、シンボリックリンク、ルート外パス、壊れた／過大なファイルは候補から除外する。計画保存時に選択名を現在の候補と照合し、実行時にSkillが削除・破損していれば明示的に失敗させる。Skill本文は信頼された管理対象の指示として扱うが、既存の読み取り専用Tool Registryの権限を越えず、シェル・ファイル変更・副作用Toolを追加しない。モデル出力が選んだSkill名だけで認可や実行可能範囲を拡張しない。
+Skill名は小文字英数字とハイフンからなるディレクトリ名とfront matterの`name`が一致するものに限り、シンボリックリンク、ルート外パス、壊れた／過大なファイルは候補から除外する。計画保存時に選択名を現在の候補と照合し、実行時にSkillが削除・破損していれば明示的に失敗させる。Skill本文は信頼された管理対象の指示として扱うが、登録済みToolの権限を越えず、シェルやファイル操作を追加しない。ComfyUIの専用`writes_data` ToolはSkillとは独立して画像プロバイダー設定に基づき登録し、モデル出力やSkill本文だけで認可・実行範囲を拡張しない。
 
 ### 7.2 プライベート資産の配置
 
@@ -602,11 +615,11 @@ flowchart TB
 
 ### 7.4 共通ツール連携
 
-ツールはモデルやエージェント固有の実装から分離し、共通契約と登録済みアダプターを通じて実行する。現行実装はWorkerに共通Tool Registry／Function Calling境界を持ち、Tavily CLI検索だけを登録する。ツール定義は一意な名前・バージョン、説明、引数JSON Schema、リスク分類、実行タイムアウト、構造化された結果・エラー形式を持つ。Tavily公式Agent Skillは検索の使い分けとCLIの利用規約を記述し、Workerがサブエージェントの指示に組み込む。実行器は引数を検証して非同期にCLIを起動し、Skill本文に任意コマンドの実行権限を与えない。Tavilyなど外部サービス固有の形式はアダプター内で共通結果へ正規化し、複数ツールの管理UIは将来拡張とする。
+ツールはモデルやエージェント固有の実装から分離し、共通契約と登録済みアダプターを通じて実行する。現行実装はWorkerに共通Tool Registry／Function Calling境界を持ち、Tavily CLI検索と、画像用プロバイダーがComfyUIの場合に限る固定画像生成Toolを登録する。ツール定義は一意な名前・バージョン、説明、引数JSON Schema、リスク分類、実行タイムアウト、構造化された結果・エラー形式を持つ。Tavily公式Agent Skillは検索の使い分けとCLIの利用規約を記述し、Workerがサブエージェントの指示に組み込む。実行器は引数を検証し、Tavilyは固定CLIを、ComfyUIは固定ワークフローだけを実行する。Skill本文に任意コマンドやワークフローの実行権限を与えない。Tavilyなど外部サービス固有の形式はアダプター内で共通結果へ正規化し、複数ツールの管理UIは将来拡張とする。
 
-Tool Callingの制御ループと実行判断はWorker側が担う。モデルが返したツール名と引数は登録済みツールの許可リストおよびJSON Schemaで検証してから実行し、未登録ツールや不正な引数は実行しない。副作用操作の承認機構が未実装の現行Registryは`read_only`以外のツールをモデルへ公開せず、実行要求も拒否する。ツール予算の追加承認はこの権限境界を変更せず、既登録の読み取り専用ツールの累積上限だけを増やす。ツールの利用可否はタスク実行時の設定で制限し、モデル出力だけで権限やネットワーク許可範囲を拡張できないようにする。ツールの実行要求・結果・エラーはタスクに紐付けて記録し、再試行はリスク分類と冪等性を考慮する。副作用を伴うツールは承認境界を通し、ファイル・シェル操作はWorker上で直接実行せずSandboxへ委譲する。
+Tool Callingの制御ループと実行判断はWorker側が担う。モデルが返したツール名と引数は登録済みツールの許可リストおよびJSON Schemaで検証してから実行し、未登録ツールや不正な引数は実行しない。既定Registryは`read_only`だけを公開する。画像用プロバイダーがComfyUIで、ComfyUIが有効な場合に限り、固定ワークフローとタスク成果物パスに限定した専用`writes_data`画像Toolを明示登録する。これは一般の副作用Toolを許可せず、任意ファイル操作・外部更新・シェル実行は引き続き拒否する。ツール予算の追加承認は登録済み機能の総呼び出し上限だけを増やし、新しいツール種別や権限を付与しない。ツールの利用可否はタスク設定で制限し、モデル出力だけで権限やネットワーク許可範囲を拡張できないようにする。ツールの実行要求・結果・エラーはタスクに紐付けて記録し、再試行はリスク分類と冪等性を考慮する。副作用を伴う一般ツールは承認境界を通し、ファイル・シェル操作はWorker上で直接実行せずSandboxへ委譲する。
 
-SDK導入後も実行場所はWorker内とし、モデルとツール結果の往復をRunnerへ移す。サブエージェント実行では公式`tavily-search` Skill本文をAgent指示へ組み込むが、SDKに自動Skill実行機能があるとはみなさない。SDKへ登録するのはアプリケーションが許可した検索専用Function Toolだけとし、実行直前に引数・権限・リース・呼び出し予算を検査する。Function ToolはVaultから検索のたびに最新キーを取得し、`TAVILY_API_KEY`として子プロセス環境へ一時的に渡して`tvly search`を起動する。コマンドは引数配列で組み立て、shellを介さず、任意URL・任意サブコマンドを許可しない。標準出力はJSONとして解析し、応答サイズ・結果数・本文長・URL schemeを検証する。標準エラーやキーをログ・DBへ保存しない。CLIが返した出典と実行記録は実際の結果から既存のサブタスク結果へ付加する。SDK既定のツール例外処理に依存せず、入力・権限違反、CLI障害、リース喪失を区別する。特にリース喪失やキャンセルは子プロセスを停止し、モデル向けの通常ツール結果へ変換して実行を続けない。
+SDK導入後も実行場所はWorker内とし、モデルとツール結果の往復をRunnerへ移す。サブエージェント実行では公式`tavily-search` Skill本文をAgent指示へ組み込むが、SDKに自動Skill実行機能があるとはみなさない。SDKへ登録するToolはアプリケーションが許可したものに限り、実行直前に引数・権限・リース・呼び出し予算を検査する。Tavily用Function Toolは検索のたびにVaultから最新キーを取得し、`TAVILY_API_KEY`として子プロセス環境へ一時的に渡して固定された`tvly search`を起動する。コマンドは引数配列で組み立て、shellを介さず、任意URL・任意サブコマンドを許可しない。標準出力はJSONとして解析し、応答サイズ・結果数・本文長・URL schemeを検証する。標準エラーやキーをログ・DBへ保存しない。画像用プロバイダーがComfyUIの場合に限り、専用Function Toolから固定グラフを内部ComfyUI APIへ送信し、検証済みPNGだけをWorkspace APIへ保存する。標準エラーや画像バイト列を会話・イベント・ログへ保存しない。Tavily出典とComfyUI成果物パスは実行結果から既存のサブタスク記録へ付加する。SDK既定のツール例外処理に依存せず、入力・権限違反、サービス障害、リース喪失を区別する。リース喪失やキャンセルは実行中の処理を止め、モデル向けの通常ツール結果へ変換して継続しない。
 
 ツールが外部サービスへ送信する情報は、実行に必要な最小限の入力に限定する。会話全体、システムプロンプト、認証情報、その他の秘密情報を無条件に転送しない。外部送信がタスク内容の機微性に照らして許可できない場合は呼び出しを行わず、理由をタスク結果に示す。ツール応答や取得文書は信頼できないデータとして扱い、その中の指示をシステム指示やユーザー指示として実行しない。
 
@@ -619,6 +632,14 @@ SDK導入後も実行場所はWorker内とし、モデルとツール結果の�
 Tavily APIキーはVaultの`VAULT_TAVILY_KEY_PATH`からWorker用AppRoleで検索ごとに読み取る。キーはコマンド引数・Skill本文・モデル入力・CLI設定ファイルへ含めず、`TAVILY_API_KEY`としてCLI子プロセスの環境へ一時的に渡す。DB、イベント、ログ、ブラウザー、永続ファイルへ保存・返却しない。検索クエリは必要最小限とし、APIキー・Bearer token・メールアドレス等の代表的なパターンを引数検証で拒否する。この検査は一般的な個人情報や秘密情報を完全に検出するものではない。CLIのタイムアウト、再試行回数、標準出力サイズ、子プロセスの終了をWorker側で制限する。Workerプロセス内のレート制御は30回／分とし、Worker間の共有レート制御は未実装である。ドメイン許可・拒否リストや検索オプションの管理UIは未実装である。
 
 現行実装は`tavily-search` Skillを通じた読み取り専用検索に限定する。Extract、Crawl、Map、Research Skillのエージェント向け実行、他プロバイダー、ドメイン制限設定、外部更新操作は対象外であり、導入時には承認・Sandbox等の境界を別途設ける。
+
+### 7.6 ComfyUIによる画像生成
+
+Workerで`COMFYUI_ENABLED=true`かつタスク設定の`worker_image_provider`が`comfyui`の場合、サブエージェントには専用Function Tool `comfyui_generate_image`を追加する。これはユーザーが要求した画像の生成に限る`writes_data`機能であり、一般の副作用Toolを許可するものではない。Tool Registryは既定では引き続き`read_only`だけを公開し、この専用ツールを明示的に登録したWorker実行に限って許可する。生成要求は正の／負のプロンプト、単一ファイル名、幅・高さ、ステップ数を受け取り、値域とファイル名を検証する。Workerは固定された標準チェックポイント生成グラフだけをComfyUIへ送信し、モデル出力による任意ワークフローJSONやコマンド実行を受け付けない。
+
+生成完了は有限のタイムアウト内でポーリングし、PNG形式、応答サイズ、出力ファイル名を検証する。Workerはリース・会話sequenceを保存直前に再確認し、検証済み画像を既存の内部Workspace API経由で`artifacts/`へ書き込み、TaskFileメタデータへ登録する。画像バイト列は会話、イベント、モデル入力へ格納しない。サブタスクのツール実行記録にはプロンプトを含めず、登録済みの相対成果物パスだけを記録する。パスは統合入力、`artifact_present`の最終品質判定、完了回答、完了イベントの成果物一覧へ伝播する。生成失敗、ComfyUI未起動、タイムアウト、リース喪失は成功扱いにしない。
+
+ComfyUI生成はサブタスクの既存ツール呼び出し予算を消費する。ツールの要求・実行上限、Worker再試行、品質修正、タスク状態の確定は独自オーケストレーターが維持する。ComfyUI出力は一時領域からWorkspaceへ直ちに複製し、タスク削除時のWorkspace清掃対象を唯一の長期保持先とする。
 
 ## 8. APIとリアルタイムイベント
 
@@ -635,7 +656,7 @@ UIの認証はサーバー側セッションで行い、管理者UIと一般ユ�
 | `POST` | `/api/admin/users/{user_id}/password-reset` | 管理者が初期パスワードを再設定し、次回ログイン時の変更を必須化 |
 | `GET` | `/api/admin/operations/tasks` | タスクID、所有者メール、状態、時刻、エラー情報を取得。指示文・会話本文は返さない |
 | `GET` | `/api/admin/settings` | アプリ運用設定とVaultキー設定状態を取得。キーそのものは返さない |
-| `GET` | `/api/admin/models?provider=openai|ollama` | 管理者が選択したプロバイダーのモデルID一覧をサーバー側で取得。APIキーやOllama認証情報は返さない |
+| `GET` | `/api/admin/models?provider=openai|ollama|comfyui` | 管理者が選択したプロバイダーのモデルID一覧をサーバー側で取得。OpenAIキーやOllama／ComfyUI内部接続情報は返さない |
 | `PUT` | `/api/admin/settings` | アプリ運用設定をPostgreSQLへ保存し、新規タスクの設定として適用 |
 | `PUT` | `/api/admin/secrets/openai-api-key` | 管理者がリクエスト本文の`api_key`をVault KV v2へ登録・更新し、成功後に非秘密の設定済み状態を記録。値は応答へ含めない |
 | `POST` | `/api/account/password` | ログイン中ユーザーが本人確認後にパスワードを変更 |
@@ -809,13 +830,15 @@ SDK導入後の例外は共通実行アダプターで分類し、ターン上�
 
 管理者のRuntime settingsでは、ManagerとWorkerそれぞれについてモデルエンドポイントを`OpenAI`または`Local LLM (Ollama)`から選択し、そのエンドポイントが返すモデルIDを検索可能なドロップダウンから選ぶ。モデル一覧は管理APIが取得し、ブラウザーへAPIキーやOllamaの認証情報を返さない。検索候補にないIDも入力可能とし、モデル一覧が一時的に取得できない場合に管理者が設定を失うことを防ぐ。
 
-Workerは会話モデルと画像生成モデルを別々に設定する。Workerのエンドポイント選択は両方のWorkerモデルIDに適用する。既定値は、ManagerがOpenAIの`gpt-6.1-sol`、Worker会話用がOpenAIの`gpt-6-luna`、Worker画像生成用がOpenAIの`gpt-image-2.5-sunburst`である。ManagerとWorkerのエンドポイント既定値はいずれもOpenAIとする。これらのIDは初期設定値であり、モデル提供状況の保証ではない。
+Worker会話モデルと画像生成モデルは、プロバイダー選択とモデルID選択を独立して持つ。Manager／Worker会話用プロバイダーは`OpenAI`または`Local LLM (Ollama)`、画像生成用プロバイダーは`OpenAI`、`Local LLM (Ollama)`、`ComfyUI`から選択する。画像モデル候補一覧は画像用プロバイダーだけを参照し、Worker会話用プロバイダーの選択では切り替わらない。既定値は、ManagerがOpenAIの`gpt-6.1-sol`、Worker会話用がOpenAIの`gpt-6-luna`、画像用プロバイダーがOpenAI、画像モデルIDが`gpt-image-2.5-sunburst`である。これらのIDは初期設定値であり、モデル提供状況の保証ではない。
 
-モデル一覧APIはOpenAIのモデル一覧とCompose内のOllamaサービスに対する`/api/tags`をサーバー側で取得し、モデルIDの配列として返す。OpenAI一覧取得はOpenAI APIのモデル一覧エンドポイントを使用し、APIキー読取専用の専用Vault AppRoleを用いる。Ollama接続先は`http://ollama:11434`に固定する。モデル一覧取得の失敗はプロバイダー別の取得エラーとしてUIに示す。
+モデル一覧APIはOpenAIのモデル一覧、Compose内のOllamaサービスに対する`/api/tags`、ComfyUIのチェックポイント候補をサーバー側で取得し、モデルIDの配列として返す。OpenAI一覧取得はOpenAI APIのモデル一覧エンドポイントを使用し、APIキー読取専用の専用Vault AppRoleを用いる。Ollama接続先は`http://ollama:11434`に固定し、ComfyUI接続先は`COMFYUI_BASE_URL`を使用する。ComfyUI候補はComfyUI APIの`/object_info/CheckpointLoaderSimple`が返す`ckpt_name`選択肢とし、Worker会話用モデル一覧とは独立させる。モデル一覧取得の失敗はプロバイダー別の取得エラーとしてUIに示す。
 
-新規タスク作成時はManager／Workerのプロバイダー、ManagerモデルID、Worker会話モデルID、Worker画像生成モデルIDを既存の`config_snapshot`へコピーする。既存タスクは保存済みスナップショットを優先し、プロバイダー追加前のタスクはOpenAIを選択したものとして解釈する。管理画面での変更は新規タスクだけに適用し、DB列追加マイグレーションは不要とする。
+新規タスク作成時はManager／Worker会話プロバイダー、Worker画像生成プロバイダー、各モデルIDを既存の`config_snapshot`へコピーする。`worker_image_provider`は管理設定JSONとタスクスナップショットへ保存し、DB列追加マイグレーションは不要とする。既存管理設定でこのキーが欠落する場合はOpenAIを既定値とする。既存タスクのスナップショットにキーがない場合は、ComfyUIが有効ならComfyUI、そうでなければWorker会話プロバイダーとして解釈する。管理画面での変更は新規タスクだけに適用する。
 
-ManagerとWorkerの会話実行では、OpenAI選択時に既存のOpenAI Responses API経路とVault管理キーを使用する。Ollama選択時はOllamaのOpenAI互換Chat Completions APIを使用し、Responses APIのみに依存する機能を呼び出さない。ローカル実行のためのAPIキーは固定のダミー値とし、Vaultキーを読み取らない。画像生成モデルIDは独立した設定値としてスナップショットへ保存するが、この変更自体は画像生成APIや画像成果物生成を実装するものではない。画像生成実行を追加する場合は、選択したプロバイダーがその機能を提供するかを別途検証する。
+画像生成プロバイダーにComfyUIを選択した場合、Worker画像モデル欄の候補一覧はComfyUI `models/checkpoints/`内のチェックポイント名から取得する。候補取得に失敗しても管理者は候補外の名前を手入力できる。画像生成プロバイダーはWorker会話モデルのプロバイダーと別にタスクへ保存する。
+
+ManagerとWorkerの会話実行では、OpenAI選択時に既存のOpenAI Responses API経路とVault管理キーを使用する。Ollama選択時はOllamaのOpenAI互換Chat Completions APIを使用し、Responses APIのみに依存する機能を呼び出さない。ローカル実行のためのAPIキーは固定のダミー値とし、Vaultキーを読み取らない。画像用プロバイダーとモデルIDは会話モデル設定から独立してスナップショットへ保存する。現行の画像生成実行はComfyUI選択時に限り固定チェックポイントワークフローで行い、OpenAI／Ollama画像生成の実行は未実装である。
 
 ## 13. 設定・デプロイ
 
@@ -823,7 +846,7 @@ Python 3.10で実行検証した`openai-agents==0.24.0`、`openai==3.35.1`、`py
 
 Runnerターン上限とサブタスクのツール総数上限はサーバー側環境設定から初期化し、APIが新規タスクの設定スナップショットに保存する。管理UIへは公開せず、既存API／UI契約を維持する。既存タスクのスナップショットに新項目がない場合は固定互換既定値24・20を適用し、実行時の最新管理設定で上限を変えない。
 
-現行実装の管理画面から変更できる運用設定にはManager／WorkerのモデルエンドポイントとモデルID、Workerの会話／画像生成モデルID、タスク内同時サブタスク数、最大試行回数、サブタスク単位とタスク全体の品質修正上限が含まれる。Vault接続・DB接続・Cookie設定等は環境設定で与える。設定更新は新規タスクへ適用し、既存タスクは作成時の`config_snapshot`を使う。画像生成モデルIDは保存・選択できるが、画像生成処理自体は未実装である。承認、Sandbox通信許可、利用量・コスト等の設定は存在しない。
+現行実装の管理画面から変更できる運用設定にはManager／Worker会話モデルのエンドポイントとモデルID、独立したWorker画像生成プロバイダーとモデルID、タスク内同時サブタスク数、最大試行回数、サブタスク単位とタスク全体の品質修正上限が含まれる。ComfyUI候補はComfyUI APIから取得する。Vault接続・DB接続・Cookie設定等は環境設定で与える。設定更新は新規タスクへ適用し、既存タスクは作成時の`config_snapshot`を使う。画像生成はComfyUI選択時の固定チェックポイントワークフローを実装し、OpenAI／Ollama画像生成の実行は未実装である。承認、Sandbox通信許可、利用量・コスト等の設定は存在しない。
 
 | デプロイ設定 | 内容 |
 |---|---|
@@ -832,6 +855,7 @@ Runnerターン上限とサブタスクのツール総数上限はサーバー�
 | `MANAGER_MODEL` | 管理者画面での初期ManagerモデルID。既定値は`gpt-6.1-sol` |
 | `WORKER_MODEL` | 管理者画面での初期Worker会話モデルID。既定値は`gpt-6-luna` |
 | `WORKER_IMAGE_MODEL` | 管理者画面での初期Worker画像生成モデルID。既定値は`gpt-image-2.5-sunburst` |
+| `WORKER_IMAGE_PROVIDER` | 管理者画面での初期Worker画像生成プロバイダー。既定値は`openai`。選択肢は`openai`／`ollama`／`comfyui` |
 | `INITIAL_ADMIN_EMAIL` | 初回起動時に作成する初期管理者のメールアドレス |
 | `INITIAL_ADMIN_PASSWORD` | 初期管理者作成用の初期パスワード。Secret Store等から一時注入し、初期化後は除去 |
 | `SESSION_COOKIE_SECURE` | セッションCookieの`Secure`属性。TLS終端環境ではtrueに設定 |
@@ -852,8 +876,13 @@ Runnerターン上限とサブタスクのツール総数上限はサーバー�
 | `VAULT_WORKER_ROLE_ID_SOURCE` / `VAULT_WORKER_SECRET_ID_SOURCE` | ComposeでWorker用AppRole資格情報を読み取り専用マウントするホスト側パス |
 | `VAULT_MODEL_CATALOG_ROLE_ID_FILE` / `VAULT_MODEL_CATALOG_SECRET_ID_FILE` | OpenAIモデル一覧専用の読取ロール資格情報をAPIへ渡すファイル |
 | `VAULT_MODEL_CATALOG_ROLE_ID_SOURCE` / `VAULT_MODEL_CATALOG_SECRET_ID_SOURCE` | Composeでモデル一覧専用ロール資格情報を読み取り専用マウントするホスト側パス |
+| `COMFYUI_ENABLED` / `COMFYUI_BASE_URL` | WorkerのComfyUI生成Toolを有効化する真偽値（既定false）と内部接続先（既定`http://comfyui:8188`）。有効化時はComposeの`image-generation`プロファイルも起動 |
+| `COMFYUI_IMAGE_TAG` | ComfyUI Dockerイメージのタグ（既定`0.6.3`）。更新時はGPU・モデル形式との組合せを再検証 |
+| `COMFYUI_MODELS_SOURCE` | ComfyUIの`/opt/comfyui/models`へ読み取り専用マウントするホスト側ディレクトリ。チェックポイントは`checkpoints/`へ配置 |
+| `COMFYUI_USER_ID` / `COMFYUI_GROUP_ID` | ComfyUIコンテナのモデルディレクトリ所有者に合わせる実行UID／GID |
+| `COMFYUI_TIMEOUT_SECONDS` / `COMFYUI_MAX_IMAGE_BYTES` | 生成処理全体の有限タイムアウトと取得画像の最大サイズ。過大な応答は保存前に拒否 |
 
-管理設定の初期値はモデルエンドポイント、`MANAGER_MODEL`、`WORKER_MODEL`、`WORKER_IMAGE_MODEL`、`MAX_CONCURRENT_AGENTS`、`MAX_AGENT_ATTEMPTS`と品質修正上限の環境変数から取得する。管理画面での変更は新規タスクに適用し、エンドポイントと3種のモデルIDをタスクの`config_snapshot`へ保存する。OpenAI APIキーを保持する`OPENAI_API_KEY`環境変数は使用しない。
+管理設定の初期値は会話モデルエンドポイント、`MANAGER_MODEL`、`WORKER_MODEL`、`WORKER_IMAGE_PROVIDER`、`WORKER_IMAGE_MODEL`、`MAX_CONCURRENT_AGENTS`、`MAX_AGENT_ATTEMPTS`と品質修正上限の環境変数から取得する。管理画面での変更は新規タスクに適用し、会話／画像プロバイダーと各モデルIDをタスクの`config_snapshot`へ保存する。OpenAI APIキーを保持する`OPENAI_API_KEY`環境変数は使用しない。
 
 現行Composeはnginx（HTTP port 8080）、Admin UI、User UI、API、PostgreSQLを起動し、任意で開発Vaultと1つのWorkerを起動する。nginx設定はTLS終端を行わないため、本番TLSは前段のロードバランサー等で提供する。SSE経路はnginxバッファリングを無効にし、長時間接続を許容する。Workerの複数レプリカ運用は共有タスクリース／レート制御がないため対象外である。
 
@@ -863,6 +892,7 @@ Runnerターン上限とサブタスクのツール総数上限はサーバー�
 
 | 機能領域 | 現行実装状況 |
 |---|---|
+| 画像生成 | `image-generation`プロファイルのGPU付きComfyUI、独立した画像プロバイダー選択、ComfyUIチェックポイント候補一覧を実装。固定チェックポイント生成ToolはPNGを検証してTaskFile付きWorkspace成果物へ保存し、最終判定・完了回答・SSEへパスを伝播。OpenAI／Ollama画像生成と任意ワークフロー／ノード実行は未実装 |
 | アカウント・認証 | Webセッション、CSRF、Bearerアクセスキー、管理者によるユーザー作成／パスワード再設定を実装 |
 | タスク・会話 | タスク作成、追加メッセージ、キャンセル、所有者スコープ、終端タスクの非同期削除要求を実装。Workspace清掃後にDB cascade |
 | エージェント実行 | 構造化計画、依存関係付き読み取り専用サブタスク、質問待ち、結果統合を実装 |
@@ -879,6 +909,8 @@ Runnerターン上限とサブタスクのツール総数上限はサーバー�
 
 | 観点 | 受け入れ条件 |
 |---|---|
+| 画像モデル選択 | 画像生成プロバイダー選択はWorker会話プロバイダーから独立し、OpenAI／Ollama／ComfyUIを切り替えられる。ComfyUI選択時は管理APIがComfyUIのチェックポイント一覧を返し、Worker会話用モデル一覧と混在しない。プロバイダーとモデルは新規タスクの`config_snapshot`へ保存され、ComfyUI一覧取得失敗時も手入力できる |
+| ComfyUI画像生成 | GPU付きComfyUIは任意プロファイルで内部接続に限定され、画像プロバイダーがComfyUIの場合だけWorkerの専用Toolを登録する。固定ワークフロー、値域・PNG・サイズ・タイムアウト・リース検査を通過した画像だけをTaskFileとして保存し、成功パスが最終判定・回答・SSEへ引き継がれる。サービス未起動・生成失敗・不正出力を成功扱いにしない |
 | SDKと作業管理の分離 | 計画・サブタスク実行・レビュー・統合をSDKで実行でき、Task／Subtask／Jobは既存DBで管理される。Runner終了だけで受け入れ済み・タスク成功にせず、既存の品質条件で確定する |
 | SDK実行コンテキスト | 同じAgent定義を並行利用しても、別タスク・別サブタスクの入力、履歴、結果が混在しない。会話・計画・判定の正本はPostgreSQLにあり、自動Session保存によりユーザー会話を二重記録しない |
 | SDK実行の上限・復旧 | Runnerターン数、ツール総数、モデル/API再試行、品質修正、Workerジョブ再試行がそれぞれ有限上限で停止する。SDK／HTTPの再試行で上限が増幅せず、再取得・修正でもツール予算がリセットされない。受け入れ済み成果を理由なく再実行しない |
@@ -917,6 +949,8 @@ Runnerターン上限とサブタスクのツール総数上限はサーバー�
 | Worker状態管理 | 各実行チェックポイントでDBの最新会話・計画状態を読み、処理結果をDBへ保存する。Worker内キャッシュは正本として使わない |
 | 追加指示 | 実行中の呼び出しを完了・保存してから最新指示を再読込し、承認待ち中は承認状態を変更せず、承認／却下後に指示を含めて再計画する |
 | キュー復旧 | Worker停止後に未完了ジョブを再取得でき、実行結果が不明な副作用処理は自動再実行せず要確認状態になる |
+
+| ComfyUI画像生成 | `image-generation`プロファイルでGPU付きComfyUIを内部限定で起動し、Workerの専用Toolから固定チェックポイントワークフローを実行する。チェックポイント名・寸法・ステップ数・タイムアウト・PNGサイズを検証し、リース確認後に画像をTaskFile付きWorkspace成果物として保存する。任意ワークフロー／ノード実行はできず、保存済み相対パスが最終判定・回答・SSEに伝播する。ComfyUI未起動・失敗時はタスク成功にしない |
 
 ## 15. 主要な設計判断と将来拡張
 

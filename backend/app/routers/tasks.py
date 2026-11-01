@@ -57,6 +57,7 @@ async def create_task(
         "manager_model": settings.manager_model,
         "worker_model_provider": settings.worker_model_provider,
         "worker_model": settings.worker_model,
+        "worker_image_provider": settings.worker_image_provider,
         "worker_image_model": settings.worker_image_model,
         "max_concurrent_agents": settings.max_concurrent_agents,
         "max_agent_attempts": min(max(settings.max_agent_attempts, 1), 3),

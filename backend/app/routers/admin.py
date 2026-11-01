@@ -17,7 +17,7 @@ from app.schemas import (
     AdminTaskSummary,
     CreateUserRequest,
     ModelCatalogView,
-    ModelProvider,
+    ModelCatalogProvider,
     OpenAIKeyRequest,
     PasswordResetRequest,
     TavilyKeyRequest,
@@ -36,6 +36,7 @@ def _default_settings() -> dict:
         "manager_model": settings.manager_model,
         "worker_model_provider": settings.worker_model_provider,
         "worker_model": settings.worker_model,
+        "worker_image_provider": settings.worker_image_provider,
         "worker_image_model": settings.worker_image_model,
         "max_concurrent_agents": settings.max_concurrent_agents,
         "max_agent_attempts": min(max(settings.max_agent_attempts, 1), 3),
@@ -103,7 +104,7 @@ async def update_admin_settings(
 
 @router.get("/models", response_model=ModelCatalogView)
 async def get_model_catalog(
-    provider: ModelProvider,
+    provider: ModelCatalogProvider,
     admin: User = Depends(require_admin),
 ):
     try:

@@ -57,6 +57,20 @@ def normalize_checklist_results(
                 and isinstance(file.get("content"), str)
                 and file["content"].strip()
             ] if isinstance(files, list) else []
+            generated_files = (
+                artifact.get("generated_files", [])
+                if isinstance(artifact, dict)
+                else []
+            )
+            if isinstance(generated_files, list):
+                filenames.extend(
+                    path
+                    for path in generated_files
+                    if isinstance(path, str)
+                    and len(path.split("/")) == 2
+                    and path.startswith("artifacts/")
+                    and path.endswith(".png")
+                )
             passed = bool(filenames)
             evidence = ", ".join(filenames[:5])
             if not passed:

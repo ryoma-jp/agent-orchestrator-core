@@ -5,6 +5,8 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, SecretStr
 
 ModelProvider = Literal["openai", "ollama"]
+ImageModelProvider = Literal["openai", "ollama", "comfyui"]
+ModelCatalogProvider = ImageModelProvider
 
 
 class LoginRequest(BaseModel):
@@ -59,6 +61,7 @@ class AdminSettingsUpdate(BaseModel):
     manager_model: str = Field(min_length=1, max_length=200)
     worker_model_provider: ModelProvider = "openai"
     worker_model: str = Field(min_length=1, max_length=200)
+    worker_image_provider: ImageModelProvider = "openai"
     worker_image_model: str = Field(
         default="gpt-image-2.5-sunburst", min_length=1, max_length=200
     )
@@ -75,7 +78,7 @@ class AdminSettingsView(AdminSettingsUpdate):
 
 
 class ModelCatalogView(BaseModel):
-    provider: ModelProvider
+    provider: ModelCatalogProvider
     models: list[str]
 
 

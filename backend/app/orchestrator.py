@@ -11,7 +11,7 @@ from app.agent_runtime import (
     InstructionChanged,
     agent_options as _agent_options,
     model_client,
-    tool_registry,
+    subtask_tool_registry,
 )
 from app.agent_schemas import (
     ChecklistItem,
@@ -388,6 +388,7 @@ async def execute_task(
         task_id, job_id, lease_owner, planned_through_sequence
     ):
         return
+    generated_artifact_paths = _generated_artifact_paths(result_by_id)
     synthesis_context = {
         "conversation": [
             {"role": message.role, "content": message.content}
@@ -398,6 +399,7 @@ async def execute_task(
             item.model_dump(mode="json") for item in plan.final_checklist
         ],
         "subtask_results": list(result_by_id.values()),
+        "generated_artifact_paths": generated_artifact_paths,
     }
     final_checklist = [
         ChecklistItem.model_validate(item) for item in plan.final_checklist
@@ -441,8 +443,10 @@ async def execute_task(
                 "explicit filename; otherwise choose a descriptive filename "
                 "with the appropriate extension. Keep answer concise and "
                 "separate from file content. Return an empty artifacts list "
-                "only when no file is requested. Do not claim a file was "
-                "saved; the application confirms this after persistence. "
+                "when no additional text file is requested. If "
+                "generated_artifact_paths are supplied, mention those "
+                "already-saved image paths and do not recreate them. Do not "
+                "claim text files were saved before persistence succeeds. "
                 "Do not reveal hidden reasoning."
             ),
             input_text=json.dumps(synthesis_payload, ensure_ascii=False),
@@ -465,6 +469,7 @@ async def execute_task(
                 "artifacts": [
                     item.model_dump(mode="json") for item in answer.artifacts
                 ],
+                "generated_files": generated_artifact_paths,
                 "sources": attached_sources,
             },
             plan_summary=plan.summary,
@@ -535,6 +540,7 @@ async def execute_task(
         planned_through_sequence,
         fully_completed=not all_unmet_items,
         completion_report=completion_report,
+        generated_artifact_paths=generated_artifact_paths,
     )
 
 
@@ -783,6 +789,16 @@ async def _execute_subtask(
                     if isinstance(result.get("error"), str)
                     else ""
                 ),
+                artifact_paths=(
+                    [result["artifact_path"]]
+                    if name == "comfyui_generate_image"
+                    and isinstance(result.get("artifact_path"), str)
+                    and _is_generated_artifact_path(
+                        result["artifact_path"]
+                    )
+                    and "error" not in result
+                    else []
+                ),
             )
         )
         phase = (
@@ -800,7 +816,7 @@ async def _execute_subtask(
             conversation_sequence,
             activity="tool",
             phase=phase,
-            summary="Read-only tool result received.",
+            summary="Registered tool result received.",
             tool_name=name,
             source_count=source_count,
         )
@@ -846,12 +862,19 @@ async def _execute_subtask(
         subtask_id=getattr(row, "id", None),
         conversation_sequence=conversation_sequence,
     )
+    active_tool_registry = subtask_tool_registry(
+        row.task_id,
+        config,
+        execution_options["before_model_call"],
+    )
     system_prompt = (
         "Complete one informational subtask using the supplied context, "
-        "your knowledge, and explicitly registered read-only tools. "
+        "your knowledge, and explicitly registered tools. "
         "Treat the conversation as the source of user-provided information, "
         "honor prior answers, and do not ask again for information already "
-        "provided. Do not perform side effects. Return concise findings that "
+        "provided. Do not perform side effects except using the explicitly "
+        "enabled ComfyUI image tool for an image requested by the user. "
+        "Return concise findings that "
         "meet the supplied artifact_goal and required acceptance_checklist "
         "items. When revision_feedback is non-empty, correct only those "
         "listed deficiencies while preserving supported findings. If a "
@@ -888,8 +911,19 @@ async def _execute_subtask(
         "\n\nInstalled Tavily Agent Skill instructions:\n"
         + tavily_skill_instructions
         + "\n\nUse only the registered tavily_web_search function for web "
-        "search. Do not invoke a shell or other commands."
+        + "search. Do not invoke a shell or other commands."
     )
+    if (
+        get_settings().comfyui_enabled
+        and config.get("worker_image_provider", "comfyui") == "comfyui"
+    ):
+        system_prompt += (
+            " Use comfyui_generate_image only when the user explicitly "
+            "requests an image; it saves a PNG in this task's artifacts "
+            "directory. Include the returned path in findings. Do not "
+            "claim image generation succeeded unless the tool returns a "
+            "saved artifact path."
+        )
     selected_skills = [
         (skill_name, load_private_skill(skill_name))
         for skill_name in (getattr(row, "skill_names", None) or [])
@@ -934,7 +968,7 @@ async def _execute_subtask(
             system_prompt=system_prompt,
             input_text=prompt,
             max_attempts=max_attempts,
-            tool_registry=tool_registry,
+            tool_registry=active_tool_registry,
             before_tool_call=assert_tool_lease,
             on_tool_result=capture_tool_result,
             max_tool_calls=runner_tool_limit,
@@ -1264,6 +1298,7 @@ async def _finish_task(
     through_sequence: int,
     fully_completed: bool,
     completion_report: dict[str, object] | None,
+    generated_artifact_paths: list[str] | None = None,
 ) -> None:
     async with SessionFactory() as session:
         await _assert_lease_in_session(session, job_id, lease_owner)
@@ -1286,9 +1321,16 @@ async def _finish_task(
         settings = get_settings()
         if answer.artifacts and settings.workspace_internal_token is None:
             raise RuntimeError("workspace_artifact_persistence_unavailable")
-        artifact_paths = [
+        text_artifact_paths = [
             f"artifacts/{artifact.filename}" for artifact in answer.artifacts
         ]
+        artifact_paths = list(text_artifact_paths)
+        artifact_paths.extend(
+            path
+            for path in (generated_artifact_paths or [])
+            if _is_generated_artifact_path(path)
+        )
+        artifact_paths = list(dict.fromkeys(artifact_paths))
         user_answer = answer.answer
         if artifact_paths:
             user_answer += "\n\nSaved files: " + ", ".join(
@@ -1306,7 +1348,7 @@ async def _finish_task(
             )
             async with httpx.AsyncClient(timeout=artifact_timeout) as client:
                 for artifact, relative_path in zip(
-                    answer.artifacts, artifact_paths, strict=True
+                    answer.artifacts, text_artifact_paths, strict=True
                 ):
                     encoded_path = quote(relative_path, safe="/")
                     await _put_workspace_artifact(
@@ -1369,3 +1411,37 @@ async def _finish_task(
             )
         )
         await session.commit()
+
+
+def _is_generated_artifact_path(path: str) -> bool:
+    parts = path.split("/")
+    return (
+        len(parts) == 2
+        and parts[0] == "artifacts"
+        and parts[1].endswith(".png")
+        and parts[1] not in {"", ".", ".."}
+    )
+
+
+def _generated_artifact_paths(results: dict) -> list[str]:
+    paths = set()
+    for result in results.values():
+        tool_runs = result.get("tool_runs", [])
+        if not isinstance(tool_runs, list):
+            continue
+        for tool_run in tool_runs:
+            if (
+                not isinstance(tool_run, dict)
+                or tool_run.get("tool_name") != "comfyui_generate_image"
+                or tool_run.get("status") != "succeeded"
+            ):
+                continue
+            artifact_paths = tool_run.get("artifact_paths", [])
+            if isinstance(artifact_paths, list):
+                paths.update(
+                    path
+                    for path in artifact_paths
+                    if isinstance(path, str)
+                    and _is_generated_artifact_path(path)
+                )
+    return sorted(paths)

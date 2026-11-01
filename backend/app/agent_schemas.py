@@ -182,6 +182,7 @@ class ToolExecutionRecord(BaseModel):
     status: Literal["succeeded", "failed"]
     source_count: int = Field(ge=0, le=15)
     error_code: str = Field(max_length=100)
+    artifact_paths: list[str] = Field(default_factory=list, max_length=10)
 
 
 class GeneratedArtifact(BaseModel):

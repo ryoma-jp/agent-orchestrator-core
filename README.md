@@ -4,7 +4,7 @@ PostgreSQL-backed task coordination service with separate API, worker, user UI, 
 
 ## Initial setup
 
-1. Copy `.env.example` to `.env`. Replace the database password with a long random value in both `POSTGRES_PASSWORD` and `DATABASE_URL`, choose a unique administrator password of at least 12 characters, and set `WORKSPACE_INTERNAL_TOKEN` to a separate long random value. The default model settings are OpenAI `gpt-6.1-sol` for Manager, `gpt-6-luna` for Worker conversations, and `gpt-image-2.5-sunburst` for Worker image generation; choose IDs available to your provider in Runtime settings. Set `VAULT_CREDENTIAL_GID` to the host's `id -g` value so the non-root API and Worker can read the group-restricted credential files. Keep `.env` and Vault credentials out of version control.
+1. Copy `.env.example` to `.env`. Replace the database password with a long random value in both `POSTGRES_PASSWORD` and `DATABASE_URL`, choose a unique administrator password of at least 12 characters, and set `WORKSPACE_INTERNAL_TOKEN` to a separate long random value. The default model settings are OpenAI `gpt-6.1-sol` for Manager, `gpt-6-luna` for Worker conversations, and `gpt-image-2.5-sunburst` for the independently selected Worker image provider (default OpenAI); choose the image endpoint separately in Runtime settings. Set `VAULT_CREDENTIAL_GID` to the host's `id -g` value so the non-root API and Worker can read the group-restricted credential files. Keep `.env` and Vault credentials out of version control.
 2. If you have a private skills repository, check it out locally. Replace `<PRIVATE_SKILL_GIT_REPOSITORY_URL>` with its Git URL:
   ```sh
   mkdir -p ./.ai_agent_base
@@ -35,6 +35,7 @@ sh scripts/provision-local-vault.sh
 # DBスキーマを更新してからアプリを起動
 docker compose --profile setup run --build --rm migrate
 docker compose --profile local-vault up -d --build
+docker compose --profile image-generation up -d comfyui
 docker compose --profile local-vault --profile agent up --build -d --force-recreate worker
 ```
 
@@ -59,6 +60,15 @@ The provisioning script configures KV v2 paths and three AppRoles: the API role 
 
 The optional `local-llm` profile runs Ollama in Compose, reserves all host NVIDIA GPUs, and persists model data in the `ollama_data` volume. GPU access requires an NVIDIA driver and NVIDIA Container Toolkit installed on the host and configured for Docker. Start it with `docker compose --profile local-llm up -d ollama`, then download `qwen3.5:9b` and `gemma4:e4b` as shown in Initial setup. API and Worker always connect to the Compose service at `http://ollama:11434`; host-installed or external Ollama endpoints are not supported. The model selector reads Ollama model IDs from `/api/tags`. AMD ROCm configuration is not included.
 
+ComfyUI image generation is an optional GPU-backed Worker tool. Install the host NVIDIA driver and NVIDIA Container Toolkit, create `./.comfyui/models/checkpoints`, and place a ComfyUI-compatible checkpoint there. Set `COMFYUI_ENABLED=true` and `COMFYUI_MODELS_SOURCE=./.comfyui/models` in `.env`, then select **ComfyUI** under the separate **Worker image endpoint** in administrator Runtime settings. The image model list is fetched from ComfyUI and contains its available checkpoint names; the Worker conversational endpoint does not affect this list. `WORKER_IMAGE_PROVIDER` and `WORKER_IMAGE_MODEL` supply initial settings only; saved Runtime settings take precedence. Set `COMFYUI_USER_ID` and `COMFYUI_GROUP_ID` to a host identity that can read the model files. Start the private service and Worker with:
+
+```sh
+docker compose --profile image-generation up -d comfyui
+docker compose --profile local-vault --profile agent up --build -d worker
+```
+
+The ComfyUI port is not published to the host or browser. The service mounts models read-only and keeps its output in temporary storage; generated PNGs are copied into the task Workspace. The initial fixed workflow uses the standard checkpoint loader and supports compatible checkpoint files, not arbitrary ComfyUI workflows or custom nodes. The administrator's Worker image model field accepts the checkpoint filename when ComfyUI is enabled.
+
 Start the independent Worker with `docker compose --profile local-vault --profile agent up --build -d worker`. The Worker does not receive either provider key in its environment; it reads each key from Vault only when making the corresponding request. For an external Vault, grant the Worker AppRole read access to both configured secret paths. Set `SESSION_COOKIE_SECURE=true` when serving through TLS.
 
 ## Agents SDK runtime
@@ -67,7 +77,7 @@ Manager planning, checklist reviews, synthesis, and subtask generation/revision 
 
 The tested Python 3.10 dependency set is `openai-agents==0.24.0`, `openai==3.35.1`, and `pydantic==2.14.1`. OpenAI 3.x uses HTTPX2; the application retains HTTPX for its other integrations and tests use HTTPX2 for the SDK transport. OpenAI model requests, including tool continuations and retries, read the latest Vault key. Ollama requests use the configured OpenAI-compatible Chat Completions endpoint and do not read the OpenAI key. API and format retries share one bounded retry budget, and HTTP-client retries are disabled.
 
-The Worker image-generation model ID is configurable and snapshotted per task, but image-generation execution is not implemented by this release.
+The Worker image provider and model are snapshotted per task, independently from the Worker conversational provider and model. With `worker_image_provider=comfyui` and `COMFYUI_ENABLED=true`, the Worker uses the selected ComfyUI checkpoint to generate requested PNG artifacts through a bounded fixed workflow. OpenAI/Ollama image model catalogs can also be selected, but image generation through those providers is not implemented.
 
 Set `MAX_AGENT_TURNS` (default 24, range 1-64) and `MAX_TOOL_CALLS_PER_SUBTASK` (default 20, range 0-100) in the deployment environment. The API snapshots them when creating a task; they are not administrator UI settings. Existing task snapshots without these fields use fixed compatibility defaults of 24 and 20. Tool usage is consumed before execution and stored on each subtask, including failed/interrupted calls, so format correction, quality revision, and Worker reclaim do not reset the budget. New plan versions have new subtask budgets; earlier usage remains recorded. These limits are separate from model retries and quality revision limits.
 
@@ -115,11 +125,11 @@ rm -rf .local-vault
 
 This also deletes the database volume and dev Vault data. Images shared with other running containers are not removed. It does not prune Docker resources belonging to other projects.
 
-The user UI supports login, task creation, conversation continuation, cancellation, terminal-task deletion, durable SSE replay, password changes, and one-time API-key rotation. The administrator UI supports account provisioning, OpenAI/Ollama endpoint selection, searchable Manager and Worker model IDs (including separate Worker conversation and image-generation IDs), runtime concurrency settings, Vault key updates, and privacy-limited task operations. Agent execution supports structured planning, dependency-aware parallel read-only subtasks, Tavily Web search through the official `tavily-search` Agent Skill and Tavily CLI, source retention/citations, replanning on new user messages, and structured response integration. The Worker loads the skill instructions into subagent prompts and exposes only a fixed search tool; it does not expose a shell, file mutation, or external write tools.
+The user UI supports login, task creation, conversation continuation, cancellation, terminal-task deletion, durable SSE replay, password changes, and one-time API-key rotation. The administrator UI supports account provisioning, OpenAI/Ollama conversation endpoint selection, an independent OpenAI/Ollama/ComfyUI image endpoint and provider-specific model catalog, runtime concurrency settings, Vault key updates, and privacy-limited task operations. Agent execution supports structured planning, dependency-aware parallel read-only subtasks, Tavily Web search through the official `tavily-search` Agent Skill and Tavily CLI, source retention/citations, replanning on new user messages, and structured response integration. The Worker loads the skill instructions into subagent prompts and exposes only a fixed search tool; it does not expose a shell, file mutation, or external write tools.
 
 ## Remaining scope
 
-Additional tool providers and side-effecting tools, human approval and `needs_attention` resolution flows, the isolated Sandbox service, the RAG adapter, artifact storage/download, context summarization, usage/cost records, and database-shared RPM/TPM/concurrency slots are not implemented yet. The Worker image installs the Tavily CLI and official `tavily-search` skill. Private skills under `.ai_agent_base/private_skills` are mounted read-only into the Worker at runtime, selected by the manager during planning, and read again for each subagent execution so host-side updates take effect without rebuilding the image. Skills do not expand the registered read-only tool permissions. Searches remain read-only and use a per-Worker rate limit. Run a single Worker replica for this initial implementation.
+Additional tool providers and general side-effecting tools, human approval and `needs_attention` resolution flows, the isolated Sandbox service, the RAG adapter, context summarization, usage/cost records, and database-shared RPM/TPM/concurrency slots are not implemented yet. The Worker image installs the Tavily CLI and official `tavily-search` skill. Private skills under `.ai_agent_base/private_skills` are mounted read-only into the Worker at runtime, selected by the manager during planning, and read again for each subagent execution so host-side updates take effect without rebuilding the image. Skills do not expand registered tool permissions. Searches remain read-only and use a per-Worker rate limit. ComfyUI is a separate optional GPU service; its narrowly scoped image-generation tool consumes the existing subtask tool budget and writes only generated PNGs to task artifacts. Run a single Worker replica for this initial implementation.
 
 ## Development checks
 

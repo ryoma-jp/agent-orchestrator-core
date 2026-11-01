@@ -4,7 +4,8 @@ import { Activity, ArrowUpRight, Check, ChevronDown, CircleAlert, Command, KeyRo
 type User = { id: string; email: string; role: string; must_change_password: boolean }
 type TaskSummary = { id: string; owner_email: string; status: string; created_at: string; updated_at: string; error: { code?: string; message?: string } | null }
 type ModelProvider = 'openai' | 'ollama'
-type AdminSettings = { manager_model_provider: ModelProvider; manager_model: string; worker_model_provider: ModelProvider; worker_model: string; worker_image_model: string; max_concurrent_agents: number; max_agent_attempts: number; max_quality_revisions_per_subtask: number; max_quality_revisions_per_task: number; openai_key_configured: boolean; tavily_key_configured: boolean; version: number }
+type ImageModelProvider = ModelProvider | 'comfyui'
+type AdminSettings = { manager_model_provider: ModelProvider; manager_model: string; worker_model_provider: ModelProvider; worker_model: string; worker_image_provider: ImageModelProvider; worker_image_model: string; max_concurrent_agents: number; max_agent_attempts: number; max_quality_revisions_per_subtask: number; max_quality_revisions_per_task: number; openai_key_configured: boolean; tavily_key_configured: boolean; version: number }
 
 async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
   const headers = new Headers(init.headers)
@@ -22,7 +23,7 @@ async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
   return response.json() as Promise<T>
 }
 
-function useModelCatalog(provider: ModelProvider) {
+function useModelCatalog(provider: ImageModelProvider) {
   const [models, setModels] = useState<string[]>([])
   const [status, setStatus] = useState('Loading model IDs...')
 
@@ -177,11 +178,13 @@ function SettingsPanel() {
   const [settings, setSettings] = useState<AdminSettings | null>(null)
   const [managerProvider, setManagerProvider] = useState<ModelProvider>('openai')
   const [workerProvider, setWorkerProvider] = useState<ModelProvider>('openai')
+  const [workerImageProvider, setWorkerImageProvider] = useState<ImageModelProvider>('openai')
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
   const [busy, setBusy] = useState(false)
   const managerCatalog = useModelCatalog(managerProvider)
   const workerCatalog = useModelCatalog(workerProvider)
+  const workerImageCatalog = useModelCatalog(workerImageProvider)
 
   useEffect(() => {
     api<AdminSettings>('/admin/settings')
@@ -189,6 +192,7 @@ function SettingsPanel() {
         setSettings(loaded)
         setManagerProvider(loaded.manager_model_provider)
         setWorkerProvider(loaded.worker_model_provider)
+        setWorkerImageProvider(loaded.worker_image_provider)
       })
       .catch((reason) => setError((reason as Error).message))
   }, [])
@@ -205,6 +209,7 @@ function SettingsPanel() {
           manager_model: data.get('manager_model'),
           worker_model_provider: data.get('worker_model_provider'),
           worker_model: data.get('worker_model'),
+          worker_image_provider: data.get('worker_image_provider'),
           worker_image_model: data.get('worker_image_model'),
           max_concurrent_agents: Number(data.get('max_concurrent_agents')),
           max_agent_attempts: Number(data.get('max_agent_attempts')),
@@ -248,7 +253,8 @@ function SettingsPanel() {
         <ModelIdField label="Manager model ID" name="manager_model" value={settings.manager_model} models={managerCatalog.models} listId="manager-model-options" status={managerCatalog.status} />
         <label>Worker endpoint<select name="worker_model_provider" value={workerProvider} onChange={(event) => setWorkerProvider(event.target.value as ModelProvider)}><option value="openai">OpenAI</option><option value="ollama">Local LLM (Ollama)</option></select></label>
         <ModelIdField label="Worker conversational model ID" name="worker_model" value={settings.worker_model} models={workerCatalog.models} listId="worker-conversation-model-options" status={workerCatalog.status} />
-        <ModelIdField label="Worker image generation model ID" name="worker_image_model" value={settings.worker_image_model} models={workerCatalog.models} listId="worker-image-model-options" status={workerCatalog.status} />
+        <label>Worker image endpoint<select name="worker_image_provider" value={workerImageProvider} onChange={(event) => setWorkerImageProvider(event.target.value as ImageModelProvider)}><option value="openai">OpenAI</option><option value="ollama">Local LLM (Ollama)</option><option value="comfyui">ComfyUI</option></select></label>
+        <ModelIdField label="Worker image model / checkpoint filename" name="worker_image_model" value={settings.worker_image_model} models={workerImageCatalog.models} listId="worker-image-model-options" status={workerImageCatalog.status} />
         <div className="settings-number-grid"><label>Concurrent agents<input name="max_concurrent_agents" type="number" min={1} max={32} defaultValue={settings.max_concurrent_agents} required /></label><label>Maximum attempts<input name="max_agent_attempts" type="number" min={1} max={3} defaultValue={settings.max_agent_attempts} required /></label></div>
         <div className="settings-number-grid"><label>Revisions per subtask<input name="max_quality_revisions_per_subtask" type="number" min={0} max={5} defaultValue={settings.max_quality_revisions_per_subtask} required /></label><label>Total quality revisions<input name="max_quality_revisions_per_task" type="number" min={0} max={25} defaultValue={settings.max_quality_revisions_per_task} required /></label></div>
         <button className="admin-button" disabled={busy}><Check size={15} /> Save runtime settings</button>

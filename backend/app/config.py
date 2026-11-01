@@ -16,6 +16,9 @@ class Settings(BaseSettings):
     manager_model: str = "gpt-6.1-sol"
     worker_model_provider: Literal["openai", "ollama"] = "openai"
     worker_model: str = "gpt-6-luna"
+    worker_image_provider: Literal["openai", "ollama", "comfyui"] = (
+        "openai"
+    )
     worker_image_model: str = "gpt-image-2.5-sunburst"
     initial_admin_email: str | None = None
     initial_admin_password: SecretStr | None = None
@@ -38,6 +41,12 @@ class Settings(BaseSettings):
     tavily_timeout_seconds: int = 20
     tavily_search_skill_path: str = (
         "/opt/agent-skills/tavily-search/SKILL.md"
+    )
+    comfyui_enabled: bool = False
+    comfyui_base_url: str = "http://comfyui:8188"
+    comfyui_timeout_seconds: int = Field(default=300, ge=10, le=1800)
+    comfyui_max_image_bytes: int = Field(
+        default=20 * 1024 * 1024, ge=1_048_576, le=100 * 1024 * 1024
     )
     private_skills_path: str = "/opt/private-agent-skills"
     openai_base_url: str | None = None
