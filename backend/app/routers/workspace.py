@@ -6,12 +6,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.config import get_settings
+from app.config import MAX_REVIEW_IMAGE_BYTES, get_settings
 from app.db import get_session
 from app.dependencies import require_ready_task_user, require_task_csrf
 from app.models import ConversationMessage, Event, Job, Task, TaskFile, User
@@ -432,6 +432,86 @@ async def read_internal_task_inputs(
         )
         total_chars += len(excerpt)
     return {"files": excerpts}
+
+
+@router.get("/{task_id}/workspace/internal/artifacts/{filename}")
+async def read_internal_task_artifact(
+    task_id: uuid.UUID,
+    filename: str,
+    x_workspace_token: str | None = Header(default=None),
+    db: AsyncSession = Depends(get_session),
+):
+    settings = get_settings()
+    expected = settings.workspace_internal_token
+    if (
+        expected is None
+        or x_workspace_token is None
+        or not hmac.compare_digest(
+            x_workspace_token, expected.get_secret_value()
+        )
+    ):
+        raise HTTPException(status_code=404, detail="Not found")
+    if (
+        not filename
+        or filename in {".", ".."}
+        or "/" in filename
+        or "\\" in filename
+        or Path(filename).suffix.lower() != ".png"
+    ):
+        raise HTTPException(status_code=404, detail="Not found")
+
+    task = await db.scalar(
+        select(Task).where(
+            Task.id == task_id,
+            Task.deletion_requested_at.is_(None),
+        )
+    )
+    if task is None:
+        raise HTTPException(status_code=404, detail="Not found")
+    relative_path = f"artifacts/{filename}"
+    task_file = await db.scalar(
+        select(TaskFile).where(
+            TaskFile.task_id == task_id,
+            TaskFile.workspace_rel_path == relative_path,
+            TaskFile.role == "final",
+            TaskFile.source_kind == "agent",
+        )
+    )
+    max_bytes = min(
+        MAX_REVIEW_IMAGE_BYTES,
+        settings.comfyui_max_image_bytes,
+    )
+    if task_file is None or task_file.size_bytes < 8:
+        raise HTTPException(status_code=404, detail="Not found")
+    if task_file.size_bytes > max_bytes:
+        raise HTTPException(
+            status_code=413, detail="Image exceeds review limit"
+        )
+    try:
+        path = resolve_workspace_file(task_id, relative_path)
+        if not path.is_file() or path.stat().st_size != task_file.size_bytes:
+            raise HTTPException(status_code=404, detail="Not found")
+        content = await asyncio.to_thread(path.read_bytes)
+    except InvalidWorkspacePath as exc:
+        raise HTTPException(
+            status_code=404, detail="Not found"
+        ) from exc
+    except OSError as exc:
+        raise HTTPException(status_code=404, detail="Not found") from exc
+    if len(content) > max_bytes:
+        raise HTTPException(
+            status_code=413, detail="Image exceeds review limit"
+        )
+    if (
+        len(content) != task_file.size_bytes
+        or not content.startswith(b"\x89PNG\r\n\x1a\n")
+    ):
+        raise HTTPException(status_code=404, detail="Not found")
+    return Response(
+        content=content,
+        media_type="image/png",
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 async def _owned_task(

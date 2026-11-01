@@ -5,6 +5,8 @@ from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 OLLAMA_BASE_URL = "http://ollama:11434"
+MAX_REVIEW_IMAGES = 5
+MAX_REVIEW_IMAGE_BYTES = 20 * 1024 * 1024
 
 
 class Settings(BaseSettings):

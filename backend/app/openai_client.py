@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import inspect
 import json
 import logging
@@ -37,6 +38,27 @@ DEFAULT_MAX_AGENT_TURNS = 24
 DEFAULT_MAX_TOOL_CALLS = 20
 SDK_VERSION = "0.24.0"
 AGENT_DEFINITION_VERSION = "1"
+
+
+def _model_input(input_text: str, input_images: list[bytes] | None):
+    if not input_images:
+        return input_text
+    content: list[dict[str, str]] = [
+        {"type": "input_text", "text": input_text}
+    ]
+    content.extend(
+        {
+            "type": "input_image",
+            "image_url": (
+                "data:image/png;base64,"
+                + base64.b64encode(image).decode("ascii")
+            ),
+            "detail": "auto",
+        }
+        for image in input_images
+    )
+    return [{"role": "user", "content": content}]
+
 
 set_tracing_disabled(True)
 logging.getLogger("openai.agents").disabled = True
@@ -203,6 +225,7 @@ class StructuredModelClient:
         schema: type[ModelOutput],
         system_prompt: str,
         input_text: str,
+        input_images: list[bytes] | None = None,
         max_attempts: int | None = None,
         tool_registry: ToolRegistry | None = None,
         before_tool_call: Callable[[str], Awaitable[None]] | None = None,
@@ -307,6 +330,7 @@ class StructuredModelClient:
         provider_model = ConfiguredProviderModel(
             model, provider, attempts, check_execution
         )
+        retry_note = ""
         for attempt in range(attempts):
             agent = Agent(
                 name=schema_name,
@@ -321,7 +345,7 @@ class StructuredModelClient:
             try:
                 result = await Runner.run(
                     agent,
-                    input_text,
+                    _model_input(input_text + retry_note, input_images),
                     context=execution_context or AgentExecutionContext(),
                     max_turns=max_turns,
                     run_config=RunConfig(
@@ -345,7 +369,7 @@ class StructuredModelClient:
             except (ModelBehaviorError, ValidationError):
                 if not provider_model.allow_retry():
                     raise AgentExecutionError("invalid_model_output") from None
-                input_text += (
+                retry_note += (
                     "\nThe previous response did not match the required "
                     "schema. "
                     "Return corrected JSON."

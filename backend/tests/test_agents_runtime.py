@@ -1,4 +1,5 @@
 import asyncio
+import base64
 
 import httpx2 as httpx
 import pytest
@@ -313,6 +314,26 @@ async def test_execution_context_is_local_and_tracing_disabled(
     )
     assert all(not item.get("session") for item in runs)
     assert len(transport.requests) == 2
+
+
+@pytest.mark.asyncio
+async def test_image_input_is_preserved_during_schema_retry(sdk_transport):
+    image_bytes = b"\x89PNG\r\n\x1a\nreview image"
+    transport = sdk_transport(['{"wrong":true}', '{"answer":"checked"}'])
+
+    result = await generate(input_images=[image_bytes], max_attempts=2)
+
+    expected_image_url = "data:image/png;base64," + base64.b64encode(
+        image_bytes
+    ).decode("ascii")
+    for request in transport.requests:
+        content = request["input"][0]["content"]
+        assert content[1]["type"] == "input_image"
+        assert content[1]["image_url"] == expected_image_url
+    assert "corrected JSON" in transport.requests[1]["input"][0][
+        "content"
+    ][0]["text"]
+    assert result.answer == "checked"
 
 
 @pytest.mark.asyncio

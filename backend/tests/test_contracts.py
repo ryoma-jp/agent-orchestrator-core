@@ -112,6 +112,10 @@ def test_workspace_routes_are_registered():
     assert "/api/tasks/{task_id}/workspace/files" in paths
     assert "/api/tasks/{task_id}/workspace/files/{relative_path}" in paths
     assert "/api/tasks/{task_id}/workspace/internal/inputs" in paths
+    assert (
+        "/api/tasks/{task_id}/workspace/internal/artifacts/{filename}"
+        in paths
+    )
     assert "/api/tasks/{task_id}/workspace/internal/{relative_path}" in paths
 
 
@@ -999,8 +1003,15 @@ async def test_subtask_quality_review_retries_with_only_failed_items(
         ),
     ]
 
-    async def generate(**_kwargs):
-        return review_responses.pop(0)
+    reviewed_image_paths = []
+
+    async def review_checklist(**kwargs):
+        reviewed_image_paths.append(kwargs["image_paths"])
+        return normalize_checklist_results(
+            kwargs["checklist"],
+            review_responses.pop(0),
+            kwargs["artifact"],
+        )
 
     revision_feedback = []
 
@@ -1020,7 +1031,9 @@ async def test_subtask_quality_review_retries_with_only_failed_items(
     monkeypatch.setattr(
         orchestrator_module, "_assert_lease_in_session", assert_lease
     )
-    monkeypatch.setattr(orchestrator_module.model_client, "generate", generate)
+    monkeypatch.setattr(
+        orchestrator_module, "_review_checklist", review_checklist
+    )
     monkeypatch.setattr(orchestrator_module, "_execute_subtask", revise)
 
     review_subtask = orchestrator_module._review_subtask_result
@@ -1047,7 +1060,16 @@ async def test_subtask_quality_review_retries_with_only_failed_items(
             summary="A generic finding.",
             findings=["A generic finding."],
             sources=[],
-            tool_runs=[],
+            tool_runs=[
+                {
+                    "tool_name": "comfyui_generate_image",
+                    "request_summary": "",
+                    "status": "succeeded",
+                    "source_count": 0,
+                    "error_code": "",
+                    "artifact_paths": ["artifacts/cat.png"],
+                }
+            ],
             questions=[],
             error="",
         ),
@@ -1070,6 +1092,7 @@ async def test_subtask_quality_review_retries_with_only_failed_items(
     assert status == "accepted"
     assert questions == []
     assert result["summary"] == "Version 2.4 is supported."
+    assert reviewed_image_paths == [["artifacts/cat.png"], []]
     assert revision_feedback == [
         "- Name the relevant version: Name the relevant version."
     ]
@@ -2200,6 +2223,441 @@ async def test_internal_workspace_write_uses_atomic_taskfile_upsert(
     assert result is stored_file
     assert session.committed
     assert "ON CONFLICT ON CONSTRAINT uq_task_files_path DO UPDATE" in sql
+
+
+@pytest.mark.asyncio
+async def test_internal_workspace_image_read_returns_generated_png(
+    monkeypatch, tmp_path
+):
+    import app.routers.workspace as workspace_module
+
+    task_id = uuid.uuid4()
+    png_bytes = b"\x89PNG\r\n\x1a\nimage payload"
+    image_path = tmp_path / "cat.png"
+    image_path.write_bytes(png_bytes)
+    task = SimpleNamespace(deletion_requested_at=None)
+    task_file = SimpleNamespace(
+        size_bytes=len(png_bytes), role="final", source_kind="agent"
+    )
+
+    class FakeSession:
+        def __init__(self):
+            self.values = [task, task_file]
+
+        async def scalar(self, _statement):
+            return self.values.pop(0)
+
+    monkeypatch.setattr(
+        workspace_module,
+        "get_settings",
+        lambda: SimpleNamespace(
+            workspace_internal_token=SimpleNamespace(
+                get_secret_value=lambda: "workspace-token"
+            ),
+            comfyui_max_image_bytes=1_000_000,
+        ),
+    )
+    monkeypatch.setattr(
+        workspace_module,
+        "resolve_workspace_file",
+        lambda _task_id, relative_path: (
+            image_path
+            if relative_path == "artifacts/cat.png"
+            else pytest.fail("unexpected workspace path")
+        ),
+    )
+
+    response = await workspace_module.read_internal_task_artifact(
+        task_id,
+        "cat.png",
+        x_workspace_token="workspace-token",
+        db=FakeSession(),
+    )
+
+    assert response.media_type == "image/png"
+    assert response.body == png_bytes
+    assert response.headers["cache-control"] == "no-store"
+
+
+@pytest.mark.asyncio
+async def test_internal_workspace_image_read_rejects_non_agent_file(
+    monkeypatch,
+):
+    import app.routers.workspace as workspace_module
+
+    task = SimpleNamespace(deletion_requested_at=None)
+    task_file = SimpleNamespace(
+        size_bytes=16, role="final", source_kind="user_edit"
+    )
+
+    class FakeSession:
+        def __init__(self):
+            self.values = [task, task_file]
+
+        async def scalar(self, _statement):
+            return self.values.pop(0)
+
+    monkeypatch.setattr(
+        workspace_module,
+        "get_settings",
+        lambda: SimpleNamespace(
+            workspace_internal_token=SimpleNamespace(
+                get_secret_value=lambda: "workspace-token"
+            ),
+            comfyui_max_image_bytes=1_000_000,
+        ),
+    )
+
+    with pytest.raises(HTTPException) as error:
+        await workspace_module.read_internal_task_artifact(
+            uuid.uuid4(),
+            "cat.png",
+            x_workspace_token="workspace-token",
+            db=FakeSession(),
+        )
+    assert error.value.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_internal_workspace_image_read_returns_413_above_image_limit(
+    monkeypatch,
+):
+    import app.routers.workspace as workspace_module
+
+    task = SimpleNamespace(deletion_requested_at=None)
+    task_file = SimpleNamespace(
+        size_bytes=workspace_module.MAX_REVIEW_IMAGE_BYTES + 1,
+        role="final",
+        source_kind="agent",
+    )
+
+    class FakeSession:
+        def __init__(self):
+            self.values = [task, task_file]
+
+        async def scalar(self, _statement):
+            return self.values.pop(0)
+
+    monkeypatch.setattr(
+        workspace_module,
+        "get_settings",
+        lambda: SimpleNamespace(
+            workspace_internal_token=SimpleNamespace(
+                get_secret_value=lambda: "workspace-token"
+            ),
+            comfyui_max_image_bytes=workspace_module.MAX_REVIEW_IMAGE_BYTES,
+        ),
+    )
+
+    with pytest.raises(HTTPException) as error:
+        await workspace_module.read_internal_task_artifact(
+            uuid.uuid4(),
+            "large.png",
+            x_workspace_token="workspace-token",
+            db=FakeSession(),
+        )
+    assert error.value.status_code == 413
+
+
+@pytest.mark.asyncio
+async def test_review_image_loader_fetches_only_generated_artifact_paths(
+    monkeypatch,
+):
+    import app.orchestrator as orchestrator_module
+
+    task_id = uuid.uuid4()
+    png_bytes = b"\x89PNG\r\n\x1a\nimage payload"
+    requests = []
+
+    def respond(request):
+        requests.append(request)
+        return httpx.Response(
+            200, headers={"content-type": "image/png"}, content=png_bytes
+        )
+
+    real_async_client = httpx.AsyncClient
+    transport = httpx.MockTransport(respond)
+    monkeypatch.setattr(
+        orchestrator_module.httpx,
+        "AsyncClient",
+        lambda **options: real_async_client(
+            transport=transport, **options
+        ),
+    )
+    monkeypatch.setattr(
+        orchestrator_module,
+        "get_settings",
+        lambda: SimpleNamespace(
+            api_internal_base_url="http://api",
+            workspace_internal_token=SimpleNamespace(
+                get_secret_value=lambda: "workspace-token"
+            ),
+            workspace_artifact_timeout_seconds=5,
+        ),
+    )
+
+    selected_paths, images, omitted_paths = (
+        await orchestrator_module._load_review_images(
+            task_id,
+            [
+                "artifacts/cat.png",
+                "artifacts/../outside.png",
+                "inputs/secret.png",
+            ],
+        )
+    )
+
+    assert selected_paths == ["artifacts/cat.png"]
+    assert images == [png_bytes]
+    assert omitted_paths == []
+    assert len(requests) == 1
+    assert requests[0].url.path.endswith(
+        f"/api/tasks/{task_id}/workspace/internal/artifacts/cat.png"
+    )
+    assert requests[0].headers["x-workspace-token"] == "workspace-token"
+
+
+@pytest.mark.asyncio
+async def test_checklist_review_passes_loaded_images_to_model(monkeypatch):
+    import app.orchestrator as orchestrator_module
+
+    task_id = uuid.uuid4()
+    png_bytes = b"\x89PNG\r\n\x1a\nimage payload"
+    loaded_paths = []
+    model_images = []
+    model_inputs = []
+
+    async def load_images(_task_id, image_paths):
+        loaded_paths.extend(image_paths)
+        return image_paths, [png_bytes], ["artifacts/omitted.png"]
+
+    async def generate(**kwargs):
+        model_images.extend(kwargs["input_images"])
+        model_inputs.append(
+            orchestrator_module.json.loads(kwargs["input_text"])
+        )
+        return ChecklistReviewResult(
+            results=[
+                {
+                    "item_id": "image-content",
+                    "passed": True,
+                    "evidence": "The image shows a cat.",
+                    "deficiency": "",
+                }
+            ]
+        )
+
+    monkeypatch.setattr(
+        orchestrator_module, "_load_review_images", load_images
+    )
+    monkeypatch.setattr(orchestrator_module.model_client, "generate", generate)
+
+    results = await orchestrator_module._review_checklist(
+        model="test-manager",
+        task_id=task_id,
+        image_paths=["artifacts/cat.png"],
+        checklist=[
+            ChecklistItem(
+                id="image-content",
+                description="The image shows a cat.",
+            )
+        ],
+        artifact={"generated_files": ["artifacts/cat.png"]},
+        plan_summary="Generate a cat image",
+        instruction="Draw a cat",
+        max_attempts=1,
+    )
+
+    assert loaded_paths == ["artifacts/cat.png"]
+    assert model_images == [png_bytes]
+    assert model_inputs[0]["image_review"] == {
+        "attached_paths": ["artifacts/cat.png"],
+        "omitted_paths": ["artifacts/omitted.png"],
+        "attached_images_follow_path_order": True,
+    }
+    assert results[0]["passed"]
+
+
+@pytest.mark.asyncio
+async def test_review_image_loader_randomly_caps_image_count(monkeypatch):
+    import app.orchestrator as orchestrator_module
+
+    task_id = uuid.uuid4()
+    png_bytes = b"\x89PNG\r\n\x1a\nimage"
+    requests = []
+
+    def respond(request):
+        requests.append(request)
+        return httpx.Response(
+            200, headers={"content-type": "image/png"}, content=png_bytes
+        )
+
+    real_async_client = httpx.AsyncClient
+    transport = httpx.MockTransport(respond)
+    monkeypatch.setattr(
+        orchestrator_module.httpx,
+        "AsyncClient",
+        lambda **options: real_async_client(
+            transport=transport, **options
+        ),
+    )
+    monkeypatch.setattr(
+        orchestrator_module,
+        "get_settings",
+        lambda: SimpleNamespace(
+            api_internal_base_url="http://api",
+            workspace_internal_token=SimpleNamespace(
+                get_secret_value=lambda: "workspace-token"
+            ),
+            workspace_artifact_timeout_seconds=5,
+        ),
+    )
+    monkeypatch.setattr(
+        orchestrator_module.random, "shuffle", lambda paths: paths.reverse()
+    )
+    candidate_paths = [
+        f"artifacts/image-{index}.png" for index in range(7)
+    ]
+
+    selected_paths, images, omitted_paths = (
+        await orchestrator_module._load_review_images(
+            task_id, candidate_paths
+        )
+    )
+
+    assert selected_paths == list(reversed(candidate_paths[2:]))
+    assert images == [png_bytes] * 5
+    assert omitted_paths == list(reversed(candidate_paths[:2]))
+    assert len(requests) == 5
+
+
+@pytest.mark.asyncio
+async def test_review_image_loader_skips_images_that_do_not_fit_byte_budget(
+    monkeypatch,
+):
+    import app.orchestrator as orchestrator_module
+
+    task_id = uuid.uuid4()
+    images_by_name = {
+        "first.png": b"\x89PNG\r\n\x1a\n1234",
+        "too-large-for-remaining.png": b"\x89PNG\r\n\x1a\n1234",
+        "last.png": b"\x89PNG\r\n\x1a\n",
+    }
+    requests = []
+
+    def respond(request):
+        requests.append(request)
+        filename = request.url.path.rsplit("/", 1)[-1]
+        image = images_by_name[filename]
+        return httpx.Response(
+            200,
+            headers={
+                "content-type": "image/png",
+                "content-length": str(len(image)),
+            },
+            content=image,
+        )
+
+    real_async_client = httpx.AsyncClient
+    transport = httpx.MockTransport(respond)
+    monkeypatch.setattr(
+        orchestrator_module.httpx,
+        "AsyncClient",
+        lambda **options: real_async_client(
+            transport=transport, **options
+        ),
+    )
+    monkeypatch.setattr(
+        orchestrator_module,
+        "get_settings",
+        lambda: SimpleNamespace(
+            api_internal_base_url="http://api",
+            workspace_internal_token=SimpleNamespace(
+                get_secret_value=lambda: "workspace-token"
+            ),
+            workspace_artifact_timeout_seconds=5,
+        ),
+    )
+    monkeypatch.setattr(
+        orchestrator_module, "MAX_REVIEW_IMAGE_BYTES", 20
+    )
+    monkeypatch.setattr(
+        orchestrator_module.random, "shuffle", lambda _paths: None
+    )
+
+    selected_paths, selected_images, omitted_paths = (
+        await orchestrator_module._load_review_images(
+            task_id,
+            [
+                "artifacts/first.png",
+                "artifacts/too-large-for-remaining.png",
+                "artifacts/last.png",
+            ],
+        )
+    )
+
+    assert selected_paths == ["artifacts/first.png", "artifacts/last.png"]
+    assert selected_images == [
+        images_by_name["first.png"],
+        images_by_name["last.png"],
+    ]
+    assert omitted_paths == ["artifacts/too-large-for-remaining.png"]
+    assert len(requests) == 3
+
+
+@pytest.mark.asyncio
+async def test_review_image_loader_skips_per_image_413_and_continues(
+    monkeypatch,
+):
+    import app.orchestrator as orchestrator_module
+
+    task_id = uuid.uuid4()
+    png_bytes = b"\x89PNG\r\n\x1a\nreviewable"
+    requests = []
+
+    def respond(request):
+        requests.append(request)
+        if request.url.path.endswith("/oversized.png"):
+            return httpx.Response(413)
+        return httpx.Response(
+            200, headers={"content-type": "image/png"}, content=png_bytes
+        )
+
+    real_async_client = httpx.AsyncClient
+    transport = httpx.MockTransport(respond)
+    monkeypatch.setattr(
+        orchestrator_module.httpx,
+        "AsyncClient",
+        lambda **options: real_async_client(
+            transport=transport, **options
+        ),
+    )
+    monkeypatch.setattr(
+        orchestrator_module,
+        "get_settings",
+        lambda: SimpleNamespace(
+            api_internal_base_url="http://api",
+            workspace_internal_token=SimpleNamespace(
+                get_secret_value=lambda: "workspace-token"
+            ),
+            workspace_artifact_timeout_seconds=5,
+        ),
+    )
+    monkeypatch.setattr(
+        orchestrator_module.random, "shuffle", lambda _paths: None
+    )
+
+    selected_paths, images, omitted_paths = (
+        await orchestrator_module._load_review_images(
+            task_id,
+            ["artifacts/oversized.png", "artifacts/cat.png"],
+        )
+    )
+
+    assert selected_paths == ["artifacts/cat.png"]
+    assert images == [png_bytes]
+    assert omitted_paths == ["artifacts/oversized.png"]
+    assert len(requests) == 2
 
 
 @pytest.mark.asyncio
