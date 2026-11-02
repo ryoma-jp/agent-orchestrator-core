@@ -60,6 +60,8 @@ services:
       GROUP_ID: ${COMFYUI_GROUP_ID:-1000}
     expose:
       - "8188"
+    ports:
+      - "127.0.0.1:8188:8188"
     volumes:
       - type: bind
         source: ${COMFYUI_MODELS_SOURCE:-./.comfyui/models}

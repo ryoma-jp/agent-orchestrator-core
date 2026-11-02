@@ -66,7 +66,7 @@ docker compose --profile image-generation up -d comfyui
 docker compose --profile local-vault --profile agent up --build -d worker
 ```
 
-The ComfyUI port is not published to the host or browser. The service mounts models read-only and keeps its output in temporary storage; generated PNGs are copied into the task Workspace. The initial fixed workflow uses the standard checkpoint loader and supports compatible checkpoint files, not arbitrary ComfyUI workflows or custom nodes. The administrator's Worker image model field accepts the checkpoint filename when ComfyUI is enabled.
+Open the ComfyUI WebUI at `http://localhost:8188` from a browser on the Docker host. Compose binds the port to host loopback only, so it is not exposed to the LAN. For a remote VS Code workspace, forward port 8188 to your local browser. The service mounts models read-only and keeps its output in temporary storage; generated PNGs are copied into the task Workspace. The initial fixed workflow uses the standard checkpoint loader and supports compatible checkpoint files, not arbitrary ComfyUI workflows or custom nodes. The administrator's Worker image model field accepts the checkpoint filename when ComfyUI is enabled.
 
 Start the independent Worker with `docker compose --profile local-vault --profile agent up --build -d worker`. The Worker does not receive either provider key in its environment; it reads each key from Vault only when making the corresponding request. For an external Vault, grant the Worker AppRole read access to both configured secret paths. Set `SESSION_COOKIE_SECURE=true` when serving through TLS.
 
