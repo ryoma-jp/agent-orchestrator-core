@@ -356,12 +356,46 @@ def load_tavily_search_skill() -> str:
 
 
 def _private_skill_root() -> Path | None:
-    configured_path = get_settings().private_skills_path
-    try:
-        root = Path(configured_path).expanduser().resolve(strict=True)
-    except OSError:
+    settings = get_settings()
+    plugin_path = getattr(settings, "agent_plugin_path", None)
+    legacy_path = getattr(settings, "private_skills_path", None)
+    configured_path = plugin_path or legacy_path
+    if configured_path is None:
         return None
-    return root if root.is_dir() else None
+    configured_root = Path(configured_path).expanduser()
+    try:
+        if configured_root.is_symlink():
+            raise RuntimeError("private_skill_unavailable")
+        root = configured_root.resolve(strict=True)
+    except FileNotFoundError:
+        if plugin_path and legacy_path:
+            configured_root = Path(legacy_path).expanduser()
+            try:
+                if configured_root.is_symlink():
+                    raise RuntimeError("private_skill_unavailable")
+                root = configured_root.resolve(strict=True)
+            except FileNotFoundError:
+                return None
+            except OSError as exc:
+                raise RuntimeError("private_skill_unavailable") from exc
+        else:
+            return None
+    except OSError as exc:
+        raise RuntimeError("private_skill_unavailable") from exc
+    if not root.is_dir():
+        raise RuntimeError("private_skill_unavailable")
+
+    if legacy_path and configured_root == Path(legacy_path).expanduser():
+        return root
+    skill_root = root / "skills"
+    legacy_nested_root = root / "private_skills"
+    if skill_root.is_dir() and not skill_root.is_symlink():
+        return skill_root.resolve(strict=True)
+    if legacy_nested_root.is_dir() and not legacy_nested_root.is_symlink():
+        return legacy_nested_root.resolve(strict=True)
+    if (root / "agents").exists():
+        return None
+    return root
 
 
 def _read_private_skill(skill_name: str) -> tuple[str, str]:
@@ -460,21 +494,12 @@ def load_private_skill(skill_name: str) -> str:
 def load_private_skill_if_present(skill_name: str) -> str | None:
     if _PRIVATE_SKILL_NAME.fullmatch(skill_name) is None:
         raise RuntimeError("private_skill_unavailable")
-    configured_root = Path(get_settings().private_skills_path).expanduser()
-    try:
-        configured_root.lstat()
-    except FileNotFoundError:
+    root = _private_skill_root()
+    if root is None:
         return None
-    except OSError as exc:
-        raise RuntimeError("private_skill_unavailable") from exc
+    skill_directory = root / skill_name
     try:
-        root = configured_root.resolve(strict=True)
-    except OSError as exc:
-        raise RuntimeError("private_skill_unavailable") from exc
-    if not root.is_dir():
-        raise RuntimeError("private_skill_unavailable")
-    try:
-        (root / skill_name).lstat()
+        skill_directory.lstat()
     except FileNotFoundError:
         return None
     except OSError as exc:

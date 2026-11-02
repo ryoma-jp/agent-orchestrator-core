@@ -180,6 +180,76 @@ def test_subtask_image_tool_follows_image_provider(
     assert "tavily_web_search" in tool_names
 
 
+@pytest.mark.asyncio
+async def test_subtask_registry_exposes_guarded_reviewer_tool(monkeypatch):
+    from app import image_generation as image_generation_module
+
+    monkeypatch.setattr(
+        agent_runtime_module,
+        "get_settings",
+        lambda: SimpleNamespace(comfyui_enabled=False),
+    )
+    monkeypatch.setattr(
+        image_generation_module,
+        "get_settings",
+        lambda: SimpleNamespace(agent_timeout_seconds=30),
+    )
+    guard_calls = []
+    review_calls = []
+
+    async def before_workspace_write():
+        return None
+
+    async def generation_guard(arguments):
+        guard_calls.append(arguments.image_id)
+        return "image_review_required"
+
+    async def review_handler(arguments):
+        review_calls.append(arguments.artifact_path)
+        return {"verdict": "passed"}
+
+    registry = agent_runtime_module.subtask_tool_registry(
+        uuid4(),
+        {
+            "worker_image_provider": "openai",
+            "worker_image_model": "test-image-model",
+        },
+        before_workspace_write,
+        image_review_handler=review_handler,
+        image_generation_guard=generation_guard,
+    )
+    tool_names = {
+        definition["name"] for definition in registry.openai_definitions()
+    }
+    generation_result = await registry.execute(
+        "openai_generate_image",
+        json.dumps(
+            {
+                "image_id": "pool",
+                "image_prompt": {
+                    "positive_prompt": "pool scene",
+                    "negative_prompt": "",
+                },
+                "filename": "pool.png",
+                "width": 768,
+                "height": 1024,
+            }
+        ),
+    )
+    review_result = await registry.execute(
+        "review_generated_image",
+        json.dumps(
+            {"image_id": "pool", "artifact_path": "artifacts/pool.png"}
+        ),
+    )
+
+    assert "review_generated_image" in tool_names
+    assert generation_result == {"error": "image_review_required"}
+    assert guard_calls == ["pool"]
+    assert review_result == {"verdict": "passed"}
+    assert review_calls == ["artifacts/pool.png"]
+
+
 def test_comfyui_arguments_reject_unsafe_paths_and_dimensions():
     with pytest.raises(ValidationError):
         ComfyUIImageArguments(

@@ -156,6 +156,10 @@ async def reserve(state, owner="test-worker"):
         state.subtask.id,
         state.job.id,
         owner,
+        "legacy_test_tool",
+        0,
+        agent_name=None,
+        review_cycle_id=None,
     )
 
 
@@ -337,7 +341,14 @@ async def test_tool_budget_cannot_consume_another_tasks_subtask(database):
     second = await seed(database)
     with pytest.raises(RuntimeError, match="subtask_not_found"):
         await _reserve_subtask_tool_call(
-            first.task.id, second.subtask.id, first.job.id, "test-worker"
+            first.task.id,
+            second.subtask.id,
+            first.job.id,
+            "test-worker",
+            "legacy_test_tool",
+            0,
+            agent_name=None,
+            review_cycle_id=None,
         )
 
 
@@ -351,6 +362,7 @@ async def test_snapshot_freezes_server_limits_without_changing_admin_contract(
     settings = Settings(
         manager_model="manager",
         worker_model="worker",
+        worker_model_provider="ollama",
         max_agent_turns=12,
         max_tool_calls_per_subtask=4,
         workspace_root=str(tmp_path / "workspaces"),
@@ -373,8 +385,13 @@ async def test_snapshot_freezes_server_limits_without_changing_admin_contract(
         )
         settings.max_agent_turns = 2
         settings.max_tool_calls_per_subtask = 0
+        settings.worker_model = "other-worker"
         assert created.config_snapshot["max_agent_turns"] == 12
         assert created.config_snapshot["max_tool_calls_per_subtask"] == 4
+        assert created.config_snapshot["worker_model"] == "worker"
+        assert created.config_snapshot["worker_model_provider"] == "ollama"
+        assert "image_generation_agent_id" not in created.config_snapshot
+        assert "image_review_agent_id" not in created.config_snapshot
         assert created.config_snapshot["agent_runtime"]["version"] == "0.24.0"
 
 
@@ -416,6 +433,47 @@ async def test_workspace_cleanup_migration_round_trip(database):
         task = await session.get(Task, state.task.id)
         assert task.deletion_requested_at is None
         assert await session.get(TaskDeletionJob, state.task.id) is None
+
+
+async def test_agent_binding_migration_round_trip_preserves_legacy_rows(
+    database,
+):
+    state = await seed(database)
+    migration = importlib.import_module(
+        "backend.migrations.versions.0017_agent_binding_snapshot"
+    )
+
+    def migrate(connection, operation):
+        with Operations.context(MigrationContext.configure(connection)):
+            getattr(migration, operation)()
+
+    async with database.engine.begin() as connection:
+        await connection.run_sync(migrate, "downgrade")
+        await connection.run_sync(migrate, "upgrade")
+    async with database.sessions() as session:
+        subtask = await session.get(Subtask, state.subtask.id)
+        assert subtask.review_agent_id is None
+        assert subtask.review_agent_digest is None
+
+
+async def test_catalog_review_binding_migration_preserves_legacy_rows(
+    database,
+):
+    state = await seed(database)
+    migration = importlib.import_module(
+        "backend.migrations.versions.0018_catalog_review_binding"
+    )
+
+    def migrate(connection, operation):
+        with Operations.context(MigrationContext.configure(connection)):
+            getattr(migration, operation)()
+
+    async with database.engine.begin() as connection:
+        await connection.run_sync(migrate, "downgrade")
+        await connection.run_sync(migrate, "upgrade")
+    async with database.sessions() as session:
+        subtask = await session.get(Subtask, state.subtask.id)
+        assert subtask.review_binding_mode is None
 
 
 @pytest.mark.parametrize("accepted", [True, False])

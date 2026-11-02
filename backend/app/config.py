@@ -50,7 +50,8 @@ class Settings(BaseSettings):
     comfyui_max_image_bytes: int = Field(
         default=20 * 1024 * 1024, ge=1_048_576, le=100 * 1024 * 1024
     )
-    private_skills_path: str = "/opt/private-agent-skills"
+    agent_plugin_path: str = "/opt/agent-plugin"
+    private_skills_path: str | None = None
     openai_base_url: str | None = None
     vault_addr: str | None = None
     vault_kv_mount: str = "secret"

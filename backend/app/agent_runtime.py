@@ -1,3 +1,5 @@
+from dataclasses import replace
+
 from app.openai_client import (
     AgentExecutionContext,
     DEFAULT_MAX_AGENT_TURNS,
@@ -7,7 +9,8 @@ from app.orchestration_state import assert_lease, requeue_if_new_messages
 from app.comfyui import ComfyUIImageGenerationTool
 from app.config import get_settings
 from app.image_generation import OpenAIImageGenerationTool
-from app.tools import TavilySearchTool, ToolRegistry
+from app.agent_schemas import ReviewGeneratedImageArguments
+from app.tools import TavilySearchTool, ToolRegistration, ToolRegistry
 
 model_client = StructuredModelClient()
 tool_registry = ToolRegistry([TavilySearchTool().registration()])
@@ -19,6 +22,8 @@ def subtask_tool_registry(
     before_workspace_write,
     *,
     include_image_tool=True,
+    image_review_handler=None,
+    image_generation_guard=None,
 ):
     registrations = [TavilySearchTool().registration()]
     exposed_risk_classes = {"read_only"}
@@ -46,6 +51,45 @@ def subtask_tool_registry(
             ).registration()
         )
         exposed_risk_classes.add("writes_data")
+    if image_review_handler is not None:
+        registrations.append(
+            ToolRegistration(
+                name="review_generated_image",
+                version="1",
+                description=(
+                    "Ask the assigned image-review specialist to inspect a "
+                    "generated image before returning it. Review only an "
+                    "image_id and artifact_path returned by the image tool."
+                ),
+                risk_class="read_only",
+                timeout_seconds=180,
+                arguments_model=ReviewGeneratedImageArguments,
+                handler=image_review_handler,
+            )
+        )
+    if image_generation_guard is not None:
+        guarded_registrations = []
+        for registration in registrations:
+            if registration.name not in {
+                "comfyui_generate_image",
+                "openai_generate_image",
+            }:
+                guarded_registrations.append(registration)
+                continue
+            original_handler = registration.handler
+
+            async def guarded_handler(
+                arguments, handler=original_handler
+            ):
+                error = await image_generation_guard(arguments)
+                if error is not None:
+                    return {"error": error}
+                return await handler(arguments)
+
+            guarded_registrations.append(
+                replace(registration, handler=guarded_handler)
+            )
+        registrations = guarded_registrations
     return ToolRegistry(
         registrations, exposed_risk_classes=exposed_risk_classes
     )

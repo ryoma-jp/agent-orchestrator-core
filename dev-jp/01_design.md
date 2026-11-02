@@ -10,12 +10,12 @@
 
 | 区分 | 現行実装 | 将来設計・未実装 |
 |---|---|---|
-| 画像生成 | 独立した画像用プロバイダー選択、ComfyUI固定ワークフロー／OpenAI Images API、`image-generation` Skillのprompt生成・画像生成・画像レビュー・修正への必須読込、正／負プロンプトJSON、全体＋最大4 cropとhigh-detail入力、必須visual-integrityチェック、PNG検証・TaskFile保存、画像未達時の最大2回の生成元サブタスク再生成、seed／qualityと修正履歴を含む追記専用履歴およびUser UI閲覧 | Ollama画像生成、任意ワークフロー／ノード、カスタムノード、モデル形式別ワークフロー |
+| 画像生成 | 独立した画像用プロバイダー選択、ComfyUI固定ワークフロー／OpenAI Images API、`image-generation` Skill、正／負プロンプトJSON、全体＋最大4 cropとhigh-detail入力、PNG検証・TaskFile保存、生成サイクルごと画像IDあたり最大5回のレビュー／修正、Workerモデルでの専門レビュー、Manager品質修正とは独立したサイクル別レビュー履歴・回数、seed／qualityと生成履歴 | Ollama画像生成、任意ワークフロー／ノード、カスタムノード、モデル形式別ワークフロー |
 | 実行基盤 | PostgreSQL、FastAPI、独立API／Worker、PostgreSQLジョブ行のロックと期限付きリース | Worker間のタスク実行リース、fencing token、共有同時実行枠・RPM／TPM制御、複数Worker運用保証 |
 | エージェント実行方式 | OpenAI Agents SDKのAgent／Runnerを共通実行アダプター経由で利用。タスク制御・永続化は独自オーケストレーターに維持 | Handoffs、動的なAgent.as_tool()委譲、Session自動保存、承認用RunStateの永続化 |
 | エージェント | 初回指示の目的を表すタスクタイトルを含む構造化計画、成果物目標・チェックリストによる個別受け入れと最終成果物判定、設定上限付き品質修正、準完了状態、依存関係に沿った読み取り専用サブタスクの並行実行、Tavily公式Agent Skillを指示へ組み込んだTavily CLI検索、入力テキスト添付の計画入力、要求ファイルの構造化出力・Workspace保存、ツール予算超過時の部分成果レビューと追加予算承認、最大3回の設定可能な試行 | ファイル／シェル操作ツール、任意形式添付の解析、副作用操作の承認、タスクSandbox内でのエージェント実行 |
 | 拡張 | TaskFileメタデータ、タスクUUID別永続Workspace、所有者スコープのファイルAPI、削除アウトボックスと再試行ワーカー | Workerから分離したタスクSandbox、ターミナル、Git cloneと認証ブローカー、動的プライベートスキル、RAGアダプター、コンテキスト要約 |
-| エージェント | 初回指示の目的を表すタスクタイトルを含む構造化計画、成果物目標・チェックリストによる個別受け入れと最終成果物判定、設定上限付き品質修正、準完了状態、依存関係に沿った読み取り専用サブタスクの並行実行、管理エージェントによるプライベートSkill選択とWorkerでの実行時読込、Tavily公式Agent Skillを指示へ組み込んだTavily CLI検索、入力テキスト添付の計画入力、要求ファイルの構造化出力・Workspace保存、ツール予算超過時の部分成果レビューと追加予算承認、最大3回の設定可能な試行 | ファイル／シェル操作ツール、任意形式添付の解析、副作用操作の承認、タスクSandbox内でのエージェント実行 |
+| エージェント | 構造化計画と受け入れ判定、設定上限付き品質修正、依存関係に沿ったサブタスク並行実行、プライベートSkill選択、専門家Agentカタログとサブタスク単位の選択・汎用Agentへのfallback、定義digest固定、コア設定による画像生成／レビューAgentの連携、Tavily検索、入力テキスト添付、要求ファイル保存、追加ツール予算承認 | ファイル／シェル操作ツール、任意形式添付の解析、副作用操作の承認、タスクSandbox内でのエージェント実行 |
 | 拡張 | TaskFileメタデータ、タスクUUID別永続Workspace、所有者スコープのファイルAPI、削除アウトボックスと再試行ワーカー | Workerから分離したタスクSandbox、ターミナル、Git cloneと認証ブローカー、RAGアダプター、コンテキスト要約 |
 | 認証・管理 | WebセッションとCSRF、ユーザー別Bearerアクセスキー、管理者によるアカウント・OpenAI／OllamaエンドポイントとモデルID・品質修正上限・Vaultキー管理 | より細かな権限・監査、利用量／コスト集計 |
 | UI・イベント | User UIの目的表現タスクタイトル表示、タスク別Explorer（空ディレクトリを含む一覧、空状態の表示、アップロード、テキスト編集、PNG／JPEG／WebP／GIF画像プレビュー、ダウンロード、削除）、画像生成履歴（未達項目・正／負プロンプト・生成設定・成果物パス）、追加ツール予算の承認／拒否、Admin UIのOpenAI／Ollamaと検索可能なモデルID選択、Workerの会話／画像モデル個別設定、品質判定の進捗・準完了表示、DBイベントのSSE配信とLast-Event-ID以降の再送 | タスクごとの隔離Terminal、Git認証UI、副作用操作の承認／解決UI |
@@ -108,7 +108,7 @@ flowchart TB
     TavilyCLI["Tavily CLI (tvly)"]
     ComfyUI["ComfyUI container<br/>任意GPU画像生成・内部接続のみ"]
     Tavily["Tavily Search API"]
-    Skills["Private Skills"]
+    AgentPlugin["Private Agent Plugin<br/>agents/ + skills/"]
     Sandbox["Sandbox service/container<br/>task_idごとの永続Workspace"]
     Terminal["Web Terminal<br/>task Workspace内のみ"]
     Explorer["File Explorer<br/>task Workspace内のみ"]
@@ -127,7 +127,7 @@ flowchart TB
     TavilyAdapter --> TavilyCLI
     ComfyUIAdapter --> ComfyUI
     TavilyCLI --> Tavily
-    SkillRegistry --> Skills
+    SkillRegistry --> AgentPlugin
     Safety -->|隔離されたコマンド・ファイル操作| Sandbox
     UserUI -->|ターミナル接続| Terminal
     UserUI -->|ファイル一覧・読書き| Explorer
@@ -221,13 +221,16 @@ flowchart TB
 1. ユーザー指示と会話コンテキストから目的・制約・完了条件を抽出する。
 2. 初回の計画生成時に最初のユーザー指示から目的を抽出し、その指示の言語で簡潔な目的表現のタスクタイトルを生成する。後続メッセージによる再計画では既存タイトルを変更しない。
 3. 必要に応じて、依存関係を持つサブタスク計画を構造化出力で生成する。
-4. 各サブタスクに指示と依存関係を割り当て、必要な場合はマウント済みSkill一覧から最大2件を選択する。Skillは指示として利用し、登録済みツールや実行権限を増やさない。
-5. 収集されたサブタスク成果を評価し、必要な修正内容を提示する。依存関係の検証、並行起動、結果と失敗の収集はオーケストレーターが行う。
-6. サブタスク結果を統合し、回答と注意事項を含むユーザー向け応答を生成する。完了可否は最終チェックリストの必須項目で判定する。
+4. Workerが検証した専門家Agentカタログを計画要求へ渡し、各サブタスクと画像Reviewerに適合するAgent IDを選択する。適任がない場合はNULLとして汎用サブエージェントやManagerレビューを選ぶ。カタログには安定ID、表示名、説明、参照Agent、利用可能スキル名を含め、Agent本文は含めない。未知IDや自己レビューは拒否する。
+5. 各サブタスクに指示と依存関係を割り当て、必要な場合はマウント済みSkill一覧から最大2件を選択する。Skillは指示として利用し、登録済みツールや実行権限を増やさない。
+6. 収集されたサブタスク成果を評価し、必要な修正内容を提示する。依存関係の検証、並行起動、結果と失敗の収集はオーケストレーターが行う。
+7. サブタスク結果を統合し、回答と注意事項を含むユーザー向け応答を生成する。完了可否は最終チェックリストの必須項目で判定する。
 
 初回の構造化計画には、最初のユーザー指示だけを根拠とする目的表現の`title`を含める。タイトルは計画と同じ管理エージェント応答から生成し、計画保存と同じトランザクションで`Task.title`に保存する。後続の追加指示で再計画しても既存タイトルを維持する。タイトル生成前はUser UIが元の指示を暫定表示し、タイトル保存後はタスクリストと詳細見出しにタイトルを表示する。既存タスクはマイグレーション時に従来の指示文を暫定タイトルとして補完し、`title_generated`でモデル生成済みかを区別する。旧計画を再利用する場合も、未生成なら最初のユーザー指示からタイトルを生成・保存してから処理を続ける。
 
-計画出力はPydanticスキーマで検証し、依存先の範囲、重複、自己依存、循環を拒否する。タイトルを含むスキーマ検証に失敗した場合は設定済みの最大試行回数内で再要求する。
+計画出力はPydanticスキーマで検証し、依存先の範囲、重複、自己依存、循環を拒否する。各サブタスクの`agent_id`と`review_agent_id`はカタログIDまたはNULLに限定し、同一Agentによる自己レビューを拒否する。画像生成の新しいカタログbindingでは、画像Tool実行時にReviewerが未選択・利用不能なら生成を開始せず失敗させる。実行時に汎用Agentへ黙って置き換えない。タイトルを含むスキーマ検証に失敗した場合は設定済みの最大試行回数内で再要求する。
+
+専門家の選択はタスク全体ではなくサブタスク単位で行う。複合要求では領域ごとに異なる専門家を割り当て、該当専門家のない作業だけを汎用サブエージェントへ割り当てる。Subtaskには選択Agentとカタログから選択したReviewerそれぞれのID・digestを別々に保存する。各digestはそのAgent定義と参照Skillの内容から算出し、未使用の他Agentの更新には依存しない。品質修正・ジョブ再取得時は保存済みID／digestを照合し、不一致なら`agent_definition_unavailable`で失敗させる。旧計画の推移的digestは旧方式でも検証できる場合に限り受け入れる。新しいユーザー指示による再計画では、その時点のカタログから新しいAgentを選択できる。
 
 #### 現行実装: 成果物の受け入れとタスク完了
 
@@ -248,6 +251,22 @@ flowchart TB
 ### 4.3 サブエージェント
 
 現行実装ではサブタスクごとに設定済みWorkerモデルを用い、同一タスク内の独立した依存関係レベルを最大32件まで並行実行する。必要に応じてTavily公式`tavily-search` Skillの手順に基づく読み取り専用Web検索や、計画で選択されたプライベートSkillを利用できる。画像用プロバイダーが有効なComfyUIまたはOpenAIの場合は、ユーザーが要求した画像を生成する専用Toolも利用できる。プライベートSkillはWorkerに読み取り専用bind mountされたディレクトリから実行ごとに読み込む。出力は `SubtaskResult`（`succeeded`／`partial`／`needs_input`／`failed`、summary、findings、sources、tool_runs、questions、error）で検証する。サブタスク個別の再開、Worker間の共有レート制限はない。OpenAI Agents SDKにAgent Skillsの自動ローダーやシェル実行器はないため、WorkerがSkill本文を指示へ明示的に組み込み、検索専用Function Toolが固定されたCLIコマンドを実行する。モデルには任意シェルを公開しない。
+
+#### 変更設計: 専門家Agentカタログと実行
+
+プラグインは別Gitリポジトリとして`.ai_agent_base/`へ配置し、Workerだけが読み取り専用でbind mountする。Agent定義は`agents/<agent-id>.agent.md`、スキルは`skills/<skill-name>/SKILL.md`へ置く。Agent IDはファイル名から得る小文字英数字とハイフンの安定識別子（1〜100文字）とし、標準front matterの`name`（省略時はID）と`description`を選択用メタデータとして読む。独自`kind`やコア固有のRunner・Worker・回数をプラグインに要求しない。`tools`、`model`、`hooks`、`handoffs`、`agents`等のコアが実装しないメタデータは権限を与えず実行しない。未配置の子Agent名や参照関係の循環だけで他Agentのカタログ利用を妨げない。YAMLは安全なLoaderで解析し、重複ID／表示名、不正形式、過大ファイル、symlink、ルート外のSkill参照を拒否する。定義本文はコードとして実行しない。
+
+Managerへは全ラインナップの選択用メタデータを渡し、サブタスクと画像Reviewerを説明や要求に基づいて選択する。参照Agentは選択の参考情報であり、権限を与えない。本文とSkill本文は選択後に読み込む。`PlannedSubtask.agent_id`と`review_agent_id`はnullableとし、NULLはそれぞれ汎用サブエージェントとManagerレビューを意味する。未知IDや自己レビューは拒否する。DBには各選択ID／digestと選択方式を保存し、旧行は既存仕様に従って復元する。実行時は個別にdigestを照合し、Agent本文や子Agent一覧からツール、ファイル範囲、ネットワーク、予算、SDK handoff権限を付与しない。
+
+専門Agentも既存の共通Runner、Workerモデル、`SubtaskResult`契約、ターン上限、ツール予算、リース確認、Tool Registryを使う。プラグインの`tools`等は許可にも拒否にも使用せず、制限的なツール一覧を含め、コア側Tool Registryが権限の正本となる。画像など固有の処理はアプリケーション側の明示的なワークフローが呼び出し、定義文に書かれた「Agentを呼ぶ」という文だけでSDKの動的委譲を行わない。カタログ、選択、検証、定義読込、共通実行を汎用基盤とし、新しいツール権限・入出力型・状態遷移・外部副作用・複雑な分岐には別途アプリケーション実装を要する。
+
+#### 変更設計: 画像生成・画像レビュー専門家
+
+画像生成要求ではManagerが`AGENT_PLUGIN_SOURCE`のカタログから適切な生成Agentと異なるReviewerを選択し、それぞれのIDと定義digestをSubtaskへ固定する。適任がない場合は汎用AgentやManagerレビューを選ぶ。生成Runnerへ選択Agent本文と参照Skillを追加し、既存の画像Tool、正／負プロンプトJSON、PNG検証・保存、生成履歴、成功時チェックポイントを維持する。Reviewer呼出しはアプリケーション側が制御し、プラグインの`agents`宣言を権限の根拠にしない。
+
+画像生成AgentのRunnerには、保存済みReviewerを呼び出す`review_generated_image` Toolを登録する。生成Agentは画像ごとに安定した`image_id`を使い、生成直後に要求、実際の生成プロンプト、生成設定、画像パス、前回レビュー、画像全体と利用可能なcropをReviewerへ渡す。Worker会話モデルで`ImageSpecialistReview`を構造化出力し、`passed`なら停止、`needs_revision`なら同じIDで修正画像を生成して再レビューする。1つの生成サイクル内で初回を含む最大5回とし、判定不能・呼出し失敗ではManagerへ画像を渡さない。5回目が未達ならその状態と指摘を結果に含めてサイクルを閉じる。Managerが画像修正を要求して新しい生成サイクルを始める場合は新しいcycle IDを発行し、同じimage IDでもレビュー番号を1へ戻す。Worker再試行は保存済みcycle IDを維持し、回数をリセットしない。履歴は削除せずサイクルごとの回数をSubtask結果へ保存し、Managerの品質修正回数とは別管理する。未レビュー画像、上限未満の未解決画像、失敗したReviewer呼出しを検出した場合はManagerへの返却を拒否する。
+
+サブタスクと最終成果物の要求全体に対する受け入れ判断は引き続きManagerが行い、専門レビューだけでタスクを完了扱いにしない。画像の専門事前レビューが完了したサブタスクではSubtask単位のManagerチェックを重複実行せず、Subtask結果をFinal Managerチェックへ渡す。Managerは最終回答と画像を含む成果物を1回のチェックリストで受け入れ判定する。Managerが画像修正を要求した場合は新しい生成サイクルを開始し、新しいPNGの生成とReviewer確認を必須にして、そのサイクル内でレビュー回数を1から数え直す。回答だけの修正では既存画像を再利用し、画像生成サイクルを開始しない。各Manager修正サイクルは既存のManager品質修正上限とタスク全体上限に従う。サイクル内で5回レビューしても未達なら、その画像を部分未達としてManagerへ渡し、同じサイクル内では再生成しない。Agent内レビュー回数はManagerの品質修正回数へ加算しない。Worker再取得時は保存済みcycle ID、画像、レビュー記録を使って安全に再開し、プロンプト・画像バイト列をイベントやログへ含めない。
 
 サブタスクの構造化出力は`SubtaskResult`（`succeeded`／`partial`／`needs_input`／`failed`、summary、findings、sources、tool_runs、questions、error）で検証する。ツール予算到達時は`partial`を返し、実行済みの検索結果・記録とともに管理エージェントの受け入れ判定へ進める。成果物はこの結果を指し、独立した中間成果物ファイルやストレージはない。受け入れ可否はサブエージェントの自己申告ではなく管理エージェントのチェックリスト判定で決め、修正時は未達項目と不足内容を渡す。
 
@@ -379,7 +398,7 @@ flowchart TB
         PostgreSQL[("PostgreSQL container/service<br/>tasks・会話・events・approvals・jobs・leases")]
         Vault["HashiCorp Vault<br/>KV v2"]
         ArtifactStorage[("task_id別Workspace永続ボリューム")]
-        PrivateSkills[("Private skills mount<br/>ワーカーへ読み取り専用")]
+        AgentPlugin[("Private Agent plugin mount<br/>agents/ + skills/、Workerへ読み取り専用")]
         API -->|認可済みWorkspaceファイル操作| SandboxService
         ArtifactWriter -->|成果物ファイルとメタデータを保存| ArtifactStorage
         API -->|管理API用AppRoleでキー更新| Vault
@@ -412,7 +431,7 @@ flowchart TB
     TaskRepository -->|ジョブ取得・リース、会話・計画・状態の読込／更新| PostgreSQL
     OpenAIClient -->|呼び出しごとにWorker用AppRoleでキー取得| Vault
     OpenAIClient -->|公式SDKでモデル呼び出し| OpenAI
-    Subagents -->|許可されたスキルをロード| PrivateSkills
+    Subagents -->|許可されたAgent／Skillをロード| AgentPlugin
     Subagents -->|許可されたWorkspace操作| SandboxService
     Manager -->|検索アダプター経由| Knowledge
 ```
@@ -425,7 +444,7 @@ flowchart TB
 | Admin UI | 管理者ダッシュボードの静的資産を配信 | 独立したステートレスコンテナ。一般ユーザー用UIの資産と混在させず、秘密情報を含めない |
 | User UI | 一般ユーザー用タスクUIの静的資産を配信 | 独立したステートレスコンテナ。管理者専用画面・権限情報を含めない |
 | API | REST、SSE、認証、入力検証、会話・アカウント・管理操作、DBへの受付記録 | 現行Composeでは1サービス。API自体にプロセス内タスク状態を保持しない |
-| Worker | DBジョブの取得、ジョブリース更新、タスク計画・読み取り専用サブタスク実行・統合。Tavily CLI、公式Agent Skill、プライベートSkillの動的読込を含む | `agent`プロファイルで起動。初期運用は1レプリカ。APIイメージとは別にビルドし、Docker制御権限やGit認証情報を与えない。ホストの`PRIVATE_SKILLS_SOURCE`を`/opt/private-agent-skills:ro`へbind mountする。Tavilyキーは呼び出しごとにVaultから読み、CLI子プロセスにのみ環境変数で渡す |
+| Worker | DBジョブの取得、ジョブリース更新、タスク計画・読み取り専用サブタスク実行・統合。Tavily CLI、公式Agent Skill、専門AgentカタログとプライベートSkillの動的読込を含む | `agent`プロファイルで起動。初期運用は1レプリカ。APIイメージとは別にビルドし、Docker制御権限やGit認証情報を与えない。ホストの`AGENT_PLUGIN_SOURCE`を`/opt/agent-plugin:ro`へbind mountする。旧`PRIVATE_SKILLS_SOURCE`は移行期間のみ互換パスとして扱う。Tavilyキーは呼び出しごとにVaultから読み、CLI子プロセスにのみ環境変数で渡す |
 | PostgreSQL | ユーザー、セッション、設定、タスク、会話、サブタスク、イベント、ジョブを保存 | Composeの名前付きボリュームを使用。マイグレーションはセットアップ用サービスで適用 |
 | Workspace／Sandbox | APIコンテナがタスクUUID別の永続ボリューム上にファイルを保存し、TaskFileメタデータと所有者スコープAPIを提供。削除ジョブがWorkspace清掃後にTaskをcascade削除 | Workerから分離したタスク別Sandbox／Terminal、Sandbox内Git cloneと認証ブローカー。現行ファイル領域はOSプロセス単位のSandboxではない |
 | HashiCorp Vault | KV v2でシステム共通OpenAI APIキーを保存 | 管理APIは書込専用の限定AppRole、Workerは読取専用AppRoleを使用 |
@@ -526,8 +545,8 @@ stateDiagram-v2
 
 1. UIが指示をREST APIへ送信する。APIは入力を検証し、`queued`タスク、初期メッセージ、イベント、ジョブをDBへコミットしてからタスクIDを返す。
 2. Workerが`FOR UPDATE SKIP LOCKED`でジョブを取得し、期限付きリースを設定してタスクを`planning`にする。
-3. オーケストレーターはタスク設定スナップショットと会話履歴を読み、同一会話sequenceの計画があればDBから再利用し、なければ管理エージェントの計画用Runnerを実行する。計画にはタスク全体の最終チェックリスト、各サブタスクの成果物目標・依存関係・受け入れチェックリストを含め、オーケストレーターが整合性を検証して計画バージョンと会話sequenceを付けて保存する。
-4. オーケストレーターは依存関係を満たすサブタスクを選び、設定上限内でサブエージェントのRunnerを並行実行する。ツールの使用はSDKのループ内で許可済みアダプターを経由し、成果・出典・実行記録を返す。ツール総数上限に達した場合は追加ツールを実行せず、Runnerに収集済み情報から部分的な構造化結果を生成させる。オーケストレーターが成果物・状態・進捗イベントをDBへ保存する。`needs_input`があれば質問をassistantメッセージとして保存し、タスクを`needs_attention`にしてジョブを終了する。
+3. オーケストレーターはタスク設定スナップショットと会話履歴を読み、同一会話sequenceの計画があればDBから再利用し、なければAgent／Skillカタログのメタデータを管理エージェントの計画用Runnerへ渡す。計画にはAgent IDまたは汎用指定NULL、最終チェックリスト、各サブタスクの成果物目標・依存関係・受け入れチェックリストを含め、IDと能力を検証して定義digestとともに保存する。
+4. オーケストレーターは依存関係を満たすサブタスクを選び、設定上限内で選択された専門Agentまたは汎用サブエージェントのRunnerを並行実行する。画像生成AgentのRunnerには生成Toolと、保存済みReviewerを呼ぶ`review_generated_image` Toolを登録する。Agentは生成・レビュー・修正を同一Runner内で最大5レビューまで反復し、すべての画像が合格または上限到達となった後にSubtaskResultを返す。オーケストレーターはAgent内レビュー回数をManagerの品質修正回数と別に保存し、未レビューや途中の未解決画像があればManagerへの返却を拒否する。ツールの使用はSDKのループ内で許可済みアダプターを経由し、成果・出典・実行記録を返す。オーケストレーターが成果物・状態・Agent名付き進捗イベントをDBへ保存する。`needs_input`があれば質問をassistantメッセージとして保存し、タスクを`needs_attention`にしてジョブを終了する。
 5. オーケストレーターは機械的チェックを実行し、内容判断が必要な項目を管理エージェントのレビュー用Runnerへ依頼する。項目別の結果・根拠と追加の読み取り専用ツールが必要かを検証して受け入れ可否を確定し、判定記録とイベントをDBへ保存する。受け入れ済みまたは部分受け入れ済みの成果を依存先へ渡す。未達が既存情報で修正可能なら追加ツールなしで修正Runnerを起動する。未達の解消に追加調査が必要なら、Task/Subtask状態と要求数を保存してタスクを`waiting_approval`にし、Workerジョブを終了する。ユーザー承認時だけ同じ計画・サブタスクを再開し、拒否時は部分受け入れ結果を統合へ渡す。計画の自動変更案の採用や欠落作業の追加は行わない。
 6. 実行チェックポイントで新しいユーザーメッセージを検出した場合、現在のジョブを完了し、新しいジョブを登録する。再実行時は最新会話sequenceに基づく新しい計画バージョンを作成し、古い判定記録を履歴として保持する。
 7. 全サブタスクの処理が完了した後、管理エージェントの統合用Runnerで会話向け回答と要求ファイル本文・ファイル名を別々に生成し、ファイル本文と生成画像をレビュー用Runnerへ渡して機械的チェックと最終チェックリストの評価を行う。各モデル判定項目は未達時の修正対象（回答／画像／両方）を返す。画像が対象の未達では、該当する生成元サブタスクの保存済みプロンプトと画像パスを特定し、未達条件を加えた修正指示とともに同サブタスクを再実行する。修正Runnerには前回の正／負プロンプトを明示的に渡し、達成済み条件を保持して不足条件を修正した新しいプロンプトで画像を再生成させる。新画像のパスと生成条件をサブタスク結果へ保存し、修正画像をレビューしてから統合回答と最終チェックリストを再生成する。画像の生成元を特定できない場合や修正上限・ツール予算に達した場合は再生成せず、未達を維持する。全必須項目の充足時だけ`succeeded`、品質修正上限後の未達は不足内容を含む応答とともに`partially_completed`とする。実行障害は`failed`、ユーザー回答待ちは`needs_attention`とする。Runnerの終了だけでこれらの状態を決定しない。
@@ -575,11 +594,13 @@ Runnerターン上限は既定24・許容範囲1〜64、サブタスクの初期
 
 登録時に重複名、破損したSchema、未許可パスを検査する。ロードできないスキルが設定されている場合、起動・タスク開始時に診断可能なエラーとして通知する。起動時ロードを基本とし、タスク実行中の無検証なコード再ロードは行わない。
 
-#### 現行実装: プライベートSkillの選択と読込
+#### 変更設計: プラグインAgent／Skillカタログ
 
-プライベートSkillは`.ai_agent_base/private_skills/<skill-name>/SKILL.md`に配置し、ComposeのWorkerだけがホストディレクトリを`/opt/private-agent-skills`へ読み取り専用bind mountする。既定のホストパスは`./.ai_agent_base/private_skills`で、`PRIVATE_SKILLS_SOURCE`により変更できる。Skill本文をWorkerイメージへコピーせず、ホスト上の更新は次回の計画カタログ取得またはサブエージェント実行時の読込に反映する。Workerは計画時にディレクトリ直下の有効なSkill名と説明を列挙し、管理エージェントに候補として渡す。計画の`skill_names`は候補内の名前を最大2件まで指定し、PostgreSQLのSubtaskへ保存する。サブエージェント実行ごとに指定された`SKILL.md`を再読込するため、保存済み計画の再試行でも最新の内容を使う。
+Private Gitリポジトリを`./.ai_agent_base`へcloneし、`agents/`と`skills/`を同一プラグインルートとして扱う。Agent定義は`agents/<agent-id>.agent.md`、Skillは`skills/<skill-name>/SKILL.md`に置く。Workerのみがルート全体を読み取り専用bind mountし、API／UIイメージへ本文をコピーしない。既定設定はホストの`./.ai_agent_base`とWorker内の`/opt/agent-plugin`とし、`AGENT_PLUGIN_SOURCE`／`AGENT_PLUGIN_PATH`で変更可能にする。旧`PRIVATE_SKILLS_SOURCE`／`PRIVATE_SKILLS_PATH`を指定している環境は、旧Skillディレクトリを読む移行互換を提供し、非推奨化・削除時期をREADMEへ記載する。
 
-Skill名は小文字英数字とハイフンからなるディレクトリ名とfront matterの`name`が一致するものに限り、シンボリックリンク、ルート外パス、壊れた／過大なファイルは候補から除外する。計画保存時に選択名を現在の候補と照合し、通常の選択済みSkillが実行時に削除・破損していれば明示的に失敗させる。画像生成時に必須となる`image-generation`は管理エージェントの最大2件の任意選択とは独立してWorkerが生成／修正Runnerと画像レビューRunnerへ読み込む。既存計画の`image-generation-prompt`名は実行時に新名称へ正規化する。Skillが存在しない場合に限り、同じJSON契約と視覚レビュー基準のfallbackを使用する。Skillが存在するのに内容が不正、または安全に読み込めない場合はフォールバックせず失敗させる。Skill本文は信頼された管理対象の指示として扱うが、登録済みToolの権限を越えず、シェルやファイル操作を追加しない。画像ToolはSkillとは独立して画像プロバイダー設定に基づき登録し、モデル出力やSkill本文だけで認可・実行範囲を拡張しない。
+Workerは計画時にAgentとSkillのカタログを別々にロードする。Skillカタログは従来どおり名前・説明だけをManagerへ渡し、`skill_names`は最大2件をSubtaskへ保存する。Agentカタログは安定ID・表示名・説明・関連Skill名と、コア設定から導出した役割／選択可否だけをManagerへ渡す。プラグインに独自front matterを要求しない。Agent定義とSkill本文はサイズ・UTF-8・YAML/front matter・ID・重複・Skillリンク・symlink・ルート逸脱を検証し、その他のメタデータは安全なデータとして無視する。YAMLはsafe loaderで解析し、Markdown本文はコード実行せず指示テキストとして扱う。明示選択されたSkillまたはAgent参照Skillが欠落・破損・digest不一致なら診断可能な実行エラーとし、汎用Agent／別Skillへ暗黙に差し替えない。カタログ自体が未設定の旧環境ではAgent ID NULLの汎用実行を維持する。
+
+Skill名は小文字英数字とハイフンからなるディレクトリ名とfront matterの`name`が一致し、定義と実ファイルの両方がプラグインルート内にあるものに限る。Workerはsymlink、ルート外参照、壊れた／過大なファイルを拒否する。計画保存時に選択名を現在のカタログと照合し、選択後にSkillが欠落・破損した場合は明示的に失敗させる。専門生成AgentとReviewerは、それぞれの定義が参照するSkillだけを読み込み、無関係な名前のSkillを暗黙に追加しない。Managerが選択したSkillとの重複は除く。汎用・旧画像生成経路では`image-generation` Skillと不在時の組み込み指針を維持し、旧計画の`image-generation-prompt`名を正規化する。存在するSkillが不正または安全に読み込めない場合はフォールバックせず失敗させる。Reviewerを利用しない旧環境では従来のManagerレビューを維持し、保存済みReviewer定義の欠落・破損は実行障害とする。Skill／Agent本文は信頼された管理対象の指示として扱うが、登録済みToolの権限を越えず、シェルやファイル操作を追加しない。
 
 ### 7.2 プライベート資産の配置
 
@@ -593,21 +614,24 @@ flowchart TB
 
     subgraph Private["Private/local storage（例）"]
         Root["~/.ai_agent_base/"]
-        Skills["private_skills/<br/>独自スキル（Private Gitまたはローカル管理）"]
+        PluginAgents["agents/<br/>専門家Agent定義"]
+        Skills["skills/<br/>再利用可能な手順・知識"]
         Knowledge["knowledge_db/<br/>ベクトルDB・元文書（Git管理対象外）"]
         Config["config/<br/>ローカル設定（秘密情報を含む場合は保護）"]
+        Root --> PluginAgents
         Root --> Skills
         Root --> Knowledge
         Root --> Config
     end
 
+    Interfaces -. "実行時に接続" .-> PluginAgents
     Interfaces -. "実行時に接続" .-> Skills
     Interfaces -. "検索インターフェース" .-> Knowledge
 ```
 
 実パスは設定で変更できる。プライベートパス、DBファイル、ログ、元文書、認証情報は公開リポジトリに追加しない。`.gitignore`と配布設定でローカルデータの誤コミットを防ぎ、起動時に設定済みパスが公開リポジトリ内を指していないか警告・検査する。
 
-現行Workerは`.ai_agent_base/private_skills`を実行時bind mountで読み取り、イメージビルド時にSkill本文を複製しない。APIやUser/Admin UIにはこのディレクトリをマウントせず、Worker内でも読み取り専用とする。
+専門Agentプラグインへの移行後は、Workerが`.ai_agent_base`全体を実行時bind mountで読み取り、イメージビルド時にAgent／Skill本文を複製しない。APIやUser/Admin UIにはマウントせず、Worker内でも読み取り専用とする。移行期間中に旧Skill-onlyのmountを許容する場合も、Agentカタログが存在しない環境として扱う。
 
 ### 7.3 検索インターフェース
 
@@ -639,7 +663,7 @@ Tavily APIキーはVaultの`VAULT_TAVILY_KEY_PATH`からWorker用AppRoleで検�
 
 Workerで`COMFYUI_ENABLED=true`かつタスク設定の`worker_image_provider`が`comfyui`の場合、サブエージェントには専用Function Tool `comfyui_generate_image`を追加する。これはユーザーが要求した画像の生成に限る`writes_data`機能であり、一般の副作用Toolを許可するものではない。Tool Registryは既定では引き続き`read_only`だけを公開し、この専用ツールを明示的に登録したWorker実行に限って許可する。生成要求は正の／負のプロンプト、単一ファイル名、幅・高さ、ステップ数を受け取り、値域とファイル名を検証する。Workerは固定された標準チェックポイント生成グラフだけをComfyUIへ送信し、モデル出力による任意ワークフローJSONやコマンド実行を受け付けない。
 
-ComfyUI画像Toolを利用可能なサブタスクでは、Workerは計画時のSkill選択とは独立して`image-generation`の本文をシステム指示へ組み込む。ユーザーが画像生成を要求した場合、サブタスクはSkillの出力形式に従い、`positive_prompt`と`negative_prompt`の2キーだけを持つJSONオブジェクトを作る。Skillが存在しない場合はサブタスク自身が同じJSONを生成するよう指示する。存在するSkillの破損・読込失敗を不在として扱わない。Tool引数ではこのオブジェクトを`image_prompt`として受け取り、Pydanticでキー、型、長さを検証する。生成設定はSkill出力JSONと分離し、`positive_prompt`をComfyUIの正プロンプト入力、`negative_prompt`を負プロンプト入力へ渡す。画像生成履歴の既存形式は維持し、正プロンプトを`ImageGenerationRecord.prompt`および`image_generation_revisions.prompt`へ対応付ける。既存計画に保存された旧Skill名はWorkerで新名称へ正規化する。
+ComfyUI画像Toolを利用可能なサブタスクでは、専門Agentが参照したSkillとManagerが選んだSkillを読み込む。特定名の画像Skillを参照しない専門Agentに、別プラグインの`image-generation` Skillを暗黙に追加しない。汎用・旧実行では従来の`image-generation` Skillを使い、不在なら組み込み指針で代替する。いずれの経路でも画像生成Tool引数は`positive_prompt`と`negative_prompt`の2キーだけを持つJSONとし、Pydanticでキー、型、長さを検証する。生成設定はJSONと分離し、正／負プロンプトをComfyUIの対応入力へ渡す。生成履歴では正プロンプトを`ImageGenerationRecord.prompt`および`image_generation_revisions.prompt`へ対応付ける。既存計画の旧Skill名はWorkerで新名称へ正規化する。
 
 生成完了は有限のタイムアウト内でポーリングし、PNG形式、応答サイズ、出力ファイル名を検証する。Workerはリース・会話sequenceを保存直前に再確認し、検証済み画像を既存の内部Workspace API経由で`artifacts/`へ書き込み、TaskFileメタデータへ登録する。画像バイト列は会話、イベント、DBへ保存しない。修正を可能にするため、成功した生成時の正／負プロンプトと寸法・stepsを、生成画像の相対パスと対応付けた`Subtask.result`内の`image_generations`メタデータとして保存する。このメタデータはタスク実行・修正用であり、ユーザー向けイベント、ツール実行記録、ログへ含めない。タスク削除時はSubtask結果とWorkspaceを既存の削除フローで消去する。修正時は保存済みプロンプトを前回条件としてRunnerへ渡し、未達条件を反映して再生成する。成功した生成ツールの記録にある相対パスを対象に、Workerは内部認証付き読み取りAPIからPNGを取得する。このAPIは`artifacts/`直下のPNG、生成元がagentでroleがfinalのTaskFile、ファイルサイズ、PNGシグネチャを検証する。レビューごとに対象パスを重複なしでランダムに並べ、最大5枚・合計20 MiBの上限内で画像を選択する。1枚が残りサイズに収まらない場合や5枚に達した場合はその画像を省き、可能なら残り候補を続けて検討する。選択したパスは画像入力と同じ順序でレビュー入力に示し、省いたパスも明示する。モデルには添付サンプルだけを評価させ、未添付画像まで確認したと主張させない。候補があるのに上限内へ1枚も含められない場合は、画像なしで内容確認を装わず実行障害として扱う。取得画像はSDKの画像入力パーツに含め、要求ごとにdata URLへ符号化する。画像内容はサブタスクレビューと最終レビューの両方で評価し、生成パスの伝播と`artifact_present`によるファイル存在判定も維持する。最終レビューの未達項目は修正対象を回答／画像／両方に分類し、画像対象では生成元とパスを特定して前回プロンプトを修正し、修正画像を再レビューしてから回答を統合する。画像の読み取り失敗や選択モデルが画像入力に対応しない場合は品質未達として修正を繰り返さず、診断可能な実行障害として扱う。サブタスクのツール実行記録にはプロンプトを含めず、登録済みの相対成果物パスだけを記録する。生成失敗、ComfyUI未起動、タイムアウト、リース喪失は成功扱いにしない。
 
@@ -661,7 +685,7 @@ User APIに`GET /api/tasks/{task_id}/image-revisions`を追加し、セッショ
 
 #### プロンプトとツール
 
-ComfyUIとOpenAIは、画像生成プロンプトを作成・検証する工程を共通化する。画像Toolを利用可能なサブタスクでは、計画時のSkill選択とは独立して`image-generation` Skillを読み込み、存在しない場合に限り同じ契約のフォールバックを使用する。破損や安全に読み込めないSkillは失敗として扱う。ユーザーが要求した画像について、サブエージェントが`positive_prompt`と`negative_prompt`の2キーのみを持つJSONを生成し、型・長さ・追加キーを検証する。ファイル名や画像サイズなどの生成設定はこのJSONと分離する。
+ComfyUIとOpenAIは、画像生成プロンプトを作成・検証する工程を共通化する。専門Agentではその定義が参照するSkillを読み、特定名のプラグインSkillを必須にしない。汎用・旧実行では従来の`image-generation` Skillを使用し、不在の場合に限り組み込み指針へフォールバックする。選択されたSkillが破損または安全に読み込めない場合は失敗として扱う。ユーザーが要求した画像について、サブエージェントが`positive_prompt`と`negative_prompt`の2キーのみを持つJSONを生成し、型・長さ・追加キーを検証する。ファイル名や画像サイズなどの生成設定はこのJSONと分離する。
 
 ComfyUIには従来どおり正／負プロンプトを別々に渡す。OpenAIには専用の`negative_prompt`パラメーターを送らず、検証済みJSONからAPI呼び出し直前に一つの文字列を組み立て、Images APIの`prompt`として渡す。
 
@@ -696,13 +720,15 @@ OpenAIにはstepsがないため、`ImageGenerationRecord`と`image_generation_r
 
 ### 7.9 `image-generation` Skillによる細部レビューと反復修正（現行実装）
 
-Workerは画像生成Toolが使えるサブタスクでprivate `image-generation` Skillを必ず読み込み、prompt生成、初回生成、品質修正に同じ指針を使う。画像レビュー時はManager側RunnerにもSkillを読み込むが、user-facing出力形式より`ChecklistReviewResult`の構造化契約を優先する。旧計画に保存された`image-generation-prompt`は新名称へ正規化する。Skillが存在しない場合だけfallbackし、Skillが存在するのに壊れている／安全に読めない場合は失敗させる。Skill本文だけでTool権限を増やさない。
+Workerは専門生成AgentとReviewerについて、それぞれが参照するSkillを読み込む。異なるプラグインの特定名Skillを暗黙に追加せず、最終的なTool引数・Runner出力・権限の契約はコアが指定する。汎用・旧画像生成経路では従来の`image-generation` Skillと、不在時の組み込み指針を使う。旧計画に保存された`image-generation-prompt`は新名称へ正規化する。存在するSkillが壊れている／安全に読めない場合は失敗させ、Skill本文だけでTool権限を増やさない。
+
+新しいカタログbindingでは、画像生成Agentの同一Runnerに`review_generated_image` Toolを登録し、Managerへ画像を返す前に選択済みReviewerを呼び出す。要求、実プロンプト、生成設定、該当PNGと利用可能なcropをWorker会話モデルへ渡して`ImageSpecialistReview`を検証する。要修正時は同一`image_id`で再生成し、1サイクルあたり初回を含む最大5回レビューする。Managerが修正を要求して新サイクルを開始した場合、同じimage IDでもレビュー番号を1に戻す。Worker再試行は同一cycle IDを再利用してカウントを維持する。履歴とサイクル別回数はSubtask結果JSONに保存し、`quality_revision_count`とは別に管理する。未レビュー、サイクル内5回未満で未解決、または判定不能の画像をManagerへ渡さず、5回目の未解決だけは上限到達として結果に含める。既に事前レビュー済みの画像についてManager後の重複Reviewer呼び出しは行わない。Managerはその後に独立の受け入れチェックを行い、画像修正要求はManager品質修正上限内で新しいAgent生成サイクルを開始する。ReviewerのAgent定義自体にコア固有の出力形式を書く必要はない。
 
 prompt JSONは引き続き`positive_prompt`／`negative_prompt`の2文字列だけを持つ。Skillは指定条件を保ちながら、主体の数、身体の接続・姿勢・手指と持ち物の接触、背景物の形・接続・遠近、光・影を具体化させる。画像レビューは、手足の数とつながり、関節・指、接触、顔・目、遮蔽、背景の形状・遠近、反射・影・光源、意図しない重複や断片を確認し、作風上の意図的な誇張は欠陥と決めつけない。欠陥は観察した画像上の場所・証拠と結び付け、見えない箇所や原因を推測で断定しない。
 
 画像が実際にレビューへ添付される場合、Workerは必須の`image_visual_integrity`チェックを追加する。レビュー入力には全体画像を含め、Pillowでメモリー内生成した四分割cropを空き容量の範囲で追加する。全体画像とcropを合わせ最大5 image parts・合計20 MiBとし、各viewを元artifact pathと対応付けてモデルへ示す。OpenAI vision入力は`detail=high`を指定する。上限に入らない画像／cropは未確認として明示し、crop作成不可時は全体画像のみをレビューして細部の未確認を保つ。cropや画像バイト列はWorkspace、DB、イベントへ別途保存しない。
 
-視覚チェック失敗は元artifact path、観察位置、欠陥を記録して`revision_target=image`とする。既存の前回prompt・良好な条件を保持し、欠陥を狙ったpromptで新しい画像全体を再生成した後、必ず同じ全体／細部レビューを再実行する。Toolはmask／部分編集をサポートしないため部分編集を行ったとは報告しない。初回生成後の画像修正は最大2回とし、既存のサブタスク／タスク品質上限やツール予算が低い場合は低い上限を優先する。上限到達・進展なし・生成元不明なら残存欠陥と未確認箇所を示して部分完了とする。
+視覚チェック失敗は元artifact path、観察位置、欠陥を記録して`revision_target=image`とする。既存の前回prompt・良好な条件を保持し、欠陥を狙ったpromptで新しい画像全体を再生成した後、必ず同じ全体／細部レビューを再実行する。Toolはmask／部分編集をサポートしないため部分編集を行ったとは報告しない。生成Agent内の画像修正は初回を含む最大5回の専門レビューに従い、Manager側の品質修正上限・ツール予算は別カウンターで適用する。専門レビュー上限到達・進展なし・生成元不明なら残存欠陥と未確認箇所を示して部分完了とする。
 
 ComfyUIではSamplerへ渡した実seedを保存し、Skillまたはユーザー指定のseedがある場合はその値を使う。OpenAIはquality=`auto`を明示し、seedは非対応のためNULLとする。モデル、サイズ、steps（対応時）、quality／seed、元プロンプト、OpenAI送信文、修正pathとtriggering reviewを`image_generation_revisions`へ記録する。マイグレーション`0015_image_generation_settings`はnullableなseed／quality列を追加し、過去世代の値を捏造しない。
 
@@ -775,7 +801,7 @@ WorkspaceファイルAPIは実装済みで、所有者・削除状態を確認�
 - `task.completed` / `task.failed`
 - `task.tool_budget_approval_requested` / `task.tool_budget_approval_resolved`
 
-現行イベントには`task.partially_completed`、`quality.checklists_created`、`quality.review_completed`、`task.tool_budget_approval_requested`、`task.tool_budget_approval_resolved`が含まれる。承認要求イベントは要求ID、対象サブタスク、追加回数、理由を含み、秘密情報や隠れた思考過程は含めない。決定イベントは承認／拒否と結果状態を記録する。品質イベントは計画バージョン、対象、判定結果や項目数をpayloadに記録する。`agent.progress`はツール活動の`activity`・`phase`・`tool_name`、Skill読込の`skill_name`・`skill_source`（`public`／`private`／`fallback`）、サブタスク／会話sequenceを記録し、Skill不在時は`phase=fallback`として区別する。ツール完了時は出典件数を含める。検索query、ツール引数、取得本文は進捗イベントに含めない。チェックリストと項目別根拠の正本はDBの計画・判定記録とし、SSEイベントは再取得可能な進捗通知として扱う。タスク完了イベントには保存済み成果物の相対パスを含め、UIがExplorer一覧を更新できるようにする。
+現行イベントには`task.partially_completed`、`quality.checklists_created`、`quality.review_completed`、`task.tool_budget_approval_requested`、`task.tool_budget_approval_resolved`が含まれる。承認要求イベントは要求ID、対象サブタスク、追加回数、理由を含み、秘密情報や隠れた思考過程は含めない。決定イベントは承認／拒否と結果状態を記録する。品質イベントは計画バージョン、対象、判定結果や項目数をpayloadに記録する。`agent.progress`は実行者の`agent_name`と、ツール活動の`activity`・`phase`・`tool_name`、Skill読込の`skill_name`・`skill_source`（`public`／`private`／`fallback`）、サブタスク／会話sequenceを記録する。画像Reviewerの開始・完了イベントはReviewer名、画像ID、レビュー番号、判定を含み、UIは`<Agent名>: <作業>`形式で表示する。Skill不在時は`phase=fallback`として区別し、ツール完了時は出典件数を含める。検索query、ツール引数、取得本文は進捗イベントに含めない。チェックリストと項目別根拠の正本はDBの計画・判定記録とし、SSEイベントは再取得可能な進捗通知として扱う。タスク完了イベントには保存済み成果物の相対パスを含め、UIがExplorer一覧を更新できるようにする。
 
 SSEエンドポイントはタスク所有者を検証し、DBのイベントID順に最大200件ずつ読み取る。`Last-Event-ID`以降を再送し、新規イベントがない間は設定間隔（既定1秒）でkeep-aliveを送る。独立した成果物イベントは設けず、完了イベントに保存済みファイルの相対パスを含める。UIは会話本文をイベントへ重複記録せず、必要に応じてメッセージAPIから再取得する。
 
@@ -792,14 +818,18 @@ SSEエンドポイントはタスク所有者を検証し、DBのイベントID�
 | `task_workspaces`（将来） | `task_id`, `status`, `sandbox_ref`, `created_at`, `updated_at` | Sandbox分離後のWorkspace準備／利用可能／削除状態を管理。ホストパスやファイル内容は保存しない |
 | `system_settings` | `id`, `settings_json`, `openai_key_configured`, `version`, `updated_by`, `updated_at` | 管理画面から変更するアプリ運用設定とOpenAIキー設定済み状態の正本。キー自体・接続先等のデプロイ設定は格納しない |
 | `conversation_messages` | `id`, `task_id`, `sequence`, `role`, `content`, `created_at` | タスク固有のユーザー指示と管理エージェント応答を時系列で保存 |
-| `subtasks` | `id`, `task_id`, `title`, `instruction`, `status`, `dependencies`, `model_id`, `skill_names`, `attempt`, `artifact_goal`, `acceptance_checklist`, `plan_version`, `quality_revision_count`, `tool_calls_used`, `tool_calls_limit`, `result`, `error`, `created_at` | 計画された作業単位、成果物目標、受け入れチェックリスト、実行結果、画像成果物にひも付く生成条件、品質修正回数、消費済みツール数とユーザー承認後の累積許可数を保存 |
+| `subtasks` | `id`, `task_id`, `title`, `instruction`, `status`, `dependencies`, `model_id`, `agent_id`, `agent_definition_digest`, `review_agent_id`, `review_agent_digest`, `skill_names`, `attempt`, `artifact_goal`, `acceptance_checklist`, `plan_version`, `quality_revision_count`, `tool_calls_used`, `tool_calls_limit`, `result`, `error`, `created_at` | 計画された作業単位、独立に固定した生成Agent／ReviewerのIDとdigest（Agent ID NULLは汎用Agent）、成果物目標、受け入れチェックリスト、実行結果、画像生成条件、品質修正回数、消費済みツール数とユーザー承認後の累積許可数を保存 |
 | `task_plans` | `id`, `task_id`, `version`, `conversation_sequence`, `summary`, `final_checklist`, `change_reason`, `created_at` | タスク計画と最終チェックリストを会話sequenceに結び付け、再計画前の版も保持 |
-| `quality_reviews` | `id`, `task_id`, `plan_version`, `target_type`, `target_id`, `revision_round`, `checklist_results`, `verdict`, `reviewer_model_id`, `created_at` | サブタスク成果物および最終成果物の判定を追記専用で保存 |
+| `quality_reviews` | `id`, `task_id`, `plan_version`, `target_type`, `target_id`, `revision_round`, `checklist_results`, `verdict`, nullable `reviewer_model_provider`, `reviewer_model_id`, nullable `specialist_model_provider`, nullable `specialist_model_id`, nullable `reviewer_agent_id`, nullable `reviewer_agent_digest`, `created_at` | サブタスク成果物および最終成果物の判定、Managerモデル、委譲した専門レビューモデルと定義digestを追記専用で保存 |
 | `image_generation_revisions` | `id`, `task_id`, `subtask_id`, `plan_version`, `generation_no`, `trigger_quality_review_id`, `source_artifact_paths`, `artifact_path`, `prompt`, `negative_prompt`, `openai_prompt`, `model_id`, `width`, `height`, nullable `steps`, nullable `seed`, nullable `quality`, `unmet_items`, `is_backfilled`, `created_at` | 成功した各画像生成の元プロンプト・OpenAI送信文（OpenAI以外はNULL）、実seed／quality（非対応・未取得はNULL）と生成設定を追記専用で保存し、品質レビューの未達項目・修正前後の画像パスに結び付ける |
 | `events` | `id`, `task_id`, `type`, `payload_json`, `created_at` | SSE再送と画面進捗。`subtask_id`列は持たず、必要な識別子はpayloadに含める |
 | `jobs` | `id`, `task_id`, `status`, `available_at`, `lease_owner`, `lease_expires_at`, `attempt`, `created_at` | Workerが取得するタスク実行用耐久ジョブキューと期限付きリース |
 | `task_files` | `id`, `task_id`, `workspace_rel_path`, `role`, `source_kind`, `source_ref`, `conversation_sequence`, `size_bytes`, `created_at`, `updated_at` | 入力、ソース、重要な途中成果物、最終成果物のパス・由来・サイズと、会話上の添付位置を管理する。ファイル内容はWorkspaceに保存 |
 | `task_deletion_jobs` | `task_id`, `status`, `attempt`, `available_at`, `lease_owner`, `lease_expires_at`, `created_at` | Workspace清掃後にTaskを削除する耐久ジョブ。Taskへのcascade FKを持たず、清掃完了時にTask削除と同一トランザクションで除去 |
+
+専門家Agent選択の導入ではマイグレーション`0016_specialist_agents`を追加し、`subtasks.agent_id`、`subtasks.agent_definition_digest`、`quality_reviews.reviewer_model_provider`、`quality_reviews.specialist_model_provider`、`quality_reviews.specialist_model_id`、`quality_reviews.reviewer_agent_id`、`quality_reviews.reviewer_agent_digest`をnullable列として加える。既存SubtaskはAgent ID／digestともNULLのまま汎用Agentとして動作し、既存QualityReviewもレビュアーAgentなしとして保持する。プラン生成時にはSubtaskのAgent IDとdigestを同じトランザクションで保存し、レビュー行にはManagerと専門レビュアーそれぞれのモデル、およびレビュアーID／digestを記録する。ダウングレードでは追加列だけを削除する。
+
+後続の`0017_agent_binding_snapshot`は`subtasks.review_agent_id`と`subtasks.review_agent_digest`をnullable列として追加し、Reviewerを生成Agentから独立に固定する。`0018_catalog_review_binding`は`review_binding_mode`を追加し、カタログ方式の意図的なReviewerなしと旧行を区別する。旧`0016`の処理途中タスクは、従来の親Agentの推移的digestと既存の子Agent参照が一致する場合に限り旧方式でReviewerを復元する。IDとdigestの片方だけが存在する、定義が欠落する、またはdigestが一致しない場合は明示的に失敗させる。
 
 現行DBには`users`、`system_settings`、`api_access_keys`、`web_sessions`、`tasks`、`conversation_messages`、`subtasks`、`task_plans`、`quality_reviews`、`image_generation_revisions`、`events`、`jobs`、`task_files`、`task_deletion_jobs`の14テーブルがある。`task_workspaces`はSandbox分離時の将来拡張である。`tasks.pending_tool_approval`は現在保留中の要求だけを保持し、決定後に消去する。承認履歴は専用テーブルを増やさず、要求・決定イベントへ記録する。`tasks.deletion_requested_at`は削除受付後のアクセス遮断に使う。TaskFileの内容は名前付きWorkspaceボリュームを正本とし、DBには入力／ソース／途中成果物／最終成果物の区分、相対パス、由来、サイズ等のメタデータを保存する。タスク削除ジョブはTaskへの外部キーを持たず、Workspace清掃の失敗時も残して再試行する。`subtasks`には成果物目標・チェックリスト・計画バージョン・品質修正回数・承認後の累積ツール上限を保存する。画像生成履歴は`image_generation_revisions`へ追記し、TaskとSubtaskの削除に連動して消去する。計画バージョンはタスク内で一意とし、品質判定は上書きせず履歴として残す。判定記録にはチェック項目ごとの結果、短い判断根拠、成果物中の証拠、判定モデルを含める。隠れた思考過程は保存しない。タスク所有者以外へタスク詳細を返さない。
 
@@ -875,7 +905,7 @@ SDK導入後の例外は共通実行アダプターで分類し、ターン上�
 - 管理者専用セッションと管理者ロールを必須とし、一般ユーザーからアクセスできない独立した管理画面として提供する。
 - 管理者が一般ユーザーの登録、初期パスワード設定、パスワード再設定を行う。アカウントの有効／無効切替はない。
 - 運用画面にはタスクID、所有者メール、状態、時刻、エラー情報を表示する。会話本文、指示、成果物、利用量・コストは表示しない。
-- manager／workerモデルID、タスク内同時サブタスク数（1〜32）、最大試行回数（1〜3）、サブタスク単位とタスク全体の最大品質修正回数を管理する。品質修正回数は形式・API再試行やWorkerジョブ再試行とは別に制限する。保存した設定は新規タスクに適用し、既存タスクは設定スナップショットを使う。承認期限やSandbox通信許可リストは設定項目にない。
+- manager／workerモデルID、タスク内同時サブタスク数（1〜32）、最大試行回数（1〜3）、サブタスク単位とタスク全体の最大品質修正回数を管理する。専門Reviewerは保存済みWorker会話モデルを使う。品質修正回数は形式・API再試行やWorkerジョブ再試行とは別に制限する。保存した設定は新規タスクに適用し、各タスクは選択時のモデル設定をsnapshotする。承認期限やSandbox通信許可リストは設定項目にない。
 - システム共通OpenAIキーをVaultへ登録・更新する。画面には登録済み／未登録の状態だけを表示し、保存済みキーを再表示しない。
 
 ### 12.3 一般ユーザー向けUI
@@ -915,7 +945,7 @@ Python 3.10で実行検証した`openai-agents==0.24.0`、`openai==3.35.1`、`py
 
 Runnerターン上限とサブタスクのツール総数上限はサーバー側環境設定から初期化し、APIが新規タスクの設定スナップショットに保存する。管理UIへは公開せず、既存API／UI契約を維持する。既存タスクのスナップショットに新項目がない場合は固定互換既定値24・20を適用し、実行時の最新管理設定で上限を変えない。
 
-現行実装の管理画面から変更できる運用設定にはManager／Worker会話モデルのエンドポイントとモデルID、独立したWorker画像生成プロバイダーとモデルID、タスク内同時サブタスク数、最大試行回数、サブタスク単位とタスク全体の品質修正上限が含まれる。OpenAI／Ollama候補は各モデル一覧APIから、ComfyUI候補はComfyUI APIから取得する。Vault接続・DB接続・Cookie設定等は環境設定で与える。設定更新は新規タスクへ適用し、既存タスクは作成時の`config_snapshot`を使う。画像生成はComfyUI固定チェックポイントワークフローとOpenAI Images APIを実装し、Ollama画像生成は未実装である。承認、Sandbox通信許可、利用量・コスト等の設定は存在しない。
+現行実装の管理画面から変更できる運用設定にはManager／Worker会話モデルのエンドポイントとモデルID、独立したWorker画像生成プロバイダーとモデルID、タスク内同時サブタスク数、最大試行回数、サブタスク単位とタスク全体のManager品質修正上限が含まれる。専門画像ReviewerはタスクにsnapshotされたWorker会話モデルを使い、独立したモデル設定は持たない。Vault接続・DB接続・Cookie設定等は環境設定で与える。設定更新は新規タスクへ適用し、既存タスクは作成時の`config_snapshot`を使う。画像生成はComfyUI固定チェックポイントワークフローとOpenAI Images APIを実装し、Ollama画像生成は未実装である。承認、Sandbox通信許可、利用量／コスト等の設定は存在しない。
 
 | デプロイ設定 | 内容 |
 |---|---|
@@ -936,7 +966,7 @@ Runnerターン上限とサブタスクのツール総数上限はサーバー�
 | `VAULT_KV_MOUNT` | Vault KV v2のmount名 |
 | `VAULT_OPENAI_KEY_PATH` | システム共通OpenAIキーを保存するKV v2内のパス |
 | `VAULT_TAVILY_KEY_PATH` | Tavily APIキーを保存するKV v2内のパス。Worker AppRoleのみ読取可能 |
-| `PRIVATE_SKILLS_SOURCE` / `PRIVATE_SKILLS_PATH` | ホスト上のSkillディレクトリ（既定`./.ai_agent_base/private_skills`）とWorker内の読込先（`/opt/private-agent-skills`）。Workerだけに読み取り専用bind mountし、イメージへコピーしない |
+| `AGENT_PLUGIN_SOURCE` / `AGENT_PLUGIN_PATH` | Agent定義とSkillを含むプラグインルート（既定`./.ai_agent_base`）とWorker内の読込先（`/opt/agent-plugin`）。Workerだけに読み取り専用bind mountし、イメージへコピーしない。旧`PRIVATE_SKILLS_SOURCE`／`PRIVATE_SKILLS_PATH`は移行互換に限る |
 | `TAVILY_TIMEOUT_SECONDS` | Tavily CLI検索プロセスのタイムアウト。Worker側で1〜60秒に制限 |
 | `VAULT_API_ROLE_ID_FILE` / `VAULT_API_SECRET_ID_FILE` | 管理API用AppRole資格情報を読み込む制限付きファイル |
 | `VAULT_WORKER_ROLE_ID_FILE` / `VAULT_WORKER_SECRET_ID_FILE` | Worker用読取専用AppRole資格情報を読み込む制限付きファイル |
@@ -961,10 +991,11 @@ Runnerターン上限とサブタスクのツール総数上限はサーバー�
 
 | 機能領域 | 現行実装状況 |
 |---|---|
-| 画像生成・レビュー | 独立した画像プロバイダー選択、ComfyUIチェックポイント候補一覧、ComfyUI固定ワークフロー、OpenAI Images APIを実装。`image-generation` Skillをprompt生成、画像生成、レビュー、修正Runnerで使う。両Toolは共通の正／負プロンプトJSONを検証し、OpenAIには結合した通常プロンプトを送る。生成PNGを検証してTaskFile付きWorkspaceへ保存し、レビューではhigh-detailの全体画像と上限内の詳細cropを管理モデルへ渡す。生成画像ごとの必須visual-integrityチェックで身体・接触・背景の具体的欠陥を評価し、Skillに基づいて最大2回（既存の低い上限があればそちらまで）再生成・再レビューする。seed／qualityを含む生成設定と履歴を追記し、User UIで表示する。Ollama画像生成と任意ワークフロー／ノード実行は未実装 |
+| 画像生成・レビュー | 独立した画像プロバイダー選択、ComfyUIチェックポイント候補一覧、ComfyUI固定ワークフロー、OpenAI Images APIを実装。専門Agentは自身のSkillを使い、汎用Agentは画像Skillまたは組み込み指示を使う。両Toolは共通の正／負プロンプトJSONを検証し、OpenAIには結合した通常プロンプトを送る。生成PNGを検証してTaskFile付きWorkspaceへ保存する。生成AgentはManagerへ返す前にReviewerを呼び、各生成サイクルで画像IDごと初回を含む最大5回レビューし、Manager要求で新サイクルが始まればカウントをリセットする。判定不能や未レビューはManagerへ渡さず、サイクル別レビュー履歴と回数をManager品質修正回数と分けて保存する。Managerは受け取り後に独立したチェックリスト判定を行う。seed／qualityを含む生成設定と履歴を追記し、User UIで表示する。Ollama画像生成と任意ワークフロー／ノード実行は未実装 |
 | アカウント・認証 | Webセッション、CSRF、Bearerアクセスキー、管理者によるユーザー作成／パスワード再設定を実装 |
 | タスク・会話 | タスク作成、追加メッセージ、キャンセル、所有者スコープ、終端タスクの非同期削除要求を実装。Workspace清掃後にDB cascade |
 | エージェント実行 | 構造化計画、依存関係付き読み取り専用サブタスク、質問待ち、結果統合を実装 |
+| 専門家Agent | 実装済み。検証済みカタログからManagerがサブタスクと画像Reviewerを選択し、適任がない場合は汎用AgentやManagerレビューを使う。各ID／digestは独立に固定する |
 | SDK実行基盤 | 管理側の計画・レビュー・統合とサブタスクの成果生成・修正を共通アダプター経由でSDK実行する。Vault更新、JSONフォールバック、停止・上限・DB復旧境界をテスト。実モデルでの品質・速度・費用測定は未実施 |
 | 品質判定 | サブタスクごとと最終回答のチェックリストを機械的検証／モデルレビューし、DBに判定履歴を保存。修正上限後の未達は`partially_completed`として完了レポートへ記録 |
 | 構造化出力 | Structured Outputsと通常JSONフォールバック、Pydantic検証、限定再試行を実装 |
@@ -973,18 +1004,22 @@ Runnerターン上限とサブタスクのツール総数上限はサーバー�
 | 全体レート制御 | 1タスク内の並行数とモデル要求再試行のみ。Worker間共有RPM／TPM・同時実行枠は未実装 |
 | Workspace／Explorer | Task UUID別永続ファイル領域、TaskFileメタデータ、空ディレクトリを含む一覧と空状態表示、各ファイルの最終更新日時表示、入力アップロード、テキスト編集、PNG／JPEG／WebP／GIF画像プレビュー（20 MiB以下）、ダウンロード、入力テキストの計画取込、要求ファイルの構造化出力・保存と完了時のExplorer更新を実装。タスク別OS Sandbox、ターミナル、Git cloneは未実装 |
 | 副作用実行 | エージェント向け副作用Tool Calling、副作用操作の承認、タスク別Sandbox、Terminal、Git認証ブローカー、外向き通信制御は未実装 |
-| 拡張・集計 | プライベートスキル、RAG、コンテキスト要約、利用量／コスト集計は未実装 |
+| 拡張・集計 | Agent／Skillプラグインの読み込みは実装済み。RAG、コンテキスト要約、利用量／コスト集計は未実装 |
 | 運用・UI | 分離したUser/Admin UIを実装。User UIは品質進捗、準完了レポート、タスク別Explorer、レビュー未達項目と生成プロンプトを時系列で閲覧する画像生成履歴を提供。管理画面はアカウント、基本設定、品質修正上限、Vaultキー、タスクメタデータを扱う |
 
 | 観点 | 受け入れ条件 |
 |---|---|
 | 画像モデル選択 | 画像生成プロバイダー選択はWorker会話プロバイダーから独立し、OpenAI／Ollama／ComfyUIを切り替えられる。ComfyUI選択時は管理APIがComfyUIのチェックポイント一覧を返し、Worker会話用モデル一覧と混在しない。プロバイダーとモデルは新規タスクの`config_snapshot`へ保存され、ComfyUI一覧取得失敗時も手入力できる |
 | OpenAI画像生成 | OpenAI画像プロバイダー選択時に、Worker会話プロバイダーと独立してスナップショット済み画像モデルをImages APIへ指定する。共通JSONの正／負プロンプトを検証し、負プロンプトが空でなければ`Do not include`指示として通常プロンプトへ結合する。stepsを送らず、OpenAI対応サイズ、PNG、応答サイズを検証する。要求ごとにVaultからキーを取得し、自動再試行せず、成功した画像だけをWorkspace・TaskFile・追記履歴へ保存する |
-| ComfyUI画像生成・内容レビュー | GPU付きComfyUIは任意プロファイルで内部接続に限定され、画像プロバイダーがComfyUIの場合だけWorkerの専用Toolを登録する。画像Toolを利用可能なサブタスクには`image-generation` Skillを組み込み、不在時に限りサブタスク自身が同じ2キーJSONを作る。不正または安全に読み込めないSkillではフォールバックしない。`image_prompt`内の`positive_prompt`／`negative_prompt`を厳密に検証し、固定ワークフローの正／負入力へ渡す。値域・PNG・サイズ・タイムアウト・リース検査を通過した画像だけをTaskFileとして保存する。レビューには画像全体と上限内の詳細cropを合計5 image parts／20 MiB以内で渡し、元pathと表示領域を対応付ける。`image_visual_integrity`必須チェックで解剖学・接触・背景整合性を評価し、未達は観察箇所・根拠・対象pathを伴って最大2回まで修正・再レビューする。上限で除外した画像／cropは未確認として入力に明示し、取得失敗・不正PNG・モデル非対応は品質修正ではなく実行障害として扱う。画像別の元prompt、seed、生成設定は生成pathと対応付けて履歴に保存し、ツール記録・イベント・ログ・ユーザー向け応答にはprompt本文を含めない。生成元不明、品質修正上限またはツール予算到達時は再生成せず未達を維持する。画像バイト列はDB等に保存しない |
+| ComfyUI画像生成・内容レビュー | GPU付きComfyUIは任意プロファイルの内部接続に限定し、設定時だけ専用Toolを登録する。専門Agentは各自が参照したSkillだけを読み、汎用・旧実行は従来の画像Skillまたは不在時fallbackを使う。正／負プロンプトの2キーJSON、生成設定、PNG、サイズ、タイムアウトとリースを検証する。専門Reviewerには全体と上限内cropを合計5 image parts／20 MiB以内で渡し、画像IDごとに最大5回までレビュー／修正する。除外した画像／cropは未確認とし、読み取り失敗・不正PNG・画像非対応モデル・判定不能はManagerへの引き渡しを止める。生成条件とレビュー回数・結果を保存するが、prompt本文をイベント・ログへ、画像バイト列をDBへ保存しない |
 | SDKと作業管理の分離 | 計画・サブタスク実行・レビュー・統合をSDKで実行でき、Task／Subtask／Jobは既存DBで管理される。Runner終了だけで受け入れ済み・タスク成功にせず、既存の品質条件で確定する |
 | 画像生成プロンプト履歴 | 成功した各生成について元の正／負プロンプト、OpenAIの実送信文（OpenAI以外はNULL）、モデル・生成設定、出力パス、生成順を追記専用で保存する。stepsはComfyUIでは値を、OpenAIではNULLを記録する。修正生成は原因となった品質レビューと未達項目ID・説明・不足内容を結び付け、初回生成はレビューなしとして表示する。失敗・未検証の生成は成功履歴に追加しない。既存タスクは`Subtask.result`から確認できる最新生成だけをバックフィルし、それ以前の履歴を推定しない |
 | 画像生成履歴API・UI | `GET /api/tasks/{task_id}/image-revisions`は所有者だけに当該タスクの履歴を生成順で返す。User UIはレビュー未達項目、修正前後の画像パス、正／負プロンプト、OpenAIの実送信プロンプトと生成設定を時系列で閲覧でき、ComfyUIのstepsがNULLであるOpenAI履歴も表示できる。履歴は完了後もタスク削除まで保持する。別ユーザー・削除済みタスクから参照できず、プロンプト本文や未達内容はSSE・進捗イベント・ログ・管理者運用APIに含めない。非機密の履歴更新通知後にUIがAPIを再取得する |
 | SDK実行コンテキスト | 同じAgent定義を並行利用しても、別タスク・別サブタスクの入力、履歴、結果が混在しない。会話・計画・判定の正本はPostgreSQLにあり、自動Session保存によりユーザー会話を二重記録しない |
+| 専門家Agentカタログ | Workerが検証済み`.agent.md`をカタログ化し、Managerへ全ラインナップの選択用情報を渡す。プラグイン固有`kind`を要求せず、適任がなければNULLを選ぶ。未知IDや自己レビューを拒否し、選択された生成／レビューAgent IDを保存する |
+| Agent定義の固定・互換性 | Agent IDとSHA-256 digestをSubtaskへ保存し、レビュー行にも実レビュアーID／digestとManager／専門家それぞれのモデルProvider・IDを保存する。既存計画のNULLは汎用Agentとして復元できる。再取得・品質修正でdigest不一致なら明示的に失敗し、別Agentへ黙って切り替えない。Agent本文だけでTool権限やSDK handoffを増やさない |
+| 画像専門Agent連携 | カタログから生成AgentとReviewerを選択し、各定義digestを固定する。生成画像と要求・実プロンプト・設定をReviewerへ渡し、コア側の3値アダプターで視覚判定へ変換する。プラグインにコア固有front matterや出力形式を要求しない。Reviewerはタスクに保存されたWorker会話モデルを使用する。判定不能や画像非対応は合格・再生成にせず実行障害として停止する。Managerは全体を別途判定し、画像修正は最大2回またはより低い上限を適用する |
+| プラグイン構成・安全性 | `.ai_agent_base/agents/`と`.ai_agent_base/skills/`をWorkerだけへ読み取り専用mountする。safe YAML解析、ID・重複・Skill参照・サイズ・symlink・root外参照を検証する。未使用の標準front matter、未配置の子Agent参照や循環はコードとして実行せず、権限も付与しない。旧private_skills配置と旧digestの既存計画は互換を保つ |
 | SDK実行の上限・復旧 | Runnerターン数、ツール総数、モデル/API再試行、品質修正、Workerジョブ再試行がそれぞれ有限上限で停止する。SDK／HTTPの再試行で上限が増幅せず、再取得・修正でもツール予算がリセットされない。受け入れ済み成果を理由なく再実行しない |
 | User UI画像プレビュー | ExplorerでPNG／JPEG／WebP／GIFを20 MiB以下の場合だけインライン表示し、所有者認可付き既存APIを利用する。SVG等の能動コンテンツと上限超過画像はプレビューせずダウンロード可能とし、タスク切替・ファイル選択変更後にBlob URLを解放する |
 | ツール上限到達と追加承認 | 上限到達時に未実行ツール要求を制御結果として返し、既収集の出典・ツール記録を含む部分SubtaskResultが管理エージェントのレビューへ届く。追加調査不要なら既存情報で修正する。必要な場合は`waiting_approval`を永続化し、要求ID付きの明示承認のみで同一計画を再開する。追加数はタスク初期スナップショットと同数で、拒否・保留中は追加呼び出しがなく、部分受け入れ結果が統合へ渡る。アプリケーションによる累積承認上限はなく、リトライ・修正で消費数がリセットされない |

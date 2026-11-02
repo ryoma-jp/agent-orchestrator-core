@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import json
 
 import httpx2 as httpx
 import pytest
@@ -88,6 +89,76 @@ async def test_openai_image_review_inputs_use_high_detail(sdk_transport):
         provider="openai",
         input_images=[b"\x89PNG\r\n\x1a\nimage"],
     )
+    image_input = transport.requests[0]["input"][0]["content"][1]
+    assert image_input["type"] == "input_image"
+    assert image_input["detail"] == "high"
+
+
+@pytest.mark.asyncio
+async def test_task_plan_accepts_catalog_agent_ids_through_sdk(sdk_transport):
+    from app.agent_schemas import TaskPlan
+
+    checklist = [{
+        "id": "image",
+        "description": "Check the image",
+        "required": True,
+        "verification_mode": "model",
+    }]
+    sdk_transport([json.dumps({
+        "title": "Create image",
+        "summary": "Generate and review an image",
+        "final_checklist": checklist,
+        "subtasks": [{
+            "title": "Create image",
+            "instruction": "Generate an image",
+            "artifact_goal": "An image",
+            "acceptance_checklist": checklist,
+            "dependencies": [],
+            "agent_id": "illustrator",
+            "review_agent_id": "inspector",
+            "skill_names": [],
+        }],
+    })])
+    result = await StructuredModelClient().generate(
+        model="test-model",
+        provider="openai",
+        schema_name="task_plan",
+        schema=TaskPlan,
+        system_prompt="Plan the task.",
+        input_text="Create an image.",
+        max_attempts=1,
+    )
+
+    assert result.subtasks[0].agent_id == "illustrator"
+    assert result.subtasks[0].review_agent_id == "inspector"
+
+
+@pytest.mark.asyncio
+async def test_image_specialist_review_supports_indeterminate_sdk_output(
+    sdk_transport,
+):
+    from app.agent_schemas import ImageSpecialistReview
+
+    transport = sdk_transport(
+        [
+            '{"verdict":"indeterminate","evidence":"",'
+            '"deficiency":"The detail is not visible.",'
+            '"target_image_paths":[]}'
+        ]
+    )
+
+    result = await StructuredModelClient().generate(
+        model="test-model",
+        provider="openai",
+        schema_name="image_specialist_review",
+        schema=ImageSpecialistReview,
+        system_prompt="Review the supplied image.",
+        input_text="Inspect the visible details.",
+        input_images=[b"\x89PNG\r\n\x1a\nimage"],
+        max_attempts=1,
+    )
+
+    assert result.verdict == "indeterminate"
     image_input = transport.requests[0]["input"][0]["content"][1]
     assert image_input["type"] == "input_image"
     assert image_input["detail"] == "high"

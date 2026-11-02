@@ -634,6 +634,86 @@ def test_admin_quality_revision_limits_are_bounded():
         )
 
 
+def test_admin_defaults_do_not_expose_reviewer_model_override(monkeypatch):
+    import app.routers.admin as admin_module
+    from app.config import Settings
+
+    settings = Settings(
+        _env_file=None,
+        manager_model_provider="ollama",
+        manager_model="local-manager",
+    )
+    monkeypatch.setattr(admin_module, "get_settings", lambda: settings)
+
+    defaults = admin_module._default_settings()
+
+    assert "image_review_model_provider" not in defaults
+    assert "image_review_model" not in defaults
+
+
+@pytest.mark.asyncio
+async def test_task_snapshots_worker_model_without_fixed_agent_ids(
+    monkeypatch,
+):
+    import app.routers.tasks as task_module
+    from app.config import Settings
+    from app.schemas import TaskCreate
+
+    settings = Settings(
+        _env_file=None,
+        worker_model_provider="ollama",
+        worker_model="worker-vision",
+    )
+
+    class FakeSession:
+        def __init__(self):
+            self.added = []
+
+        async def get(self, *_args):
+            return SimpleNamespace(
+                settings_json={
+                    "image_generation_agent_id": "legacy-generator",
+                    "image_review_agent_id": "legacy-reviewer",
+                    "image_review_model": "legacy-model",
+                    "image_review_model_provider": "openai",
+                }
+            )
+
+        def add(self, value):
+            self.added.append(value)
+
+        async def flush(self):
+            for value in self.added:
+                if (
+                    isinstance(value, (Task, ConversationMessage))
+                    and value.id is None
+                ):
+                    value.id = uuid.uuid4()
+
+        async def commit(self):
+            return None
+
+        async def refresh(self, _value):
+            return None
+
+    monkeypatch.setattr(task_module, "get_settings", lambda: settings)
+    monkeypatch.setattr(task_module, "task_workspace", lambda *_a, **_k: None)
+
+    task = await task_module.create_task(
+        TaskCreate(instruction="Create an image"),
+        SimpleNamespace(id=uuid.uuid4()),
+        FakeSession(),
+    )
+    settings.worker_model = "later-worker"
+
+    assert task.config_snapshot["worker_model"] == "worker-vision"
+    assert task.config_snapshot["worker_model_provider"] == "ollama"
+    assert "image_generation_agent_id" not in task.config_snapshot
+    assert "image_review_agent_id" not in task.config_snapshot
+    assert "image_review_model" not in task.config_snapshot
+    assert "image_review_model_provider" not in task.config_snapshot
+
+
 def test_default_model_settings_use_openai_and_requested_models(monkeypatch):
     for name in (
         "MANAGER_MODEL_PROVIDER",
@@ -991,6 +1071,51 @@ def test_task_plan_rejects_dependency_cycles():
                     skill_names=[],
                 ),
             ],
+        )
+
+
+def test_planned_subtask_accepts_valid_agent_id_and_rejects_invalid_id():
+    valid_subtask = PlannedSubtask(
+        title="Generate image",
+        instruction="Create the requested image",
+        artifact_goal="Save a PNG image",
+        acceptance_checklist=[
+            ChecklistItem(id="image", description="Image exists")
+        ],
+        dependencies=[],
+        agent_id="image-generation",
+        review_agent_id="visual-reviewer",
+        skill_names=[],
+    )
+    assert valid_subtask.agent_id == "image-generation"
+    assert valid_subtask.review_agent_id == "visual-reviewer"
+
+    with pytest.raises(
+        ValidationError, match="subtask_and_reviewer_must_differ"
+    ):
+        PlannedSubtask.model_validate(
+            {
+                **valid_subtask.model_dump(),
+                "review_agent_id": valid_subtask.agent_id,
+            }
+        )
+
+    with pytest.raises(ValidationError):
+        PlannedSubtask.model_validate(
+            {**valid_subtask.model_dump(), "review_agent_id": "../outside"}
+        )
+
+    with pytest.raises(ValidationError):
+        PlannedSubtask(
+            title="Invalid agent",
+            instruction="Run an arbitrary agent",
+            artifact_goal="Return a result",
+            acceptance_checklist=[
+                ChecklistItem(id="result", description="Result exists")
+            ],
+            dependencies=[],
+            agent_id="../outside",
+            skill_names=[],
         )
 
 
@@ -1387,6 +1512,7 @@ def test_stored_plan_restores_subtask_order_and_dependencies():
                 }
             ],
             dependencies=[str(first_id)],
+            review_agent_id="visual-checker",
             skill_names=[],
         ),
     ]
@@ -1407,14 +1533,25 @@ def test_stored_plan_restores_subtask_order_and_dependencies():
     )
 
     assert restored.subtasks[1].dependencies == [0]
+    assert restored.subtasks[1].review_agent_id == "visual-checker"
     assert restored.subtasks[0].artifact_goal == "Find source-backed facts"
 
 
 @pytest.mark.asyncio
 async def test_first_plan_generates_and_persists_purpose_title(monkeypatch):
+    from app.agent_plugins import AgentDefinition
     import app.orchestrator as orchestrator_module
     import app.planning as planning_module
 
+    specialist = AgentDefinition(
+        id="research-specialist",
+        name="Research Specialist",
+        description="Research a defined subject with sources.",
+        instructions="Research the assigned topic.",
+        allowed_agents=(),
+        skill_names=(),
+        digest="a" * 64,
+    )
     task = Task(
         id=uuid.uuid4(),
         owner_id=uuid.uuid4(),
@@ -1437,6 +1574,7 @@ async def test_first_plan_generates_and_persists_purpose_title(monkeypatch):
                     ChecklistItem(id="requirements", description="Summarize")
                 ],
                 dependencies=[],
+                agent_id="research-specialist",
                 skill_names=["deep-research"],
             )
         ],
@@ -1471,7 +1609,9 @@ async def test_first_plan_generates_and_persists_purpose_title(monkeypatch):
         async def commit(self):
             return None
 
-    sessions = [FakeSession(), FakeSession(plan_version=0)]
+    planning_session = FakeSession()
+    persistence_session = FakeSession(plan_version=0)
+    sessions = [planning_session, persistence_session]
     generated_options = {}
 
     async def generate(**options):
@@ -1500,6 +1640,11 @@ async def test_first_plan_generates_and_persists_purpose_title(monkeypatch):
         assert_lease_in_session,
     )
     monkeypatch.setattr(planning_module, "format_task_input", format_input)
+    monkeypatch.setattr(
+        planning_module,
+        "load_agent_catalog",
+        lambda: {specialist.id: specialist},
+    )
     monkeypatch.setattr(
         planning_module,
         "list_private_skills",
@@ -1544,10 +1689,43 @@ async def test_first_plan_generates_and_persists_purpose_title(monkeypatch):
         "system_prompt"
     ]
     assert "deep-research" in generated_options["system_prompt"]
+    assert "research-specialist" in generated_options["system_prompt"]
     assert result[2][0].skill_names == ["deep-research"]
+    stored_subtask = next(
+        item
+        for item in persistence_session.added
+        if isinstance(item, Subtask)
+    )
+    assert stored_subtask.agent_id == specialist.id
+    assert stored_subtask.agent_definition_digest == specialist.digest
 
-    sessions.extend([FakeSession(), FakeSession(plan_version=1)])
+    from dataclasses import replace
+
+    image_generator = replace(
+        specialist,
+        id="illustrator",
+        name="Illustrator",
+        digest="b" * 64,
+    )
+    image_reviewer = replace(
+        specialist,
+        id="inspector",
+        name="Inspector",
+        digest="c" * 64,
+    )
+    monkeypatch.setattr(
+        planning_module,
+        "load_agent_catalog",
+        lambda: {
+            image_generator.id: image_generator,
+            image_reviewer.id: image_reviewer,
+        },
+    )
+    followup_persistence_session = FakeSession(plan_version=1)
+    sessions.extend([FakeSession(), followup_persistence_session])
     generated_plan.title = "Different follow-up title"
+    generated_plan.subtasks[0].agent_id = image_generator.id
+    generated_plan.subtasks[0].review_agent_id = image_reviewer.id
     followup = ConversationMessage(
         sequence=2,
         role="user",
@@ -1561,6 +1739,7 @@ async def test_first_plan_generates_and_persists_purpose_title(monkeypatch):
         {
             "manager_model": "test-manager",
             "worker_model": "test-worker",
+            "worker_image_provider": "openai",
             "max_agent_attempts": 2,
             "max_agent_turns": 10,
         },
@@ -1568,6 +1747,105 @@ async def test_first_plan_generates_and_persists_purpose_title(monkeypatch):
 
     assert result is not None
     assert task.title == "Accessible project dashboard"
+    image_subtask = next(
+        item
+        for item in followup_persistence_session.added
+        if isinstance(item, Subtask)
+    )
+    assert image_subtask.agent_id == image_generator.id
+    assert image_subtask.review_agent_id == image_reviewer.id
+    assert image_subtask.review_agent_digest == image_reviewer.digest
+    assert image_subtask.review_binding_mode == "catalog"
+
+    monkeypatch.setattr(
+        planning_module,
+        "load_agent_catalog",
+        lambda: {image_generator.id: image_generator},
+    )
+    fallback_persistence_session = FakeSession(plan_version=2)
+    sessions.extend([FakeSession(), fallback_persistence_session])
+    generated_plan.subtasks[0].agent_id = None
+    generated_plan.subtasks[0].review_agent_id = None
+    third_message = ConversationMessage(
+        sequence=3,
+        role="user",
+        content="Continue with the available agents.",
+    )
+    result = await orchestrator_module._load_or_create_plan(
+        task.id,
+        uuid.uuid4(),
+        "worker-test",
+        [first_message, followup, third_message],
+        {
+            "manager_model": "test-manager",
+            "worker_model": "test-worker",
+            "worker_image_provider": "openai",
+            "max_agent_attempts": 2,
+            "max_agent_turns": 10,
+        },
+    )
+
+    assert result is not None
+    fallback_subtask = next(
+        item
+        for item in fallback_persistence_session.added
+        if isinstance(item, Subtask)
+    )
+    assert fallback_subtask.agent_id is None
+    assert fallback_subtask.review_agent_id is None
+    assert fallback_subtask.review_binding_mode == "catalog"
+    assert '"id": "illustrator"' in generated_options["system_prompt"]
+    assert '"id": "inspector"' not in generated_options["system_prompt"]
+
+    monkeypatch.setattr(
+        planning_module,
+        "load_agent_catalog",
+        lambda: {image_reviewer.id: image_reviewer},
+    )
+    generic_persistence_session = FakeSession(plan_version=3)
+    sessions.extend([FakeSession(), generic_persistence_session])
+    generated_plan.subtasks[0].review_agent_id = image_reviewer.id
+    result = await orchestrator_module._load_or_create_plan(
+        task.id,
+        uuid.uuid4(),
+        "worker-test",
+        [first_message, followup, third_message],
+        {
+            "manager_model": "test-manager",
+            "worker_model": "test-worker",
+            "worker_image_provider": "openai",
+            "max_agent_attempts": 2,
+            "max_agent_turns": 10,
+        },
+    )
+
+    assert result is not None
+    generic_subtask = next(
+        item
+        for item in generic_persistence_session.added
+        if isinstance(item, Subtask)
+    )
+    assert generic_subtask.agent_id is None
+    assert generic_subtask.review_agent_id == image_reviewer.id
+    assert generic_subtask.review_agent_digest == image_reviewer.digest
+    assert generic_subtask.review_binding_mode == "catalog"
+
+    sessions.append(FakeSession())
+    generated_plan.subtasks[0].review_agent_id = "missing-reviewer"
+    with pytest.raises(RuntimeError, match="unavailable_agent_requested"):
+        await orchestrator_module._load_or_create_plan(
+            task.id,
+            uuid.uuid4(),
+            "worker-test",
+            [first_message, followup, third_message],
+            {
+                "manager_model": "test-manager",
+                "worker_model": "test-worker",
+                "worker_image_provider": "openai",
+                "max_agent_attempts": 2,
+                "max_agent_turns": 10,
+            },
+        )
 
 
 @pytest.mark.asyncio
@@ -2672,6 +2950,612 @@ async def test_checklist_review_passes_loaded_images_to_model(monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "specialist_verdict", ["passed", "needs_revision", "indeterminate"]
+)
+async def test_checklist_review_delegates_visual_integrity_to_specialist(
+    monkeypatch, specialist_verdict,
+):
+    import app.orchestrator as orchestrator_module
+    from app.agent_plugins import AgentDefinition
+    from app.agent_schemas import ImageSpecialistReview
+
+    image_bytes = b"review-image-bytes"
+    calls = []
+
+    async def load_images(_task_id, image_paths):
+        return image_paths, [image_bytes], []
+
+    def build_images(paths, images):
+        return images, [
+            {"artifact_path": paths[0], "view": "full image"}
+        ], []
+
+    def reject_implicit_skill(_name):
+        raise AssertionError("unrelated image Skill must not be loaded")
+
+    async def generate(**kwargs):
+        calls.append(kwargs)
+        review_input = orchestrator_module.json.loads(kwargs["input_text"])
+        item_id = review_input["checklist"][0]["id"]
+        if kwargs["schema_name"] == "image_specialist_review":
+            return ImageSpecialistReview(
+                verdict=specialist_verdict,
+                evidence=(
+                    "No visible defects."
+                    if specialist_verdict == "passed"
+                    else ""
+                ),
+                deficiency=(
+                    ""
+                    if specialist_verdict == "passed"
+                    else "The fingers do not connect to the hand."
+                ),
+                target_image_paths=["artifacts/cat.png"],
+            )
+        return ChecklistReviewResult(
+            results=[
+                {
+                    "item_id": item_id,
+                    "passed": True,
+                    "evidence": "Clear overall view.",
+                    "deficiency": "",
+                    "revision_target": "image",
+                    "target_image_paths": ["artifacts/cat.png"],
+                }
+            ]
+        )
+
+    monkeypatch.setattr(
+        orchestrator_module, "_load_review_images", load_images
+    )
+    monkeypatch.setattr(
+        orchestrator_module, "_build_detailed_review_images", build_images
+    )
+    monkeypatch.setattr(
+        orchestrator_module,
+        "load_private_skill_if_present",
+        reject_implicit_skill,
+    )
+    monkeypatch.setattr(
+        orchestrator_module,
+        "load_private_skill",
+        lambda name: f"Independent guidance for {name}.",
+    )
+    monkeypatch.setattr(orchestrator_module.model_client, "generate", generate)
+    image_reviewer = AgentDefinition(
+        id="image-review",
+        name="Image Review",
+        description="Inspect generated images.",
+        instructions="Inspect anatomy and contact details closely.",
+        allowed_agents=(),
+        skill_names=("review-aid",),
+        digest="review-digest",
+    )
+
+    review_options = {
+        "model": "manager-model",
+        "task_id": uuid.uuid4(),
+        "image_paths": ["artifacts/cat.png"],
+        "checklist": [],
+        "artifact": {
+            "generated_files": ["artifacts/cat.png"],
+            "image_generations": [
+                {
+                    "artifact_path": "artifacts/cat.png",
+                    "prompt": "cat and cup",
+                },
+                {"artifact_path": "artifacts/other.png", "prompt": "other"},
+            ],
+        },
+        "plan_summary": "Generate a cat image",
+        "instruction": "Draw a cat holding a cup",
+        "max_attempts": 1,
+        "review_agent": image_reviewer,
+        "review_agent_model": "vision-review-model",
+        "review_agent_provider": "ollama",
+        "review_agent_records": [
+            {"artifact_path": "artifacts/cat.png", "prompt": "cat and cup"},
+            {"artifact_path": "artifacts/other.png", "prompt": "other"},
+        ],
+    }
+    if specialist_verdict == "indeterminate":
+        with pytest.raises(
+            orchestrator_module.AgentExecutionError,
+            match="image_review_indeterminate",
+        ):
+            await orchestrator_module._review_checklist(**review_options)
+        assert len(calls) == 2
+        return
+
+    results = await orchestrator_module._review_checklist(**review_options)
+
+    assert len(calls) == 2
+    assert calls[0]["model"] == "manager-model"
+    assert calls[1]["model"] == "vision-review-model"
+    assert calls[1]["provider"] == "ollama"
+    assert calls[1]["input_images"] == [image_bytes]
+    assert "Inspect anatomy and contact details closely." in calls[1][
+        "system_prompt"
+    ]
+    assert "Independent guidance for review-aid." in calls[1]["system_prompt"]
+    specialist_checklist = orchestrator_module.json.loads(
+        calls[1]["input_text"]
+    )["checklist"]
+    assert len(specialist_checklist) == 1
+    specialist_input = orchestrator_module.json.loads(calls[1]["input_text"])
+    assert specialist_input["image_generations"] == [
+        {"artifact_path": "artifacts/cat.png", "prompt": "cat and cup"}
+    ]
+    assert specialist_input["artifact"]["image_generations"] == (
+        specialist_input["image_generations"]
+    )
+    visual_integrity = next(
+        result
+        for result in results
+        if result["item_id"].startswith("system-image-visual-integrity")
+    )
+    if specialist_verdict == "passed":
+        assert visual_integrity["passed"]
+        return
+    assert not visual_integrity["passed"]
+    assert visual_integrity["deficiency"] == (
+        "The fingers do not connect to the hand."
+    )
+    assert visual_integrity["revision_target"] == "image"
+
+
+def test_final_image_review_avoids_mixed_reviewer_assignments(monkeypatch):
+    import app.orchestrator as orchestrator_module
+    from app.agent_plugins import AgentDefinition
+
+    first = AgentDefinition(
+        id="first-reviewer",
+        name="First Reviewer",
+        description="Review images.",
+        instructions="Inspect images.",
+        allowed_agents=(),
+        skill_names=(),
+        digest="a" * 64,
+    )
+    second = AgentDefinition(
+        id="second-reviewer",
+        name="Second Reviewer",
+        description="Review images.",
+        instructions="Inspect images.",
+        allowed_agents=(),
+        skill_names=(),
+        digest="b" * 64,
+    )
+    rows = [
+        SimpleNamespace(id=uuid.uuid4(), reviewer=first),
+        SimpleNamespace(id=uuid.uuid4(), reviewer=second),
+    ]
+    results = {
+        str(row.id): {"paths": [f"artifacts/{index}.png"]}
+        for index, row in enumerate(rows)
+    }
+    monkeypatch.setattr(
+        orchestrator_module,
+        "_generated_artifact_paths",
+        lambda payload: payload["subtask"]["paths"],
+    )
+    monkeypatch.setattr(
+        orchestrator_module,
+        "_image_review_agent_for_subtask",
+        lambda row, _config: row.reviewer,
+    )
+
+    assert (
+        orchestrator_module._shared_final_image_review_agent(rows, results, {})
+        is None
+    )
+    rows[1].reviewer = first
+    assert (
+        orchestrator_module._shared_final_image_review_agent(rows, results, {})
+        == first
+    )
+    rows[1].reviewer = None
+    assert (
+        orchestrator_module._shared_final_image_review_agent(rows, results, {})
+        is None
+    )
+    rows[0].reviewer = None
+    rows[1].reviewer = second
+
+    def resolve_reviewer(row, _config):
+        if row.reviewer == second:
+            raise AgentExecutionError("agent_definition_unavailable")
+        return row.reviewer
+
+    monkeypatch.setattr(
+        orchestrator_module,
+        "_image_review_agent_for_subtask",
+        resolve_reviewer,
+    )
+    with pytest.raises(
+        AgentExecutionError, match="agent_definition_unavailable"
+    ):
+        orchestrator_module._shared_final_image_review_agent(rows, results, {})
+
+
+def test_image_review_uses_saved_binding_without_plugin_child_metadata(
+    monkeypatch,
+):
+    import app.orchestrator as orchestrator_module
+    from app.agent_plugins import AgentDefinition
+
+    generator = AgentDefinition(
+        id="illustrator",
+        name="Illustrator",
+        description="Create images.",
+        instructions="Create an image.",
+        allowed_agents=(),
+        skill_names=(),
+        digest="a" * 64,
+    )
+    reviewer = AgentDefinition(
+        id="inspector",
+        name="Inspector",
+        description="Review images.",
+        instructions="Review an image.",
+        allowed_agents=(),
+        skill_names=(),
+        digest="b" * 64,
+    )
+    definitions = {generator.id: generator, reviewer.id: reviewer}
+    requested = []
+
+    def load_definition(agent_id, expected_digest=None):
+        requested.append((agent_id, expected_digest))
+        definition = definitions[agent_id]
+        if definition.digest != expected_digest:
+            raise RuntimeError("agent_definition_unavailable")
+        return definition
+
+    monkeypatch.setattr(
+        orchestrator_module, "load_agent_definition", load_definition
+    )
+    row = SimpleNamespace(
+        agent_id=generator.id,
+        agent_definition_digest=generator.digest,
+        review_agent_id=reviewer.id,
+        review_agent_digest=reviewer.digest,
+    )
+
+    result = orchestrator_module._image_review_agent_for_subtask(
+        row,
+        {
+            "image_generation_agent_id": "different-generator",
+            "image_review_agent_id": "different-reviewer",
+        },
+    )
+
+    assert result == reviewer
+    assert requested == [
+        (generator.id, generator.digest),
+        (reviewer.id, reviewer.digest),
+    ]
+    generic_row = SimpleNamespace(
+        agent_id=None,
+        review_agent_id=reviewer.id,
+        review_agent_digest=reviewer.digest,
+        review_binding_mode="catalog",
+    )
+    assert (
+        orchestrator_module._image_review_agent_for_subtask(generic_row)
+        == reviewer
+    )
+    no_reviewer_row = SimpleNamespace(
+        agent_id="image-generation",
+        review_agent_id=None,
+        review_agent_digest=None,
+        review_binding_mode="catalog",
+    )
+    assert (
+        orchestrator_module._image_review_agent_for_subtask(no_reviewer_row)
+        is None
+    )
+    row.review_agent_id = None
+    with pytest.raises(
+        orchestrator_module.AgentExecutionError,
+        match="agent_definition_unavailable",
+    ):
+        orchestrator_module._image_review_agent_for_subtask(row)
+
+
+@pytest.mark.asyncio
+async def test_subtask_image_reviewer_uses_worker_model_snapshot(monkeypatch):
+    import app.orchestrator as orchestrator_module
+    from app.agent_plugins import AgentDefinition
+
+    reviewer = AgentDefinition(
+        id="visual-checker",
+        name="Visual Checker",
+        description="Review images.",
+        instructions="Inspect images.",
+        allowed_agents=(),
+        skill_names=(),
+        digest="c" * 64,
+    )
+    captured = {}
+
+    async def save_subtask(*_args, **_kwargs):
+        return None
+
+    async def review_checklist(**kwargs):
+        captured["review"] = kwargs
+        return []
+
+    async def revision_count(_task_id):
+        return 0
+
+    async def save_quality_review(**kwargs):
+        captured["quality"] = kwargs
+        return uuid.uuid4()
+
+    monkeypatch.setattr(
+        orchestrator_module, "_save_subtask_result", save_subtask
+    )
+    monkeypatch.setattr(
+        orchestrator_module, "_review_checklist", review_checklist
+    )
+    monkeypatch.setattr(
+        orchestrator_module, "_quality_revision_count", revision_count
+    )
+    monkeypatch.setattr(
+        orchestrator_module, "_save_quality_review", save_quality_review
+    )
+    monkeypatch.setattr(
+        orchestrator_module,
+        "_image_review_agent_for_subtask",
+        lambda *_args: reviewer,
+    )
+    monkeypatch.setattr(
+        orchestrator_module, "_agent_options", lambda *_a, **_k: {}
+    )
+
+    result = SubtaskResult(
+        status="succeeded",
+        summary="Image generated.",
+        findings=[],
+        sources=[],
+        tool_runs=[
+            {
+                "tool_name": "comfyui_generate_image",
+                "request_summary": "",
+                "status": "succeeded",
+                "source_count": 0,
+                "error_code": "",
+                "artifact_paths": ["artifacts/example.png"],
+            }
+        ],
+        questions=[],
+        error="",
+    )
+    row = SimpleNamespace(
+        id=uuid.uuid4(),
+        acceptance_checklist=[],
+        artifact_goal="Generate an image.",
+        quality_revision_count=0,
+        tool_calls_used=0,
+        tool_calls_limit=20,
+    )
+    config = {
+        "manager_model": "manager-model",
+        "manager_model_provider": "openai",
+        "worker_model": "worker-vision-model",
+        "worker_model_provider": "ollama",
+        "image_review_model": "obsolete-review-model",
+        "image_review_model_provider": "openai",
+        "max_agent_attempts": 1,
+    }
+
+    _, status, _ = await orchestrator_module._review_subtask_result(
+        row,
+        result,
+        SimpleNamespace(summary="Image task"),
+        {},
+        [],
+        uuid.uuid4(),
+        uuid.uuid4(),
+        "worker-test",
+        1,
+        config,
+        1,
+    )
+
+    assert status == "accepted"
+    assert captured["review"]["review_agent_model"] == "worker-vision-model"
+    assert captured["review"]["review_agent_provider"] == "ollama"
+    assert captured["quality"]["specialist_model_id"] == "worker-vision-model"
+    assert captured["quality"]["specialist_model_provider"] == "ollama"
+
+
+@pytest.mark.asyncio
+async def test_manager_image_check_is_deferred_after_indeterminate_preflight(
+    monkeypatch,
+):
+    import app.orchestrator as orchestrator_module
+    from app.agent_plugins import AgentDefinition
+
+    reviewer = AgentDefinition(
+        id="image-review",
+        name="Image Review",
+        description="Review generated images.",
+        instructions="Inspect the supplied image.",
+        allowed_agents=(),
+        skill_names=(),
+        digest="e" * 64,
+    )
+    captured = {}
+
+    async def no_op(*_args, **_kwargs):
+        return None
+
+    async def review_checklist(**kwargs):
+        raise AssertionError(
+            "Manager image acceptance is deferred to the final review"
+        )
+
+    async def save_subtask(*_args, **kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setattr(
+        orchestrator_module, "_save_subtask_result", save_subtask
+    )
+    monkeypatch.setattr(
+        orchestrator_module, "_review_checklist", review_checklist
+    )
+    monkeypatch.setattr(
+        orchestrator_module,
+        "_image_review_agent_for_subtask",
+        lambda *_args, **_kwargs: reviewer,
+    )
+    monkeypatch.setattr(
+        orchestrator_module, "_agent_options", lambda *_args, **_kwargs: {}
+    )
+
+    result = SubtaskResult(
+        status="partial",
+        summary="Image review needs Manager inspection.",
+        findings=["artifacts/pool-1234abcd.png"],
+        sources=[],
+        tool_runs=[],
+        questions=[],
+        error="",
+    )
+    result._image_generations = [
+        ImageGenerationRecord(
+            artifact_path="artifacts/pool-1234abcd.png",
+            image_id="pool",
+            prompt="pool scene",
+            negative_prompt="",
+            width=768,
+            height=1024,
+        )
+    ]
+    result._agent_image_reviews = [
+        {
+            "image_id": "pool",
+            "artifact_path": "artifacts/pool-1234abcd.png",
+            "status": "completed",
+            "cycle_id": "initial-cycle",
+            "cycle_number": 1,
+            "review_number": 1,
+            "verdict": "indeterminate",
+            "deficiency": "The image condition could not be verified.",
+            "reviewer_agent_id": reviewer.id,
+        }
+    ]
+    row = SimpleNamespace(
+        id=uuid.uuid4(),
+        task_id=uuid.uuid4(),
+        title="Generate an image",
+        acceptance_checklist=[],
+        artifact_goal="Create a pool scene.",
+        quality_revision_count=0,
+        tool_calls_used=0,
+        tool_calls_limit=20,
+        review_binding_mode="catalog",
+        agent_id="image-generation",
+        agent_definition_digest="f" * 64,
+        review_agent_id=reviewer.id,
+        review_agent_digest=reviewer.digest,
+    )
+
+    saved_result, status, _ = await orchestrator_module._review_subtask_result(
+        row,
+        result,
+        SimpleNamespace(summary="Image task"),
+        {},
+        [],
+        row.task_id,
+        uuid.uuid4(),
+        "worker-test",
+        1,
+        {
+            "manager_model": "manager-model",
+            "manager_model_provider": "openai",
+            "worker_model": "worker-model",
+            "worker_model_provider": "openai",
+            "max_agent_attempts": 1,
+            "max_quality_revisions_per_task": 5,
+            "max_quality_revisions_per_subtask": 2,
+        },
+        1,
+    )
+
+    assert status == "succeeded"
+    assert captured["status_override"] == "succeeded"
+    assert saved_result["manager_image_acceptance_deferred"] is True
+    assert saved_result["agent_image_reviews"][0]["verdict"] == "indeterminate"
+    assert saved_result["agent_image_reviews"][0]["deficiency"] == (
+        "The image condition could not be verified."
+    )
+
+
+@pytest.mark.asyncio
+async def test_quality_review_persists_specialist_provenance(monkeypatch):
+    import app.orchestrator as orchestrator_module
+    from app.models import QualityReview
+
+    class FakeSession:
+        def __init__(self):
+            self.added = []
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        def add(self, value):
+            self.added.append(value)
+
+        async def commit(self):
+            return None
+
+    session = FakeSession()
+
+    async def assert_lease(*_args):
+        return None
+
+    monkeypatch.setattr(orchestrator_module, "SessionFactory", lambda: session)
+    monkeypatch.setattr(
+        orchestrator_module, "_assert_lease_in_session", assert_lease
+    )
+
+    await orchestrator_module._save_quality_review(
+        task_id=uuid.uuid4(),
+        job_id=uuid.uuid4(),
+        lease_owner="worker-test",
+        plan_version=1,
+        target_type="final",
+        target_id=None,
+        revision_round=0,
+        results=[],
+        verdict="accepted",
+        reviewer_model_id="manager-model",
+        reviewer_model_provider="openai",
+        specialist_model_id="vision-model",
+        specialist_model_provider="ollama",
+        reviewer_agent_id="image-review",
+        reviewer_agent_digest="c" * 64,
+    )
+
+    review = next(
+        item for item in session.added if isinstance(item, QualityReview)
+    )
+    assert review.reviewer_model_id == "manager-model"
+    assert review.reviewer_model_provider == "openai"
+    assert review.specialist_model_id == "vision-model"
+    assert review.specialist_model_provider == "ollama"
+    assert review.reviewer_agent_id == "image-review"
+    assert review.reviewer_agent_digest == "c" * 64
+
+
+@pytest.mark.asyncio
 async def test_review_image_loader_randomly_caps_image_count(monkeypatch):
     import app.orchestrator as orchestrator_module
 
@@ -2942,7 +3826,7 @@ async def test_subtask_receives_conversation_history(monkeypatch):
     async def assert_lease(*_args):
         return None
 
-    async def reserve_tool(*_args):
+    async def reserve_tool(*_args, **_kwargs):
         return None
 
     activities = []
@@ -3073,7 +3957,899 @@ async def test_subtask_receives_conversation_history(monkeypatch):
         ("skill", "loaded", "deep-research", "private"),
         ("tool", "completed", None, None),
     ]
+    assert all(
+        item[1]["agent_name"] == "Generic Subagent" for item in activities
+    )
     assert "Do not use tools" not in captured["system_prompt"]
+
+
+@pytest.mark.asyncio
+async def test_execute_subtask_loads_pinned_specialist_agent(monkeypatch):
+    import app.orchestrator as orchestrator_module
+    from app.agent_plugins import AgentDefinition
+
+    definition = AgentDefinition(
+        id="research-specialist",
+        name="Research Specialist",
+        description="Research a subject with evidence.",
+        instructions="Prioritize primary sources and cite evidence.",
+        allowed_agents=(),
+        skill_names=(),
+        digest="b" * 64,
+    )
+    captured = {}
+
+    async def no_op(*_args, **_kwargs):
+        return None
+
+    async def generate(**kwargs):
+        captured.update(kwargs)
+        return SubtaskResult(
+            status="succeeded",
+            summary="Research complete.",
+            findings=["A supported fact."],
+            sources=[],
+            tool_runs=[],
+            questions=[],
+            error="",
+        )
+
+    def reject_implicit_skill(_name):
+        raise AssertionError("unrelated image Skill must not be loaded")
+
+    monkeypatch.setattr(orchestrator_module, "_assert_lease", no_op)
+    monkeypatch.setattr(
+        orchestrator_module,
+        "_record_subtask_activity",
+        no_op,
+    )
+    monkeypatch.setattr(
+        orchestrator_module,
+        "_agent_options",
+        lambda *_args, **_kwargs: {"before_model_call": no_op},
+    )
+    monkeypatch.setattr(
+        orchestrator_module,
+        "load_tavily_search_skill",
+        lambda: "Search only with the registered read-only tool.",
+    )
+    monkeypatch.setattr(
+        orchestrator_module,
+        "load_agent_definition",
+        lambda agent_id, expected_digest=None: definition,
+    )
+    monkeypatch.setattr(
+        orchestrator_module,
+        "load_private_skill_if_present",
+        reject_implicit_skill,
+    )
+    monkeypatch.setattr(orchestrator_module.model_client, "generate", generate)
+
+    result = await orchestrator_module._execute_subtask(
+        SimpleNamespace(
+            id=uuid.uuid4(),
+            task_id=uuid.uuid4(),
+            plan_version=1,
+            tool_calls_used=0,
+            tool_calls_limit=20,
+            title="Research",
+            instruction="Find evidence.",
+            artifact_goal="Provide a supported summary.",
+            acceptance_checklist=[],
+            dependencies=[],
+            model_id="test-worker",
+            agent_id=definition.id,
+            agent_definition_digest=definition.digest,
+            skill_names=[],
+        ),
+        SimpleNamespace(summary="Research plan"),
+        {},
+        [],
+        uuid.uuid4(),
+        "worker-test",
+        1,
+        config={"worker_image_provider": "openai"},
+    )
+
+    assert result.status == "succeeded"
+    assert "Prioritize primary sources and cite evidence." in captured[
+        "system_prompt"
+    ]
+    assert "SubtaskResult output contract" in captured["system_prompt"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("review_verdicts", "expected_error"),
+    [
+        (["passed"], None),
+        (["needs_revision"] * 5, None),
+        (["needs_revision"], "image_revision_required"),
+        (["indeterminate"], None),
+    ],
+)
+async def test_generation_agent_reviews_before_returning_to_manager(
+    monkeypatch, review_verdicts, expected_error
+):
+    import json
+
+    import app.orchestrator as orchestrator_module
+    from app.agent_plugins import AgentDefinition
+    from app.agent_schemas import ImageSpecialistReview
+    from app.image_generation import OpenAIImageGenerationArguments
+    from app.tools import ToolRegistration, ToolRegistry
+
+    generator = AgentDefinition(
+        id="image-generation",
+        name="Image Generation",
+        description="Generate requested images.",
+        instructions="Generate images and review before returning.",
+        allowed_agents=("image-review",),
+        skill_names=(),
+        digest="c" * 64,
+    )
+    reviewer = AgentDefinition(
+        id="image-review",
+        name="Image Review",
+        description="Review generated images.",
+        instructions="Inspect the image and report concrete defects.",
+        allowed_agents=(),
+        skill_names=(),
+        digest="d" * 64,
+    )
+    tool_order = []
+    reviewer_calls = 0
+    generation_calls = 0
+    persisted_reviews = []
+
+    async def no_op(*_args, **_kwargs):
+        return None
+
+    async def generate(**kwargs):
+        nonlocal reviewer_calls, generation_calls
+        if kwargs["schema_name"] == "image_specialist_review":
+            verdict = review_verdicts[reviewer_calls]
+            reviewer_calls += 1
+            return ImageSpecialistReview(
+                verdict=verdict,
+                evidence="No visible defect." if verdict == "passed" else "",
+                deficiency="Fix the visible defect."
+                if verdict != "passed"
+                else "",
+                target_image_paths=(
+                    ["artifacts/pool.png"] if verdict != "passed" else []
+                ),
+            )
+
+        registry = kwargs["tool_registry"]
+        for index, verdict in enumerate(review_verdicts, start=1):
+            image_id = "pool"
+            generation_arguments = json.dumps(
+                {
+                    "image_id": image_id,
+                    "image_prompt": {
+                        "positive_prompt": f"Pool scene revision {index}",
+                        "negative_prompt": "",
+                    },
+                    "filename": "pool.png",
+                    "width": 768,
+                    "height": 1024,
+                }
+            )
+            tool_order.append("generate")
+            await kwargs["before_tool_call"]("openai_generate_image")
+            generation_result = await registry.execute(
+                "openai_generate_image", generation_arguments
+            )
+            generation_calls += 1
+            await kwargs["on_tool_result"](
+                "openai_generate_image",
+                generation_arguments,
+                generation_result,
+            )
+
+            review_arguments = json.dumps(
+                {
+                    "image_id": image_id,
+                    "artifact_path": generation_result["artifact_path"],
+                }
+            )
+            tool_order.append("review")
+            await kwargs["before_tool_call"]("review_generated_image")
+            review_result = await registry.execute(
+                "review_generated_image", review_arguments
+            )
+            await kwargs["on_tool_result"](
+                "review_generated_image", review_arguments, review_result
+            )
+            if (
+                review_result.get("error")
+                or review_result.get("verdict")
+                in {"passed", "indeterminate"}
+                or index == 5
+            ):
+                break
+        return SubtaskResult(
+            status="succeeded",
+            summary="Image generated and reviewed.",
+            findings=["artifacts/pool.png"],
+            sources=[],
+            tool_runs=[],
+            questions=[],
+            error="",
+        )
+
+    async def generate_image(arguments):
+        return {
+            "artifact_path": f"artifacts/pool-{generation_calls + 1}.png",
+            "image_id": arguments.image_id,
+            "width": arguments.width,
+            "height": arguments.height,
+            "seed": None,
+            "quality": "auto",
+        }
+
+    async def record_review_start(*_args, **kwargs):
+        record = {
+            "review_id": str(uuid.uuid4()),
+            "image_id": kwargs["image_id"],
+            "artifact_path": kwargs["artifact_path"],
+            "review_number": len(persisted_reviews) + 1,
+            "cycle_id": kwargs["cycle_id"],
+            "cycle_number": 1,
+            "reviewer_agent_id": reviewer.id,
+            "status": "started",
+        }
+        persisted_reviews.append(record)
+        return record
+
+    async def record_review_finish(*_args, **kwargs):
+        record = next(
+            item
+            for item in persisted_reviews
+            if item["review_id"] == kwargs["review_id"]
+        )
+        result = kwargs["review"]
+        record.update(
+            status="completed",
+            verdict=result.verdict,
+            evidence=result.evidence,
+            deficiency=result.deficiency,
+            target_image_paths=result.target_image_paths,
+        )
+        return dict(record)
+
+    async def load_images(_task_id, paths):
+        return paths, [b"png image"], []
+
+    def build_images(paths, images):
+        return images, [{"artifact_path": paths[0], "view": "full image"}], []
+
+    def build_registry(
+        _task_id,
+        _config,
+        _before_write,
+        *,
+        image_review_handler,
+        image_generation_guard,
+        **_kwargs,
+    ):
+        async def guarded_generation(arguments):
+            error = await image_generation_guard(arguments)
+            if error:
+                return {"error": error}
+            return await generate_image(arguments)
+
+        return ToolRegistry(
+            [
+                ToolRegistration(
+                    name="openai_generate_image",
+                    version="1",
+                    description="Generate a PNG.",
+                    risk_class="writes_data",
+                    timeout_seconds=10,
+                    arguments_model=OpenAIImageGenerationArguments,
+                    handler=guarded_generation,
+                ),
+                ToolRegistration(
+                    name="review_generated_image",
+                    version="1",
+                    description="Review a generated image.",
+                    risk_class="read_only",
+                    timeout_seconds=10,
+                    arguments_model=orchestrator_module
+                    .ReviewGeneratedImageArguments,
+                    handler=image_review_handler,
+                ),
+            ],
+            exposed_risk_classes={"read_only", "writes_data"},
+        )
+
+    monkeypatch.setattr(orchestrator_module, "_assert_lease", no_op)
+    monkeypatch.setattr(
+        orchestrator_module,
+        "_agent_options",
+        lambda *_args, **_kwargs: {"before_model_call": no_op},
+    )
+    monkeypatch.setattr(
+        orchestrator_module, "_reserve_subtask_tool_call", no_op
+    )
+    monkeypatch.setattr(
+        orchestrator_module, "_record_subtask_activity", no_op
+    )
+    monkeypatch.setattr(
+        orchestrator_module, "_checkpoint_image_generations", no_op
+    )
+    monkeypatch.setattr(
+        orchestrator_module, "_begin_agent_image_review", record_review_start
+    )
+    monkeypatch.setattr(
+        orchestrator_module, "_finish_agent_image_review", record_review_finish
+    )
+    monkeypatch.setattr(
+        orchestrator_module, "_load_review_images", load_images
+    )
+    monkeypatch.setattr(
+        orchestrator_module, "_build_detailed_review_images", build_images
+    )
+    monkeypatch.setattr(
+        orchestrator_module,
+        "_image_review_agent_for_subtask",
+        lambda *_args, **_kwargs: reviewer,
+    )
+    monkeypatch.setattr(
+        orchestrator_module,
+        "load_agent_definition",
+        lambda *_args, **_kwargs: generator,
+    )
+    monkeypatch.setattr(
+        orchestrator_module, "load_tavily_search_skill", lambda: "search"
+    )
+    monkeypatch.setattr(
+        orchestrator_module, "subtask_tool_registry", build_registry
+    )
+    monkeypatch.setattr(
+        orchestrator_module,
+        "get_settings",
+        lambda: SimpleNamespace(comfyui_enabled=False),
+    )
+    monkeypatch.setattr(orchestrator_module.model_client, "generate", generate)
+
+    row = SimpleNamespace(
+        id=uuid.uuid4(),
+        task_id=uuid.uuid4(),
+        plan_version=1,
+        tool_calls_used=0,
+        tool_calls_limit=20,
+        quality_revision_count=0,
+        title="Generate an image",
+        instruction="Draw a pool scene.",
+        artifact_goal="Create one polished pool scene.",
+        acceptance_checklist=[],
+        dependencies=[],
+        model_id="worker-test",
+        agent_id=generator.id,
+        agent_definition_digest=generator.digest,
+        review_agent_id=reviewer.id,
+        review_agent_digest=reviewer.digest,
+        review_binding_mode="catalog",
+        skill_names=[],
+        result=None,
+    )
+    execution = orchestrator_module._execute_subtask(
+        row,
+        SimpleNamespace(summary="Generate an image"),
+        {},
+        [],
+        uuid.uuid4(),
+        "worker-test",
+        1,
+        config={
+            "worker_image_provider": "openai",
+            "worker_image_model": "image-model",
+            "worker_model": "vision-model",
+            "worker_model_provider": "openai",
+            "max_tool_calls_per_subtask": 20,
+        },
+    )
+    if expected_error is not None:
+        with pytest.raises(
+            orchestrator_module.AgentExecutionError, match=expected_error
+        ):
+            await execution
+        assert generation_calls == len(review_verdicts)
+        assert reviewer_calls == len(review_verdicts)
+        return
+    result = await execution
+
+    assert result.status == (
+        "partial" if review_verdicts[-1] == "indeterminate" else "succeeded"
+    )
+    assert tool_order == [
+        item
+        for _ in review_verdicts
+        for item in ("generate", "review")
+    ]
+    assert generation_calls == len(review_verdicts)
+    assert reviewer_calls == len(review_verdicts)
+    assert len(result._agent_image_reviews) == len(review_verdicts)
+    assert result._agent_image_reviews[-1]["verdict"] == review_verdicts[-1]
+    if review_verdicts[-1] == "indeterminate":
+        assert "Manager review is required" in result.findings[-1]
+        assert result._agent_image_reviews[-1]["deficiency"]
+    serialized = orchestrator_module._serialize_subtask_result(result)
+    assert serialized["agent_image_review_counts"] == {
+        result._agent_image_review_cycle_id: {
+            "pool": len(review_verdicts)
+        }
+    }
+    assert row.quality_revision_count == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("revision_target", "expected_error"),
+    [
+        ("image", "image_generation_required_for_revision"),
+        ("answer", None),
+    ],
+)
+async def test_manager_image_revision_requires_new_cycle_generation(
+    monkeypatch, revision_target, expected_error
+):
+    import json
+
+    import app.orchestrator as orchestrator_module
+    from app.agent_plugins import AgentDefinition
+
+    generator = AgentDefinition(
+        id="image-generation",
+        name="Image Generation",
+        description="Generate requested images.",
+        instructions="Generate the requested image.",
+        allowed_agents=("image-review",),
+        skill_names=(),
+        digest="1" * 64,
+    )
+    reviewer = AgentDefinition(
+        id="image-review",
+        name="Image Review",
+        description="Review generated images.",
+        instructions="Inspect the supplied image.",
+        allowed_agents=(),
+        skill_names=(),
+        digest="2" * 64,
+    )
+    manager_review_id = uuid.uuid4()
+    previous = ImageGenerationRecord(
+        artifact_path="artifacts/pool-old.png",
+        image_id="pool",
+        review_cycle_id="initial-cycle",
+        prompt="pool scene",
+        negative_prompt="",
+        width=768,
+        height=1024,
+    )
+    captured = {}
+    registry_options = {}
+
+    async def no_op(*_args, **_kwargs):
+        return None
+
+    async def generate(**kwargs):
+        captured.update(kwargs)
+        return SubtaskResult(
+            status="succeeded",
+            summary="The previous image meets the request.",
+            findings=[previous.artifact_path],
+            sources=[],
+            tool_runs=[],
+            questions=[],
+            error="",
+        )
+
+    def tool_registry(*_args, **kwargs):
+        registry_options.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(orchestrator_module, "_assert_lease", no_op)
+    monkeypatch.setattr(
+        orchestrator_module, "_record_subtask_activity", no_op
+    )
+    monkeypatch.setattr(
+        orchestrator_module,
+        "_agent_options",
+        lambda *_args, **_kwargs: {"before_model_call": no_op},
+    )
+    monkeypatch.setattr(
+        orchestrator_module,
+        "_image_review_agent_for_subtask",
+        lambda *_args, **_kwargs: reviewer,
+    )
+    monkeypatch.setattr(
+        orchestrator_module,
+        "load_agent_definition",
+        lambda *_args, **_kwargs: generator,
+    )
+    monkeypatch.setattr(
+        orchestrator_module, "load_tavily_search_skill", lambda: "search"
+    )
+    monkeypatch.setattr(
+        orchestrator_module,
+        "subtask_tool_registry",
+        tool_registry,
+    )
+    monkeypatch.setattr(
+        orchestrator_module,
+        "get_settings",
+        lambda: SimpleNamespace(comfyui_enabled=False),
+    )
+    monkeypatch.setattr(orchestrator_module.model_client, "generate", generate)
+
+    subtask_id = uuid.uuid4()
+    row = SimpleNamespace(
+        id=subtask_id,
+        task_id=uuid.uuid4(),
+        plan_version=1,
+        tool_calls_used=0,
+        tool_calls_limit=20,
+        quality_revision_count=1,
+        title="Generate an image",
+        instruction="Revise the pool scene.",
+        artifact_goal="Show the requested pool scene.",
+        acceptance_checklist=[],
+        dependencies=[],
+        model_id="worker-test",
+        agent_id=generator.id,
+        agent_definition_digest=generator.digest,
+        review_agent_id=reviewer.id,
+        review_agent_digest=reviewer.digest,
+        review_binding_mode="catalog",
+        skill_names=[],
+        result={
+            "image_generations": [previous.model_dump(mode="json")],
+            "agent_image_review_cycle_id": "initial-cycle",
+            "agent_image_reviews": [
+                {
+                    "image_id": "pool",
+                    "artifact_path": previous.artifact_path,
+                    "cycle_id": "initial-cycle",
+                    "review_number": 1,
+                    "status": "completed",
+                    "verdict": "passed",
+                }
+            ],
+        },
+    )
+
+    unmet_item = {
+        "item_id": "shoreline",
+        "description": "Show a sandy shoreline.",
+        "deficiency": "No shoreline is visible.",
+        "revision_target": revision_target,
+    }
+    execution = orchestrator_module._execute_subtask(
+        row,
+        SimpleNamespace(summary="Generate an image"),
+        {},
+        [],
+        uuid.uuid4(),
+        "worker-test",
+        1,
+        revision_feedback=(
+            "Add a visible sandy shoreline."
+            if revision_target == "image"
+            else "Correct the written description."
+        ),
+        previous_image_generations=[previous],
+        image_revision_context={
+            "trigger_quality_review_id": str(manager_review_id),
+            "source_artifact_paths": [previous.artifact_path],
+            "unmet_items": [unmet_item],
+        },
+        config={
+            "worker_image_provider": "openai",
+            "worker_image_model": "image-model",
+            "worker_model": "vision-model",
+            "worker_model_provider": "openai",
+            "max_tool_calls_per_subtask": 20,
+        },
+    )
+    if expected_error is not None:
+        with pytest.raises(
+            orchestrator_module.AgentExecutionError,
+            match=expected_error,
+        ):
+            await execution
+    else:
+        result = await execution
+        assert result.status == "succeeded"
+
+    runner_input = json.loads(captured["input_text"])
+    assert runner_input["image_revision_required"] is (
+        revision_target == "image"
+    )
+    expected_cycle_id = (
+        f"manager:{manager_review_id}"
+        if revision_target == "image"
+        else "initial-cycle"
+    )
+    assert runner_input["agent_image_review_cycle_id"] == expected_cycle_id
+    assert registry_options["include_image_tool"] is (
+        revision_target == "image"
+    )
+
+
+@pytest.mark.asyncio
+async def test_agent_image_review_history_is_durable_and_bounded(monkeypatch):
+    import app.orchestrator as orchestrator_module
+    from app.agent_plugins import AgentDefinition
+    from app.agent_schemas import ImageSpecialistReview
+    from app.models import Subtask
+
+    class FakeSession:
+        def __init__(self):
+            self.added = events
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def get(self, model, row_id, **_kwargs):
+            assert model is Subtask
+            assert row_id == row.id
+            return stored
+
+        def add(self, item):
+            self.added.append(item)
+
+        async def commit(self):
+            return None
+
+    reviewer = AgentDefinition(
+        id="image-review",
+        name="Image Review",
+        description="Review generated images.",
+        instructions="Inspect the supplied image.",
+        allowed_agents=(),
+        skill_names=(),
+        digest="a" * 64,
+    )
+    row = SimpleNamespace(id=uuid.uuid4(), result=None)
+    stored = SimpleNamespace(result=None)
+    events = []
+
+    async def no_op(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(
+        orchestrator_module, "SessionFactory", FakeSession
+    )
+    monkeypatch.setattr(
+        orchestrator_module, "_assert_lease_in_session", no_op
+    )
+
+    for review_number in range(1, 6):
+        started = await orchestrator_module._begin_agent_image_review(
+            uuid.uuid4(),
+            uuid.uuid4(),
+            "worker-test",
+            row,
+            1,
+            image_id="pool",
+            artifact_path=f"artifacts/pool-{review_number}.png",
+            cycle_id="cycle-1",
+            reviewer=reviewer,
+        )
+        assert started["review_number"] == review_number
+        review = ImageSpecialistReview(
+            verdict="needs_revision",
+            evidence="",
+            deficiency="Correct the visible defect.",
+            target_image_paths=[started["artifact_path"]],
+        )
+        completed = await orchestrator_module._finish_agent_image_review(
+            uuid.uuid4(),
+            uuid.uuid4(),
+            "worker-test",
+            row,
+            1,
+            review_id=started["review_id"],
+            reviewer=reviewer,
+            review=review,
+        )
+        assert completed["status"] == "completed"
+
+    with pytest.raises(
+        orchestrator_module.AgentExecutionError,
+        match="image_review_limit_reached",
+    ):
+        await orchestrator_module._begin_agent_image_review(
+            uuid.uuid4(),
+            uuid.uuid4(),
+            "worker-test",
+            row,
+            1,
+            image_id="pool",
+            artifact_path="artifacts/pool-six.png",
+            cycle_id="cycle-1",
+            reviewer=reviewer,
+        )
+
+    second_cycle = await orchestrator_module._begin_agent_image_review(
+        uuid.uuid4(),
+        uuid.uuid4(),
+        "worker-test",
+        row,
+        1,
+        image_id="pool",
+        artifact_path="artifacts/pool-next-cycle.png",
+        cycle_id="cycle-2",
+        reviewer=reviewer,
+    )
+    indeterminate = ImageSpecialistReview(
+        verdict="indeterminate",
+        evidence="",
+        deficiency="The image detail cannot be verified.",
+        target_image_paths=[second_cycle["artifact_path"]],
+    )
+    completed_second_cycle = (
+        await orchestrator_module._finish_agent_image_review(
+            uuid.uuid4(),
+            uuid.uuid4(),
+            "worker-test",
+            row,
+            1,
+            review_id=second_cycle["review_id"],
+            reviewer=reviewer,
+            review=indeterminate,
+        )
+    )
+    reused_review = await orchestrator_module._begin_agent_image_review(
+        uuid.uuid4(),
+        uuid.uuid4(),
+        "worker-test",
+        row,
+        1,
+        image_id="pool",
+        artifact_path=second_cycle["artifact_path"],
+        cycle_id="cycle-2",
+        reviewer=reviewer,
+    )
+    interrupted_review = await orchestrator_module._begin_agent_image_review(
+        uuid.uuid4(),
+        uuid.uuid4(),
+        "worker-test",
+        row,
+        1,
+        image_id="pool",
+        artifact_path="artifacts/pool-interrupted.png",
+        cycle_id="cycle-3",
+        reviewer=reviewer,
+    )
+    recovered_review = await orchestrator_module._begin_agent_image_review(
+        uuid.uuid4(),
+        uuid.uuid4(),
+        "worker-test",
+        row,
+        1,
+        image_id="pool",
+        artifact_path="artifacts/pool-interrupted.png",
+        cycle_id="cycle-3",
+        reviewer=reviewer,
+    )
+
+    assert second_cycle["review_number"] == 1
+    assert second_cycle["cycle_number"] == 2
+    assert completed_second_cycle["deficiency"] == (
+        "The image detail cannot be verified."
+    )
+    assert reused_review["review_id"] == second_cycle["review_id"]
+    assert reused_review["verdict"] == "indeterminate"
+    assert reused_review["deficiency"] == (
+        "The image detail cannot be verified."
+    )
+    assert interrupted_review["review_number"] == 1
+    assert recovered_review["review_id"] == interrupted_review["review_id"]
+    assert recovered_review["status"] == "completed"
+    assert recovered_review["verdict"] == "indeterminate"
+    assert recovered_review["error_code"] == "image_review_interrupted"
+    assert stored.result["agent_image_review_counts"] == {
+        "cycle-1": {"pool": 5},
+        "cycle-2": {"pool": 1},
+        "cycle-3": {"pool": 1},
+    }
+    assert len(stored.result["agent_image_reviews"]) == 7
+    assert all(
+        event.payload_json["agent_name"] == "Image Review"
+        for event in events
+    )
+    review_started_events = [
+        event
+        for event in events
+        if event.type == "agent.progress"
+        and event.payload_json["phase"] == "started"
+    ]
+    assert [
+        event.payload_json["cycle_id"] for event in review_started_events
+    ] == [
+        "cycle-1",
+        "cycle-1",
+        "cycle-1",
+        "cycle-1",
+        "cycle-1",
+        "cycle-2",
+        "cycle-3",
+    ]
+    assert [
+        event.payload_json["review_number"]
+        for event in review_started_events
+    ] == [1, 2, 3, 4, 5, 1, 1]
+    assert [
+        event.payload_json["phase"]
+        for event in events
+        if event.type == "agent.progress"
+    ] == [
+        phase
+        for _ in range(5)
+        for phase in ("started", "completed")
+    ] + ["started", "completed", "started", "completed"]
+
+
+def test_agent_image_review_cycle_id_is_stable_per_manager_revision():
+    import app.orchestrator as orchestrator_module
+
+    subtask_id = uuid.uuid4()
+    manager_review_id = uuid.uuid4()
+    row = SimpleNamespace(id=subtask_id)
+
+    initial_cycle = orchestrator_module._agent_image_review_cycle_id(
+        row, None, [], None
+    )
+    manager_cycle = orchestrator_module._agent_image_review_cycle_id(
+        row,
+        {"agent_image_review_cycle_id": initial_cycle},
+        [],
+        {
+            "trigger_quality_review_id": manager_review_id,
+            "unmet_items": [{"revision_target": "image"}],
+        },
+    )
+    retried_manager_cycle = orchestrator_module._agent_image_review_cycle_id(
+        row,
+        {"agent_image_review_cycle_id": manager_cycle},
+        [],
+        {
+            "trigger_quality_review_id": manager_review_id,
+            "unmet_items": [{"revision_target": "image"}],
+        },
+    )
+    next_manager_cycle = orchestrator_module._agent_image_review_cycle_id(
+        row,
+        {"agent_image_review_cycle_id": manager_cycle},
+        [],
+        {
+            "trigger_quality_review_id": uuid.uuid4(),
+            "unmet_items": [{"revision_target": "image"}],
+        },
+    )
+    answer_only_cycle = orchestrator_module._agent_image_review_cycle_id(
+        row,
+        {"agent_image_review_cycle_id": initial_cycle},
+        [],
+        {
+            "trigger_quality_review_id": uuid.uuid4(),
+            "unmet_items": [{"revision_target": "answer"}],
+        },
+    )
+
+    assert initial_cycle == f"initial:{subtask_id}"
+    assert manager_cycle == f"manager:{manager_review_id}"
+    assert retried_manager_cycle == manager_cycle
+    assert next_manager_cycle != manager_cycle
+    assert answer_only_cycle == initial_cycle
 
 
 @pytest.mark.asyncio
@@ -3099,6 +4875,7 @@ async def test_subtask_captures_image_prompt_for_revision(
     import app.orchestrator as orchestrator_module
 
     task_id = uuid.uuid4()
+    subtask_id = uuid.uuid4()
     previous = ImageGenerationRecord(
         artifact_path="artifacts/previous.png",
         prompt="three women at a pool",
@@ -3196,7 +4973,7 @@ async def test_subtask_captures_image_prompt_for_revision(
 
     result = await orchestrator_module._execute_subtask(
         SimpleNamespace(
-            id=uuid.uuid4(),
+            id=subtask_id,
             task_id=task_id,
             plan_version=1,
             tool_calls_used=0,
@@ -3245,8 +5022,11 @@ async def test_subtask_captures_image_prompt_for_revision(
     assert image_skill_activity["phase"] == expected_skill_phase
     assert image_skill_activity["skill_source"] == expected_skill_source
     assert saved["image_generations"] == [
+        previous.model_dump(mode="json"),
         {
             "artifact_path": "artifacts/revised-pool.png",
+            "image_id": "primary",
+            "review_cycle_id": f"initial:{subtask_id}",
             "prompt": new_arguments["image_prompt"]["positive_prompt"],
             "negative_prompt": new_arguments["image_prompt"][
                 "negative_prompt"
@@ -3264,7 +5044,8 @@ async def test_subtask_captures_image_prompt_for_revision(
     ]
     assert "prompt" not in result.tool_runs[0].model_dump()
     assert len(checkpoints) == 1
-    assert checkpoints[0][3][0].artifact_path == (
+    assert checkpoints[0][3][0].artifact_path == "artifacts/previous.png"
+    assert checkpoints[0][3][-1].artifact_path == (
         "artifacts/revised-pool.png"
     )
 
@@ -3417,8 +5198,10 @@ async def test_image_generation_checkpoint_persists_and_clears_feedback(
 ):
     import app.orchestrator as orchestrator_module
 
+    review_id = uuid.uuid4()
     record = ImageGenerationRecord(
         artifact_path="artifacts/revised.png",
+        review_cycle_id=f"manager:{review_id}",
         prompt="three women playing in one pool scene",
         negative_prompt="collage",
         width=768,
@@ -3468,7 +5251,6 @@ async def test_image_generation_checkpoint_persists_and_clears_feedback(
         plan_version=1,
         result=stored_result,
     )
-    review_id = uuid.uuid4()
     revision_context = {
         "trigger_quality_review_id": str(review_id),
         "source_artifact_paths": ["artifacts/previous.png"],
@@ -3505,6 +5287,9 @@ async def test_image_generation_checkpoint_persists_and_clears_feedback(
     ]
     assert stored.result["image_revision_feedback"] == ""
     assert stored.result["image_revision_completed"] is True
+    assert stored.result["agent_image_review_cycle_id"] == (
+        record.review_cycle_id
+    )
     assert row.result == stored.result
     assert orchestrator_module._stored_revision_feedback(stored.result) == ""
     history = next(
@@ -3524,6 +5309,7 @@ async def test_image_generation_checkpoint_persists_and_clears_feedback(
     restored = orchestrator_module._restore_subtask_result(stored.result)
     assert restored.status == "succeeded"
     assert restored._image_generations == [record]
+    assert restored._agent_image_review_cycle_id == record.review_cycle_id
 
 
 @pytest.mark.asyncio
@@ -3531,6 +5317,17 @@ async def test_final_image_review_revises_source_subtask(monkeypatch):
     import json
 
     import app.orchestrator as orchestrator_module
+    from app.agent_plugins import AgentDefinition
+
+    image_reviewer = AgentDefinition(
+        id="visual-checker",
+        name="Visual Checker",
+        description="Review images.",
+        instructions="Inspect the image.",
+        allowed_agents=(),
+        skill_names=(),
+        digest="d" * 64,
+    )
 
     task_id = uuid.uuid4()
     job_id = uuid.uuid4()
@@ -3582,6 +5379,9 @@ async def test_final_image_review_revises_source_subtask(monkeypatch):
             "max_concurrent_agents": 1,
             "max_agent_attempts": 1,
             "manager_model": "test-manager",
+            "worker_model": "test-worker-vision",
+            "worker_model_provider": "ollama",
+            "image_review_model": "obsolete-review-model",
             "max_quality_revisions_per_task": 3,
             "max_quality_revisions_per_subtask": 2,
             "max_tool_calls_per_subtask": 20,
@@ -3626,8 +5426,10 @@ async def test_final_image_review_revises_source_subtask(monkeypatch):
 
     syntheses = []
     reviewed_paths = []
+    review_options = []
     revision_calls = []
     saved_verdicts = []
+    saved_review_options = []
     saved_review_ids = []
     finished = {}
     reviews = [
@@ -3667,6 +5469,7 @@ async def test_final_image_review_revises_source_subtask(monkeypatch):
 
     async def review_checklist(**kwargs):
         reviewed_paths.append(kwargs["image_paths"])
+        review_options.append(kwargs)
         return reviews.pop(0)
 
     async def begin_image_revision(*_args, **_kwargs):
@@ -3700,6 +5503,7 @@ async def test_final_image_review_revises_source_subtask(monkeypatch):
 
     async def save_quality_review(**kwargs):
         saved_verdicts.append(kwargs["verdict"])
+        saved_review_options.append(kwargs)
         review_id = uuid.uuid4()
         saved_review_ids.append(review_id)
         return review_id
@@ -3738,6 +5542,11 @@ async def test_final_image_review_revises_source_subtask(monkeypatch):
     )
     monkeypatch.setattr(
         orchestrator_module, "_review_checklist", review_checklist
+    )
+    monkeypatch.setattr(
+        orchestrator_module,
+        "_image_review_agent_for_subtask",
+        lambda *_args: image_reviewer,
     )
     monkeypatch.setattr(
         orchestrator_module, "_save_quality_review", save_quality_review
@@ -3781,13 +5590,26 @@ async def test_final_image_review_revises_source_subtask(monkeypatch):
                 "description": "Three women play together in one pool.",
                 "evidence": "Many separate faces are visible.",
                 "deficiency": "The image is a grid of unrelated faces.",
+                "revision_target": "image",
             }
         ],
     }
+    assert orchestrator_module._agent_image_review_cycle_id(
+        row,
+        {"agent_image_review_cycle_id": "initial-cycle"},
+        [old_image],
+        revision_calls[0]["image_revision_context"],
+    ) == f"manager:{saved_review_ids[0]}"
     assert reviewed_paths == [
         [old_image.artifact_path],
         [new_image.artifact_path],
     ]
+    assert review_options[0]["review_agent_model"] == "test-worker-vision"
+    assert review_options[0]["review_agent_provider"] == "ollama"
+    assert (
+        saved_review_options[0]["specialist_model_id"] == "test-worker-vision"
+    )
+    assert saved_review_options[0]["specialist_model_provider"] == "ollama"
     assert syntheses[1]["generated_artifact_paths"] == [
         new_image.artifact_path
     ]
@@ -4049,6 +5871,7 @@ async def test_tool_reservation_emits_named_progress_event(monkeypatch):
         tool_calls_limit=20,
         tool_calls_used=0,
         plan_version=3,
+        attempt=2,
     )
 
     class FakeSession:
@@ -4083,6 +5906,8 @@ async def test_tool_reservation_emits_named_progress_event(monkeypatch):
         "worker-test",
         "tavily_web_search",
         7,
+        agent_name="Image Generation",
+        review_cycle_id="manager-review-1",
     )
 
     event = session.added[0]
@@ -4091,6 +5916,9 @@ async def test_tool_reservation_emits_named_progress_event(monkeypatch):
     assert event.payload_json["phase"] == "started"
     assert event.payload_json["tool_name"] == "tavily_web_search"
     assert event.payload_json["conversation_sequence"] == 7
+    assert event.payload_json["agent_name"] == "Image Generation"
+    assert event.payload_json["attempt"] == 2
+    assert event.payload_json["review_cycle_id"] == "manager-review-1"
     assert subtask.tool_calls_used == 1
 
 
@@ -5031,6 +6859,118 @@ def test_optional_private_skill_falls_back_only_when_directory_is_missing(
     )
     with pytest.raises(RuntimeError, match="private_skill_invalid"):
         tools_module.load_private_skill_if_present("image-generation")
+
+
+def test_agent_catalog_accepts_independent_standard_metadata(
+    tmp_path, monkeypatch
+):
+    import app.agent_plugins as plugin_module
+    import app.tools as tools_module
+
+    plugin_root = tmp_path / "agent-plugin"
+    agents_root = plugin_root / "agents"
+    agents_root.mkdir(parents=True)
+    (agents_root / "sketch-artist.agent.md").write_text(
+        "---\nname: Sketch Artist\ndescription: 'Create images.'\n"
+        "kind: reviewer\ntools: []\nmodel: 'other-host-model'\n"
+        "agents: ['Quality Observer', 'External Agent']\n---\n"
+        "Create the requested image.\n",
+        encoding="utf-8",
+    )
+    (agents_root / "quality-observer.agent.md").write_text(
+        "---\nname: Quality Observer\ndescription: 'Inspect images.'\n"
+        "agents: ['Sketch Artist']\nhooks: {ignored: true}\n---\n"
+        "Inspect the supplied image.\n",
+        encoding="utf-8",
+    )
+    settings = SimpleNamespace(
+        agent_plugin_path=str(plugin_root),
+        private_skills_path=None,
+    )
+    monkeypatch.setattr(plugin_module, "get_settings", lambda: settings)
+    monkeypatch.setattr(tools_module, "get_settings", lambda: settings)
+
+    catalog = plugin_module.load_agent_catalog()
+
+    assert "kind" not in catalog["sketch-artist"].catalog_entry()
+    assert catalog["quality-observer"].name == "Quality Observer"
+    assert catalog["sketch-artist"].allowed_agents == ("quality-observer",)
+    assert plugin_module.load_agent_catalog() == catalog
+
+
+def test_agent_plugin_catalog_resolves_children_and_pins_digest(
+    tmp_path, monkeypatch
+):
+    import app.agent_plugins as plugin_module
+    import app.tools as tools_module
+
+    plugin_root = tmp_path / "agent-plugin"
+    agents_root = plugin_root / "agents"
+    skill_directory = plugin_root / "skills" / "image-generation"
+    agents_root.mkdir(parents=True)
+    skill_directory.mkdir(parents=True)
+    (skill_directory / "SKILL.md").write_text(
+        "---\nname: image-generation\n"
+        "description: 'Make image prompts.'\n---\n"
+        "# Prompt skill\n",
+        encoding="utf-8",
+    )
+    (agents_root / "image-generation.agent.md").write_text(
+        "---\nname: Image Generation\ndescription: 'Generate images.'\n"
+        "kind: subtask\nagents: ['Image Review']\n---\n"
+        "Use [the prompt skill](../skills/image-generation/SKILL.md).\n",
+        encoding="utf-8",
+    )
+    review_file = agents_root / "image-review.agent.md"
+    review_file.write_text(
+        "---\nname: Image Review\ndescription: 'Review images.'\n"
+        "kind: reviewer\nagents: []\n---\n"
+        "Inspect the provided image.\n",
+        encoding="utf-8",
+    )
+    settings = SimpleNamespace(
+        agent_plugin_path=str(plugin_root), private_skills_path=None
+    )
+    monkeypatch.setattr(plugin_module, "get_settings", lambda: settings)
+    monkeypatch.setattr(tools_module, "get_settings", lambda: settings)
+
+    catalog = plugin_module.load_agent_catalog()
+
+    assert catalog["image-generation"].name == "Image Generation"
+    assert catalog["image-generation"].allowed_agents == ("image-review",)
+    assert catalog["image-generation"].skill_names == ("image-generation",)
+    assert catalog["image-review"].name == "Image Review"
+    assert plugin_module.load_agent_definition(
+        "image-generation", catalog["image-generation"].digest
+    ) == catalog["image-generation"]
+    assert plugin_module.load_agent_definition(
+        "image-generation", catalog["image-generation"].legacy_digest
+    ) == catalog["image-generation"]
+    with pytest.raises(RuntimeError, match="agent_definition_unavailable"):
+        plugin_module.load_agent_definition("image-generation", "stale-digest")
+
+    review_file.write_text(
+        "---\nname: Image Review\ndescription: 'Review images.'\n"
+        "kind: reviewer\nagents: []\n---\n"
+        "Inspect the supplied image details carefully.\n",
+        encoding="utf-8",
+    )
+    updated_catalog = plugin_module.load_agent_catalog()
+    assert (
+        updated_catalog["image-generation"].digest
+        == catalog["image-generation"].digest
+    )
+    assert plugin_module.load_agent_definition(
+        "image-generation", catalog["image-generation"].digest
+    ) == updated_catalog["image-generation"]
+    with pytest.raises(RuntimeError, match="agent_definition_unavailable"):
+        plugin_module.load_agent_definition(
+            "image-review", catalog["image-review"].digest
+        )
+    with pytest.raises(RuntimeError, match="agent_definition_unavailable"):
+        plugin_module.load_agent_definition(
+            "image-generation", catalog["image-generation"].legacy_digest
+        )
 
 
 @pytest.mark.asyncio

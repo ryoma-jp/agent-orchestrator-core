@@ -90,12 +90,13 @@ async def update_admin_settings(
     db: AsyncSession = Depends(get_session),
 ):
     row = await _settings_row(db)
-    row.settings_json = payload.model_dump()
+    settings_payload = payload.model_dump()
+    row.settings_json = settings_payload
     row.version += 1
     row.updated_by = admin.id
     await db.commit()
     return AdminSettingsView(
-        **payload.model_dump(),
+        **settings_payload,
         openai_key_configured=row.openai_key_configured,
         tavily_key_configured=row.tavily_key_configured,
         version=row.version,

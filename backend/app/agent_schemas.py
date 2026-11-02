@@ -21,6 +21,16 @@ class PlannedSubtask(BaseModel):
         min_length=1, max_length=20
     )
     dependencies: list[int] = Field(max_length=30)
+    agent_id: str | None = Field(
+        default=None,
+        max_length=100,
+        pattern=r"^[a-z0-9]+(?:-[a-z0-9]+)*$",
+    )
+    review_agent_id: str | None = Field(
+        default=None,
+        max_length=100,
+        pattern=r"^[a-z0-9]+(?:-[a-z0-9]+)*$",
+    )
     skill_names: list[str] = Field(max_length=2)
 
     @field_validator("skill_names")
@@ -38,6 +48,8 @@ class PlannedSubtask(BaseModel):
     @model_validator(mode="after")
     def validate_checklist_ids(self):
         _validate_checklist_ids(self.acceptance_checklist)
+        if self.agent_id is not None and self.agent_id == self.review_agent_id:
+            raise ValueError("subtask_and_reviewer_must_differ")
         return self
 
 
@@ -146,6 +158,23 @@ class ChecklistReviewResult(BaseModel):
     results: list[ChecklistItemResult] = Field(max_length=21)
 
 
+class ImageSpecialistReview(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    verdict: Literal["passed", "needs_revision", "indeterminate"]
+    evidence: str = Field(max_length=2_000)
+    deficiency: str = Field(max_length=1_000)
+    target_image_paths: list[str] = Field(default_factory=list, max_length=5)
+
+    @model_validator(mode="after")
+    def validate_review(self):
+        if self.verdict == "passed" and not self.evidence.strip():
+            raise ValueError("image_review_evidence_required")
+        if self.verdict != "passed" and not self.deficiency.strip():
+            raise ValueError("image_review_deficiency_required")
+        return self
+
+
 class ImageGenerationPrompt(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -166,10 +195,28 @@ class ImageGenerationPrompt(BaseModel):
         return value.strip()
 
 
+class ReviewGeneratedImageArguments(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    image_id: str = Field(
+        min_length=1,
+        max_length=64,
+        pattern=r"^[a-z0-9]+(?:-[a-z0-9]+)*$",
+    )
+    artifact_path: str = Field(min_length=1, max_length=300)
+
+
 class ImageGenerationRecord(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     artifact_path: str = Field(min_length=1, max_length=300)
+    image_id: str = Field(
+        default="primary",
+        min_length=1,
+        max_length=64,
+        pattern=r"^[a-z0-9]+(?:-[a-z0-9]+)*$",
+    )
+    review_cycle_id: str | None = Field(default=None, max_length=200)
     prompt: str = Field(min_length=1, max_length=4_000)
     negative_prompt: str = Field(max_length=2_000)
     width: int = Field(ge=256, le=3840)
@@ -186,6 +233,10 @@ class SubtaskResult(BaseModel):
     _image_generations: list[ImageGenerationRecord] = PrivateAttr(
         default_factory=list
     )
+    _agent_image_reviews: list[dict[str, object]] = PrivateAttr(
+        default_factory=list
+    )
+    _agent_image_review_cycle_id: str | None = PrivateAttr(default=None)
 
     status: Literal["succeeded", "partial", "needs_input", "failed"]
     summary: str = Field(max_length=4_000)

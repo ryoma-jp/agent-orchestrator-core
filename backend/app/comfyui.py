@@ -62,6 +62,7 @@ class ComfyUIImageGenerationTool:
             openai_parameters={
                 "type": "object",
                 "properties": {
+                    "image_id": {"type": "string"},
                     "image_prompt": {
                         "type": "object",
                         "properties": {
@@ -81,6 +82,7 @@ class ComfyUIImageGenerationTool:
                     "seed": {"type": ["integer", "null"]},
                 },
                 "required": [
+                    "image_id",
                     "image_prompt",
                     "filename",
                     "width",
@@ -164,6 +166,7 @@ class ComfyUIImageGenerationTool:
 
         return {
             "artifact_path": relative_path,
+            "image_id": raw_arguments.image_id,
             "width": raw_arguments.width,
             "height": raw_arguments.height,
             "seed": seed,

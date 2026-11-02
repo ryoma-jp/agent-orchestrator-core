@@ -73,6 +73,13 @@ async def create_task(
     }
     if stored_settings:
         execution_settings.update(stored_settings.settings_json)
+    for legacy_key in (
+        "image_review_model_provider",
+        "image_review_model",
+        "image_generation_agent_id",
+        "image_review_agent_id",
+    ):
+        execution_settings.pop(legacy_key, None)
     execution_settings.update(
         {
             "max_agent_turns": settings.max_agent_turns,

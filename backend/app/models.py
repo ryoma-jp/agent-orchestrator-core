@@ -238,6 +238,19 @@ class Subtask(Base):
     status: Mapped[str] = mapped_column(String(32), default="pending")
     dependencies: Mapped[list] = mapped_column(JSONB, default=list)
     model_id: Mapped[str] = mapped_column(String(200))
+    agent_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    agent_definition_digest: Mapped[str | None] = mapped_column(
+        String(64), nullable=True
+    )
+    review_agent_id: Mapped[str | None] = mapped_column(
+        String(100), nullable=True
+    )
+    review_agent_digest: Mapped[str | None] = mapped_column(
+        String(64), nullable=True
+    )
+    review_binding_mode: Mapped[str | None] = mapped_column(
+        String(16), nullable=True
+    )
     skill_names: Mapped[list] = mapped_column(JSONB, default=list)
     plan_position: Mapped[int] = mapped_column(Integer, default=0)
     artifact_goal: Mapped[str] = mapped_column(Text, default="")
@@ -305,7 +318,22 @@ class QualityReview(Base):
     revision_round: Mapped[int] = mapped_column(Integer, default=0)
     checklist_results: Mapped[list] = mapped_column(JSONB)
     verdict: Mapped[str] = mapped_column(String(32))
+    reviewer_model_provider: Mapped[str | None] = mapped_column(
+        String(16), nullable=True
+    )
     reviewer_model_id: Mapped[str] = mapped_column(String(200))
+    specialist_model_provider: Mapped[str | None] = mapped_column(
+        String(16), nullable=True
+    )
+    specialist_model_id: Mapped[str | None] = mapped_column(
+        String(200), nullable=True
+    )
+    reviewer_agent_id: Mapped[str | None] = mapped_column(
+        String(100), nullable=True
+    )
+    reviewer_agent_digest: Mapped[str | None] = mapped_column(
+        String(64), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )

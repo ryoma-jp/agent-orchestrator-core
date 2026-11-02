@@ -30,6 +30,12 @@ _MAX_IMAGE_BYTES = 20 * 1024 * 1024
 class ImageGenerationArguments(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    image_id: str = Field(
+        default="primary",
+        min_length=1,
+        max_length=64,
+        pattern=r"^[a-z0-9]+(?:-[a-z0-9]+)*$",
+    )
     image_prompt: ImageGenerationPrompt
     filename: str = Field(
         default="generated-image.png", min_length=5, max_length=220
@@ -146,6 +152,7 @@ class OpenAIImageGenerationTool:
             openai_parameters={
                 "type": "object",
                 "properties": {
+                    "image_id": {"type": "string"},
                     "image_prompt": {
                         "type": "object",
                         "properties": {
@@ -163,6 +170,7 @@ class OpenAIImageGenerationTool:
                     "height": {"type": "integer"},
                 },
                 "required": [
+                    "image_id",
                     "image_prompt",
                     "filename",
                     "width",
@@ -239,6 +247,7 @@ class OpenAIImageGenerationTool:
             return {"error": "openai_image_workspace_write_failed"}
         return {
             "artifact_path": artifact_path,
+            "image_id": raw_arguments.image_id,
             "width": raw_arguments.width,
             "height": raw_arguments.height,
             "seed": None,

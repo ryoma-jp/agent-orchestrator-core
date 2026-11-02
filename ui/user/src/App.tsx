@@ -113,6 +113,12 @@ function App() {
       try { payload = JSON.parse(message.data) as Record<string, unknown> } catch { return }
       const conversationSequence = payload.conversation_sequence
       if (typeof conversationSequence !== 'number' || !Number.isInteger(conversationSequence)) return
+      const agentName = typeof payload.agent_name === 'string'
+        ? payload.agent_name
+        : message.type === 'task.status_changed'
+          && ['planning', 'needs_attention'].includes(String(payload.status))
+          ? 'Manager'
+          : '不明'
       let content = ''
       if (message.type === 'plan.created') {
         const summary = typeof payload.summary === 'string' ? payload.summary : ''
@@ -130,7 +136,9 @@ function App() {
           const source = payload.skill_source === 'public' ? '公開Skill' : 'プライベートSkill'
           content = `${source}「${skillName}」を読み込みました。`
         } else if (activity === 'tool') {
-          const toolName = payload.tool_name === 'tavily_web_search' ? 'Tavily Web検索' : typeof payload.tool_name === 'string' ? payload.tool_name : 'ツール'
+          const toolName = payload.tool_name === 'tavily_web_search' ? 'Tavily Web検索'
+            : payload.tool_name === 'review_generated_image' ? 'Image Reviewへのレビュー依頼'
+              : typeof payload.tool_name === 'string' ? payload.tool_name : 'ツール'
           const phase = payload.phase
           const sourceCount = typeof payload.source_count === 'number' ? payload.source_count : 0
           content = phase === 'started' ? `${toolName}を実行しています。`
@@ -138,6 +146,18 @@ function App() {
               : phase === 'blocked' ? `${toolName}はツール予算上限のため実行されませんでした。`
                 : phase === 'failed' ? `${toolName}の実行に失敗しました。`
                   : ''
+        } else if (activity === 'image_review') {
+          const reviewNumber = typeof payload.review_number === 'number' ? payload.review_number : 0
+          const cycleNumber = typeof payload.cycle_number === 'number' ? payload.cycle_number : 0
+          const verdict = payload.verdict
+          const phase = payload.phase
+          const cycleLabel = cycleNumber > 0 ? `サイクル${cycleNumber}・` : ''
+          content = phase === 'started' ? `画像レビューを開始しました（${cycleLabel}${reviewNumber}回目）。`
+            : phase === 'completed' && verdict === 'passed' ? `画像レビューに合格しました（${cycleLabel}${reviewNumber}回目）。`
+              : phase === 'completed' && verdict === 'needs_revision' ? `画像レビューで修正が必要です（${cycleLabel}${reviewNumber}回目）。`
+                : phase === 'completed' ? `画像レビューは判定不能でした（${cycleLabel}${reviewNumber}回目）。`
+                  : phase === 'failed' ? '画像レビューを完了できませんでした。'
+                    : ''
           } else if (activity === 'image_generation') {
             content = typeof payload.summary === 'string'
               ? payload.summary
@@ -155,9 +175,10 @@ function App() {
         content = verdict === 'accepted' ? '成果物の受け入れチェックに合格しました。' : verdict === 'revision_requested' ? '未達項目に絞って修正を依頼しました。' : verdict === 'partially_accepted' ? '修正上限に達した未達項目を記録しました。' : ''
       } else if (message.type === 'task.status_changed') {
         const status = payload.status
-        content = status === 'planning' ? '作業内容を整理しています。' : status === 'running' ? 'エージェントが作業を開始しました。' : status === 'needs_attention' ? '追加の情報が必要です。' : ''
+        content = status === 'planning' ? '作業内容を整理しています。' : status === 'needs_attention' ? '追加の情報が必要です。' : ''
       }
       if (!content || !alive) return
+      content = `${agentName}: ${content}`
       setProgress((current) => current.some((item) => item.id === message.lastEventId)
         ? current
         : [...current, { id: message.lastEventId, conversationSequence, content }])
